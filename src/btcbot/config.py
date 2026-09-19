@@ -32,6 +32,11 @@ class KalshiEnv(StrEnum):
     PROD = "prod"
 
 
+class SizingMode(StrEnum):
+    FIXED = "fixed"  # always contracts_per_trade
+    KELLY = "kelly"  # fractional Kelly on max_open_exposure_usd; see btcbot.strategy.kelly_size
+
+
 class _Strict(BaseModel):
     # Unknown keys are errors, so a typo like "min_egde" cannot silently fall back to a default.
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -39,6 +44,10 @@ class _Strict(BaseModel):
 
 class Sizing(_Strict):
     contracts_per_trade: int = Field(5, gt=0)
+    mode: SizingMode = SizingMode.FIXED
+    # Fraction of full Kelly to actually stake when mode is "kelly" -- see kelly_fraction()'s docstring for
+    # why staking full Kelly against an uncalibrated model is dangerous, especially near a price of 0 or 1.
+    kelly_fraction_multiplier: float = Field(0.2, gt=0.0, le=1.0)
 
 
 class RiskLimits(_Strict):
@@ -62,6 +71,12 @@ class BotConfig(_Strict):
     min_tau_sec: int = Field(30, ge=0)
     max_tau_sec: int = Field(780, gt=0, le=900)  # a window is 900s long
     cancel_before_close_sec: int = Field(20, ge=0)
+    # A flat min_edge is not risk-adjusted: the same edge is a small, capped win against a much larger loss
+    # (or the reverse) once price is near 0 or 1, and the model has no calibration check at those extremes
+    # yet (see btcbot.strategy's module docstring and btcbot.calibrate). Refusing the extremes by default
+    # is a reasoned starting guardrail, not a backtested-optimal cutoff -- tune it with `btcbot lab`.
+    min_price: Decimal | None = Field(Decimal("0.15"), ge=0, lt=1)
+    max_price: Decimal | None = Field(Decimal("0.85"), gt=0, le=1)
     sizing: Sizing = Field(default_factory=Sizing)
     risk: RiskLimits = Field(default_factory=RiskLimits)
 
@@ -71,6 +86,8 @@ class BotConfig(_Strict):
             raise ValueError("min_tau_sec must be less than max_tau_sec")
         if self.sizing.contracts_per_trade > self.risk.max_contracts_per_trade:
             raise ValueError("sizing.contracts_per_trade exceeds risk.max_contracts_per_trade")
+        if self.min_price is not None and self.max_price is not None and self.min_price >= self.max_price:
+            raise ValueError("min_price must be less than max_price")
         return self
 
 

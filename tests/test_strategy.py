@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 
 from btcbot.models import OrderBook, PriceLevel
-from btcbot.strategy import Action, decide
+from btcbot.strategy import Action, decide, kelly_fraction, kelly_size
 
 
 def book(yes=(), no=()):
@@ -119,3 +119,85 @@ class TestEntry:
         taxed = decide_with(p_yes=0.6, min_edge=Decimal("0.09"), maker_fee_multiplier=Decimal("1"))
         assert free.action is Action.REST
         assert taxed.action is Action.SKIP
+
+    def test_a_rest_decision_reports_its_edge_and_kelly_fraction(self):
+        d = decide_with(p_yes=0.9, book=book(yes=[("0.50", "20")], no=[("0.45", "20")]))
+        assert d.action is Action.REST
+        assert d.edge == pytest.approx(0.40)  # 0.9 - 0.50 - 0 fee
+        assert d.kelly_fraction == pytest.approx(0.8)  # (0.9 - 0.5) / (1 - 0.5)
+
+    def test_a_skip_decision_has_no_edge_or_kelly_fraction(self):
+        d = decide_with(p_yes=0.5, book=book(yes=[("0.49", "20")], no=[("0.49", "20")]))
+        assert d.action is Action.SKIP
+        assert d.edge is None
+        assert d.kelly_fraction is None
+
+
+class TestPriceBand:
+    def test_max_price_excludes_a_side_priced_above_it(self):
+        # yes edge clears the bar (0.95 - 0.90 = 0.05 >= 0.04); the no side never qualifies either way.
+        without_band = decide_with(p_yes=0.95, book=book(yes=[("0.90", "20")], no=[("0.05", "20")]))
+        with_band = decide_with(
+            p_yes=0.95, book=book(yes=[("0.90", "20")], no=[("0.05", "20")]), max_price=Decimal("0.85")
+        )
+        assert without_band.action is Action.REST and without_band.side == "yes"
+        assert with_band.action is Action.SKIP
+
+    def test_min_price_excludes_a_side_priced_below_it(self):
+        # yes_bid + no_bid = 0.95 keeps both sides' spread within the default max_spread (0.06).
+        # no edge clears the bar (0.95 - 0.10 = 0.85 >= 0.04); yes never qualifies either way (edge < 0).
+        b = book(yes=[("0.85", "20")], no=[("0.10", "20")])
+        without_band = decide_with(p_yes=0.05, book=b)
+        with_band = decide_with(p_yes=0.05, book=b, min_price=Decimal("0.15"))
+        assert without_band.action is Action.REST and without_band.side == "no"
+        assert with_band.action is Action.SKIP
+
+    def test_a_price_exactly_on_the_band_edge_is_allowed(self):
+        # yes_bid + no_bid = 0.95 keeps both sides' spread within the default max_spread (0.06).
+        d = decide_with(
+            p_yes=0.95, book=book(yes=[("0.85", "20")], no=[("0.10", "20")]), max_price=Decimal("0.85")
+        )
+        assert d.action is Action.REST and d.price == Decimal("0.85")
+
+    def test_a_qualifying_side_inside_the_band_still_trades(self):
+        d = decide_with(
+            p_yes=0.9, book=book(yes=[("0.50", "20")], no=[("0.45", "20")]),
+            min_price=Decimal("0.15"), max_price=Decimal("0.85"),
+        )
+        assert d.action is Action.REST and d.side == "yes"
+
+
+class TestKellyFraction:
+    def test_zero_at_a_fair_price(self):
+        assert kelly_fraction(0.5, Decimal("0.5")) == pytest.approx(0.0)
+
+    def test_matches_the_textbook_formula(self):
+        assert kelly_fraction(0.94, Decimal("0.90")) == pytest.approx(0.4)
+        assert kelly_fraction(0.14, Decimal("0.10")) == pytest.approx(0.04 / 0.9)
+
+    def test_the_same_raw_edge_is_a_larger_fraction_at_an_extreme_price(self):
+        # This is precisely why full Kelly must never be staked directly near a price of 0 or 1.
+        low = kelly_fraction(0.54, Decimal("0.50"))
+        high = kelly_fraction(0.94, Decimal("0.90"))
+        assert high > low
+
+    def test_negative_edge_clamps_to_zero_not_negative(self):
+        assert kelly_fraction(0.4, Decimal("0.5")) == 0.0
+
+    def test_a_price_of_one_is_defined_as_zero(self):
+        assert kelly_fraction(0.99, Decimal("1")) == 0.0
+
+
+class TestKellySize:
+    def test_matches_hand_computed_stake(self):
+        # full kelly 0.40 * multiplier 0.2 = 0.08 of a $25 bankroll = $2.00 / $0.90 -> floor to 2 contracts
+        size = kelly_size(0.40, Decimal("0.90"), bankroll_usd=Decimal("25"), multiplier=0.2, max_contracts=Decimal(10))
+        assert size == Decimal(2)
+
+    def test_floors_up_to_one_contract_rather_than_zero(self):
+        size = kelly_size(0.01, Decimal("0.50"), bankroll_usd=Decimal("25"), multiplier=0.2, max_contracts=Decimal(10))
+        assert size == Decimal(1)
+
+    def test_never_exceeds_max_contracts(self):
+        size = kelly_size(1.0, Decimal("0.10"), bankroll_usd=Decimal("100"), multiplier=1.0, max_contracts=Decimal(10))
+        assert size == Decimal(10)

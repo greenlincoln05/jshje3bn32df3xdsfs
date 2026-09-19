@@ -81,6 +81,21 @@ to replay. Every number this phase can currently produce comes from hand-built s
 market data -- see [docs/running-live.md](docs/running-live.md) for how to actually produce and analyze a
 real capture once you're on a machine with real network access.
 
+**Risk-adjusted entry and sizing (added after real demo trading exposed the gap):** a flat `min_edge` is not
+a risk-adjusted bar -- the same raw edge is roughly even stakes at a price near 0.5, but a small, capped win
+against a much larger loss (or the reverse) near a price of 0 or 1, exactly where the model has never been
+calibration-checked (`btcbot calibrate`). `strategy.decide()` now takes an optional `min_price`/`max_price`
+band (`BotConfig` defaults to `[0.15, 0.85]` -- a reasoned starting guardrail, not a backtested-optimal
+cutoff; tune it with `btcbot lab`) and reports each `Decision`'s Kelly-optimal bankroll fraction
+(`kelly_fraction()`: `(p - price) / (1 - price)`, the standard formula for a $1-payout binary bet). Kelly's
+own math is most aggressive exactly where a probability estimate is least trustworthy -- for a fixed edge,
+the fraction grows without bound as price approaches 1 -- so `sizing.mode: kelly` in `config.yaml` stakes
+only a fraction of it (`kelly_fraction_multiplier`, default 0.2) against `risk.max_open_exposure_usd`,
+instead of a flat `contracts_per_trade`. Off by default (`sizing.mode: fixed`) for `btcbot backtest`/`btcbot
+lab` (which already has its own independent `risk_pct`-based sizing for research); wired into
+`live_paper.py`'s decision loop, so `btcbot paper` and `btcbot demo` (which reuses the same loop unchanged)
+both pick it up.
+
 **Phase 5, as built:** `live_paper.py`'s `LivePaperTrader` runs the same model/strategy/risk/paper-broker
 stack backtest.py replays offline, but driven by data as it arrives rather than from a finished database.
 It does not poll a second time: `recorder.py` gained two hook attributes, `on_orderbook` and `on_settlement`
