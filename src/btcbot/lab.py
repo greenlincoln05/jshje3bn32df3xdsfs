@@ -68,6 +68,8 @@ class LabParams:
     max_tau_sec: int
     min_price: Decimal | None = None
     max_price: Decimal | None = None
+    persist_steps: int = 1
+    min_p_side: Decimal | None = None
     trend_mode: str = "off"
     trend_lookback_sec: int = 60
     trend_min_move_usd: Decimal = Decimal(0)
@@ -105,10 +107,10 @@ class AccountSettings:
     max_trades_per_hour: int = 12
 
 
-_DECIMAL_KEYS = {"min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct"}
-_INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "contracts"}
+_DECIMAL_KEYS = {"min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_p_side"}
+_INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "contracts", "persist_steps"}
 _FLOAT_KEYS = {"model_blend"}
-_OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct"}
+_OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct", "min_p_side"}
 TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode"}))
 _TREND_MODES = ("off", "with", "against")
 
@@ -120,6 +122,8 @@ def _check(key: str, value: Any) -> Any:
         "min_depth": lambda v: v >= 0,
         "min_price": lambda v: v is None or 0 < v < 1,
         "max_price": lambda v: v is None or 0 < v < 1,
+        "min_p_side": lambda v: v is None or 0 < v < 1,
+        "persist_steps": lambda v: 1 <= v <= 300,
         "trend_min_move_usd": lambda v: v >= 0,
         "risk_pct": lambda v: v is None or 0 < v <= 100,
         "min_tau_sec": lambda v: 0 <= v <= 900,
@@ -291,7 +295,8 @@ def _config_for(base: BotConfig, params: LabParams, account: AccountSettings) ->
 
 def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
     return EntryFilters(
-        min_price=params.min_price, max_price=params.max_price, trend_mode=params.trend_mode,
+        min_price=params.min_price, max_price=params.max_price, persist_steps=params.persist_steps,
+        min_p_side=params.min_p_side, trend_mode=params.trend_mode,
         trend_lookback_sec=params.trend_lookback_sec, trend_min_move_usd=params.trend_min_move_usd,
         account_usd=account.account_usd,
         risk_pct_per_trade=None if params.risk_pct is None else params.risk_pct / 100,

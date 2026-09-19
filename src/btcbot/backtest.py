@@ -344,10 +344,16 @@ class EntryFilters:
     (at least ``trend_min_move_usd``), ``"against"`` only the side it has been moving away from (a
     mean-reversion bet). ``account_usd`` + ``risk_pct_per_trade`` size each order as that fraction of the
     current bankroll (starting account plus settled PnL, less capital already at risk), rounded down to
-    whole contracts; sizing never depends on a prior loss being "made back"."""
+    whole contracts; sizing never depends on a prior loss being "made back".
+
+    ``persist_steps``: only enter once the strategy has wanted the SAME side for this many consecutive snapshots
+    (about one per second), so a single-quote flicker cannot trigger an entry. ``min_p_side``: only enter a side
+    the blended model puts at least this likely to win, so a cheap bet against the favourite is refused."""
 
     min_price: Decimal | None = None
     max_price: Decimal | None = None
+    persist_steps: int = 1
+    min_p_side: Decimal | None = None
     trend_mode: str = "off"
     trend_lookback_sec: int = 60
     trend_min_move_usd: Decimal = Decimal(0)
@@ -384,7 +390,9 @@ def replay_prepared(
     position: TradeRecord | None = None
     trades: list[TradeRecord] = []
     windows_traded: set[str] = set()
-    counts = {"price_band": 0, "trend": 0, "too_small": 0, "risk_blocked": 0}
+    counts = {"price_band": 0, "trend": 0, "too_small": 0, "risk_blocked": 0, "persistence": 0, "low_confidence": 0}
+    rest_side: str | None = None  # the side the strategy has wanted on consecutive snapshots, and for how long
+    rest_streak = 0
     bankroll = filters.account_usd if filters is not None else None
     equity: list[tuple[datetime, Decimal]] = []
 
@@ -416,10 +424,18 @@ def replay_prepared(
                     equity.append((ts, bankroll))
             position = None
 
-    def screen(decision: Decision, ts: datetime) -> Decision | None:
+    def screen(decision: Decision, ts: datetime, p_yes: float, streak: int) -> Decision | None:
         """Apply the lab's filters and sizing to a proposed resting order; None means do not place it."""
         if filters is None:
             return decision
+        if streak < filters.persist_steps:
+            counts["persistence"] += 1
+            return None
+        if filters.min_p_side is not None:
+            p_side = p_yes if decision.side == "yes" else 1.0 - p_yes
+            if p_side < float(filters.min_p_side):
+                counts["low_confidence"] += 1
+                return None
         price = decision.price
         if (filters.min_price is not None and price < filters.min_price) or (
             filters.max_price is not None and price > filters.max_price
@@ -452,6 +468,7 @@ def replay_prepared(
             if current_ticker is not None:
                 finalize_window(current_ticker, snap.poll_ts)
             current_ticker = snap.ticker
+            rest_side, rest_streak = None, 0  # a new window starts a new streak
         if not step.active:
             continue
         p_blend = step.p_yes
@@ -494,7 +511,13 @@ def replay_prepared(
         )
 
         if decision.action is Action.REST:
-            screened = screen(decision, snap.poll_ts)
+            rest_streak = rest_streak + 1 if rest_side == decision.side else 1
+            rest_side = decision.side
+        else:
+            rest_side, rest_streak = None, 0
+
+        if decision.action is Action.REST:
+            screened = screen(decision, snap.poll_ts, p_blend, rest_streak)
             if screened is not None:
                 approval = risk.check_new_order(size=screened.size, price=screened.price, now=snap.poll_ts)
                 if approval.approved:

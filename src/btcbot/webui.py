@@ -1243,6 +1243,8 @@ const LAB_FIELDS = [
   ["min_tau_sec", "Latest entry (secs left)", "30, 120, 300", "Stop entering when fewer than this many seconds remain."],
   ["min_price", "Min entry price ($)", "none, 0.20", "0.20 = 20 cents. 'none' = no floor."],
   ["max_price", "Max entry price ($)", "none, 0.60", "0.60 = 60 cents. 'none' = no cap."],
+  ["persist_steps", "Edge must persist (seconds)", "1, 5, 15, 30", "Only enter once the strategy has wanted the same side this many seconds in a row (ignores one-quote flickers)."],
+  ["min_p_side", "Min chance of winning", "none, 0.5, 0.6", "Only enter a side the model says is at least this likely to win. 0.5 refuses bets against the favourite."],
   ["trend_mode", "Trend filter", "off, with, against", "with = only the side spot is moving toward; against = fade the move."],
   ["trend_lookback_sec", "Trend lookback (secs)", "60, 180", "How far back to measure the move."],
   ["trend_min_move_usd", "Trend min move ($)", "0, 10, 25", "Ignore moves smaller than this."],
