@@ -1250,6 +1250,7 @@ const LAB_FIELDS = [
   ["trend_min_move_usd", "Trend min move ($)", "0, 10, 25", "Ignore moves smaller than this."],
   ["model_blend", "Model weight (0-1)", "0.3, 0.5, 0.8", "1 = trust the model only, 0 = trust the market mid only."],
   ["risk_pct", "Risk per trade (% of account)", "1, 2, 5", "Blank = fixed number of contracts instead."],
+  ["max_growth_pct", "Max growth per win (%)", "none, 10, 25", "With risk %: after a win the next order may be at most this much larger. Never grows after a loss."],
   ["contracts", "Fixed contracts", "5, 10", "Used when risk % is blank."],
 ];
 const LAB_PRESETS = {

@@ -38,7 +38,7 @@ from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictio
 from btcbot.models import Market, OrderBook
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, Decision, decide, kelly_size
+from btcbot.strategy import Action, Decision, decide, kelly_size, percent_size
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -79,6 +79,12 @@ class LivePaperTrader:
 
         self.trades: list[TradeRecord] = []
         self.windows_traded: set[str] = set()
+        # sizing mode "percent": the account grows and shrinks only with SETTLED results (see strategy.percent_size)
+        self._bankroll: Decimal = config.sizing.account_usd
+        self._last_order_size: Decimal | None = None
+        self._last_result: str | None = None  # "win" or "loss" of the most recent settled trade
+        if config.sizing.mode is SizingMode.PERCENT:
+            self._risk.set_account_value(self._bankroll)
         self.first_ts: datetime | None = None
         self.last_ts: datetime | None = None
         self._tickers_seen: set[str] = set()
@@ -86,6 +92,11 @@ class LivePaperTrader:
     @property
     def risk(self) -> RiskManager:
         return self._risk
+
+    @property
+    def bankroll(self) -> Decimal:
+        """Starting account plus settled profit and loss (sizing mode "percent" grows bets from this)."""
+        return self._bankroll
 
     @property
     def unresolved_count(self) -> int:
@@ -155,12 +166,24 @@ class LivePaperTrader:
                 max_contracts=Decimal(self._config.risk.max_contracts_per_trade),
             )
             decision = replace(decision, size=size)
+        elif decision.action is Action.REST and self._config.sizing.mode is SizingMode.PERCENT:
+            size = percent_size(
+                decision.price, cash_usd=self._bankroll - self._risk.open_exposure_usd,
+                risk_pct=self._config.sizing.risk_pct_per_trade, previous_size=self._last_order_size,
+                last_result=self._last_result, max_growth_pct=self._config.sizing.max_growth_per_win_pct,
+                max_contracts=Decimal(self._config.risk.max_contracts_per_trade),
+            )
+            if size >= 1:
+                decision = replace(decision, size=size)
+            else:
+                decision = Decision(Action.SKIP, reason="account too small for one contract at this risk percent")
         if decision.action is Action.REST:
             approval = self._risk.check_new_order(size=decision.size, price=decision.price, now=poll_ts)
             if approval.approved:
                 order_id = await self._place_resting(decision, poll_ts)
                 if order_id is not None:  # None: the exchange rejected it, so nothing rests and no exposure is taken
                     self._resting_order_id = order_id
+                    self._last_order_size = decision.size
                     self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
         elif decision.action is Action.CANCEL and self._resting_order_id is not None:
             await self._cancel_resting()
@@ -267,6 +290,10 @@ class LivePaperTrader:
         resolved = replace(pending, result=result, pnl_usd=pnl)
         self.trades.append(resolved)
         log_trade(self._conn, resolved)
+        self._bankroll += pnl
+        self._last_result = "loss" if pnl < 0 else "win"
+        if self._config.sizing.mode is SizingMode.PERCENT:
+            self._risk.set_account_value(self._bankroll)
         self._risk.record_trade_closed(
             TradeOutcome(ts=settled_ts, size=pending.size, pnl_usd=pnl), exposure_released_usd=exposure
         )

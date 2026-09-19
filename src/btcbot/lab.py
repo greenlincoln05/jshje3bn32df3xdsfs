@@ -75,6 +75,7 @@ class LabParams:
     trend_min_move_usd: Decimal = Decimal(0)
     model_blend: float = 0.5
     risk_pct: Decimal | None = None   # percent of bankroll risked per trade; None = fixed contracts
+    max_growth_pct: Decimal | None = None  # with risk_pct: a win may raise the next order by at most this percent
     contracts: int = 5
 
     @classmethod
@@ -107,10 +108,10 @@ class AccountSettings:
     max_trades_per_hour: int = 12
 
 
-_DECIMAL_KEYS = {"min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_p_side"}
+_DECIMAL_KEYS = {"min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_p_side", "max_growth_pct"}
 _INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "contracts", "persist_steps"}
 _FLOAT_KEYS = {"model_blend"}
-_OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct", "min_p_side"}
+_OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct", "min_p_side", "max_growth_pct"}
 TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode"}))
 _TREND_MODES = ("off", "with", "against")
 
@@ -123,6 +124,7 @@ def _check(key: str, value: Any) -> Any:
         "min_price": lambda v: v is None or 0 < v < 1,
         "max_price": lambda v: v is None or 0 < v < 1,
         "min_p_side": lambda v: v is None or 0 < v < 1,
+        "max_growth_pct": lambda v: v is None or 0 <= v <= 500,
         "persist_steps": lambda v: 1 <= v <= 300,
         "trend_min_move_usd": lambda v: v >= 0,
         "risk_pct": lambda v: v is None or 0 < v <= 100,
@@ -283,6 +285,9 @@ def _config_for(base: BotConfig, params: LabParams, account: AccountSettings) ->
         daily_loss_limit_usd=max(account.account_usd * account.daily_loss_pct / 100, Decimal("0.01")),
         max_consecutive_losses=account.max_consecutive_losses,
         max_trades_per_hour=account.max_trades_per_hour,
+        # in percent mode the caps follow the account as it grows and shrinks, like the live trader's
+        max_open_exposure_pct=account.max_exposure_pct if params.risk_pct is not None else None,
+        daily_loss_limit_pct=account.daily_loss_pct if params.risk_pct is not None else None,
     )
     data = base.model_dump()
     data.update(
@@ -300,6 +305,7 @@ def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
         trend_lookback_sec=params.trend_lookback_sec, trend_min_move_usd=params.trend_min_move_usd,
         account_usd=account.account_usd,
         risk_pct_per_trade=None if params.risk_pct is None else params.risk_pct / 100,
+        max_growth_pct=params.max_growth_pct,
     )
 
 
