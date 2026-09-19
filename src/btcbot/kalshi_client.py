@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from btcbot import __version__
 from btcbot.config import KalshiEnv
-from btcbot.models import Balance, Market, OrderBook, Series, require
+from btcbot.models import Balance, Market, OrderBook, ParseError, Series, require
 
 log = logging.getLogger("btcbot.kalshi")
 
@@ -217,10 +217,23 @@ class KalshiClient:
         params = {"series_ticker": series_ticker, "limit": "1000"}  # 1000 is the API maximum
         if status:
             params["status"] = status
-        data = await self._request("GET", "/markets", params=params)
-        if data.get("cursor"):
-            log.warning("markets for %s span more than one page; only the first %s were read", series_ticker, params["limit"])
-        return [Market.from_api(market) for market in data.get("markets") or ()]
+        markets: list[Market] = []
+        seen_cursors: set[str] = set()
+        while True:
+            data = await self._request("GET", "/markets", params=params)
+            page = require(data, "markets", "markets response")
+            if not isinstance(page, list):
+                raise ParseError("markets response: markets must be an array")
+            markets.extend(Market.from_api(market) for market in page)
+            cursor = data.get("cursor")
+            if cursor is None or cursor == "":
+                return markets
+            if not isinstance(cursor, str):
+                raise ParseError("markets response: cursor must be a string")
+            if cursor in seen_cursors:
+                raise KalshiError("markets response repeated a pagination cursor; refusing incomplete results")
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
 
     async def get_market(self, ticker: str) -> Market:
         data = await self._request("GET", f"/markets/{quote(ticker, safe='')}")

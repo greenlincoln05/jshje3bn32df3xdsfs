@@ -22,6 +22,11 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 
 Phase 1 is read-only: the client has no order-placing methods at all.
 
+The [repository review and overnight-plan assessment](docs/review-and-overnight-plan.md)
+records phase 1 bug fixes and phase 2 requirements for measuring latency and data quality.
+Market listing follows pagination; discovery re-checks time after network calls and refuses
+to display a quote fetched across market close.
+
 ## Setup
 
 Python 3.11 or newer.
