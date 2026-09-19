@@ -12,6 +12,9 @@ Phase 3:
 
 Phase 4:
   backtest    replay recorded data through the model, strategy, risk and paper broker
+
+Phase 5:
+  paper       run the paper strategy against live public data in real time (no real orders)
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from pathlib import Path
 from btcbot.backtest import BacktestError, BacktestReport, run_backtest
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
+from btcbot.live_paper import LivePaperTrader
 from btcbot.market_discovery import find_current_market
 from btcbot.model import CalibrationSummary, compute_calibration_report
 from btcbot.models import Market, OrderBook, ParseError, Series, Side
@@ -313,6 +317,68 @@ async def _cmd_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_paper(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    series_ticker = args.series or config.series_ticker
+    env = KalshiEnv(args.env) if args.env else KalshiSettings().env
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    db_path = data_dir / f"paper-{series_ticker}-{env.value}-{timestamp}.sqlite"
+    queue_assumption = QueueAssumption(args.queue)
+    maker_fee_multiplier = Decimal(args.maker_fee_multiplier)
+
+    async with KalshiClient(env) as client:  # public data only: no auth; paper never places a real order
+        recorder = Recorder(
+            client,
+            series_ticker=series_ticker,
+            db_path=db_path,
+            kill_file=args.kill_file,
+            poll_interval_sec=args.poll_interval,
+        )
+        # a second connection to the same file: recorder.py owns the base tables, this owns predictions
+        trader_conn = sqlite3.connect(str(db_path))
+        spot_buffer = SpotBuffer()
+        trader = LivePaperTrader(
+            trader_conn,
+            config,
+            spot_buffer,
+            queue_assumption=queue_assumption,
+            maker_fee_multiplier=maker_fee_multiplier,
+            kill_file=args.kill_file,
+        )
+        recorder.on_orderbook = trader.on_orderbook_snapshot
+        recorder.on_settlement = trader.on_settlement
+
+        def on_tick(tick):
+            recorder.record_spot_tick(tick)
+            trader.on_spot_tick(tick.price)
+
+        spot_feed = CoinbaseSpotFeed(spot_buffer, on_tick=on_tick)
+        spot_task = asyncio.ensure_future(spot_feed.run_forever())
+        print(
+            f"Paper trading {series_ticker} ({env.value}, simulated fills only -- no real orders) to {db_path}\n"
+            f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early and cancel any open order.",
+            flush=True,
+        )
+        summary = None
+        try:
+            summary = await recorder.run(duration_sec=args.hours * 3600)
+        finally:
+            spot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await spot_task
+            await spot_feed.aclose()
+            await trader.shutdown(summary.stopped_at if summary is not None else datetime.now(timezone.utc))
+            trader.close()
+            recorder.close()
+    print(render_recorder_summary(summary))
+    print()
+    print("Trading report (feed this database to `btcbot backtest` to compare against a replay of it):")
+    print(render_backtest_reports([trader.report()]))
+    return 0
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -368,7 +434,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="0, 0.25, another non-negative number, or 'both' for 0 and 0.25 (default: both)",
     )
     backtest.set_defaults(handler=_cmd_backtest)
+
+    paper = commands.add_parser(
+        "paper", help="run the paper strategy against live public data in real time (Phase 5, no real orders)"
+    )
+    paper.add_argument("--env", choices=envs, help="Kalshi environment (default: KALSHI_ENV, else demo)")
+    paper.add_argument("--series", help="override series_ticker from config.yaml")
+    paper.add_argument("--hours", type=float, default=9.0, help="stop after this many hours (default: 9)")
+    paper.add_argument("--data-dir", default="data", help="directory for the SQLite database (default: ./data)")
+    paper.add_argument(
+        "--kill-file", default="KILL", help="creating this file stops trading, cancelling any open order (default: ./KILL)"
+    )
+    paper.add_argument(
+        "--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)"
+    )
+    paper.add_argument(
+        "--queue", choices=["optimistic", "pessimistic"], default="optimistic",
+        help="queue-fill assumption: see paper_broker.py (default: optimistic)",
+    )
+    paper.add_argument("--maker-fee-multiplier", default="0", help="a non-negative number (default: 0)")
+    paper.set_defaults(handler=_cmd_paper)
     return parser
+
+
+def _is_non_negative_decimal(value: str) -> bool:
+    try:
+        return Decimal(value) >= 0
+    except InvalidOperation:
+        return False
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -386,13 +479,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "calibrate" and args.bins <= 0:
         print("error: --bins must be greater than 0", file=sys.stderr)
         return 2
-    if args.command == "backtest" and args.maker_fee_multiplier != "both":
-        try:
-            multiplier_ok = Decimal(args.maker_fee_multiplier) >= 0
-        except InvalidOperation:
-            multiplier_ok = False
-        if not multiplier_ok:
-            print("error: --maker-fee-multiplier must be 'both' or a non-negative number", file=sys.stderr)
+    if args.command == "backtest" and args.maker_fee_multiplier != "both" and not _is_non_negative_decimal(args.maker_fee_multiplier):
+        print("error: --maker-fee-multiplier must be 'both' or a non-negative number", file=sys.stderr)
+        return 2
+    if args.command == "paper":
+        if not math.isfinite(args.hours) or args.hours <= 0:
+            print("error: --hours must be finite and greater than 0", file=sys.stderr)
+            return 2
+        if not math.isfinite(args.poll_interval) or args.poll_interval <= 0:
+            print("error: --poll-interval must be finite and greater than 0", file=sys.stderr)
+            return 2
+        if not _is_non_negative_decimal(args.maker_fee_multiplier):
+            print("error: --maker-fee-multiplier must be a non-negative number", file=sys.stderr)
             return 2
     for stream in (sys.stdout, sys.stderr):  # a non-ASCII title must not crash a Windows console
         reconfigure = getattr(stream, "reconfigure", None)

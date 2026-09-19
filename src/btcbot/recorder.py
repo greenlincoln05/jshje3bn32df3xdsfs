@@ -168,6 +168,12 @@ class Recorder:
     Stop conditions (checked once per loop iteration, before that iteration's requests): a time limit, a
     ``KILL`` marker file, free disk space below a floor, the database file reaching a size cap, or too many
     consecutive request failures. None of these restart themselves; the caller decides whether to run again.
+
+    ``on_orderbook`` and ``on_settlement`` are optional hooks for something that wants to react to live data
+    as it arrives (Phase 5's live paper loop) without polling a second time: ``on_orderbook`` fires right
+    after each order-book snapshot is written, with the market whose book it is; ``on_settlement`` fires
+    right after a settlement is written. Both are awaited from inside the poll loop, so a slow hook slows
+    recording -- keep them fast. Neither hook can affect what gets recorded; they observe, not filter.
     """
 
     def __init__(
@@ -184,6 +190,8 @@ class Recorder:
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         disk_free_bytes: Callable[[str], int] = lambda path: shutil.disk_usage(path).free,
+        on_orderbook: Callable[[Market, OrderBook, datetime], Awaitable[None]] | None = None,
+        on_settlement: Callable[[Market], Awaitable[None]] | None = None,
     ) -> None:
         if poll_interval_sec <= 0:
             raise ValueError("poll_interval_sec must be positive")
@@ -198,6 +206,8 @@ class Recorder:
         self._clock = clock
         self._sleep = sleep
         self._disk_free_bytes = disk_free_bytes
+        self.on_orderbook = on_orderbook
+        self.on_settlement = on_settlement
 
         self._spot_tick_count = 0
 
@@ -331,6 +341,8 @@ class Recorder:
                 self._record_settlement(market, poll_ts=self._clock(), resolved=True)
                 stats.settlements += 1
                 pending.discard(ticker)
+                if self.on_settlement is not None:
+                    await self.on_settlement(market)
 
     async def run(
         self,
@@ -419,6 +431,11 @@ class Recorder:
                     self._log("warning", "poll_error", f"orderbook {market.ticker}: {exc}")
                     if stats.errors >= self._max_consecutive_failures:
                         return stop("repeated_failures", f"{stats.errors} consecutive failures")
+                else:
+                    # outside the except above: a hook failure is a real bug, not a network blip, and must
+                    # not be miscounted as a poll error or silently swallowed.
+                    if self.on_orderbook is not None:
+                        await self.on_orderbook(market, book, poll_ts)
 
                 await self._finalize_pending(pending_settlement, stats)
                 await self._sleep(self._poll_interval_sec)

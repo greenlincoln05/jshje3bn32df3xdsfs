@@ -254,25 +254,30 @@ def run_backtest(
     if current_ticker is not None:
         finalize_window(current_ticker, snapshots[-1].poll_ts)
 
-    return _build_report(
+    return build_report(
         trades,
         windows_seen=len({s.ticker for s in snapshots}),
         windows_traded=windows_traded,
-        snapshots=snapshots,
+        first_ts=snapshots[0].poll_ts,
+        last_ts=snapshots[-1].poll_ts,
         queue_assumption=queue_assumption,
         maker_fee_multiplier=maker_fee_multiplier,
     )
 
 
-def _build_report(
+def build_report(
     trades: list[TradeRecord],
     *,
     windows_seen: int,
     windows_traded: set[str],
-    snapshots: list[Snapshot],
+    first_ts: datetime | None,
+    last_ts: datetime | None,
     queue_assumption: QueueAssumption,
     maker_fee_multiplier: Decimal,
 ) -> BacktestReport:
+    """Shared by ``run_backtest`` and :mod:`btcbot.live_paper`, so a live run and a backtest replay of the
+    same recorded data produce directly comparable reports (spec section 8.5's "compare live paper results
+    to the backtest")."""
     resolved = [t for t in trades if t.result is not None]
     unresolved = [t for t in trades if t.result is None]
     wins = sum(1 for t in resolved if t.pnl_usd is not None and t.pnl_usd > 0)
@@ -291,8 +296,8 @@ def _build_report(
         max_dd = max(max_dd, peak - running)
 
     span_days = None
-    if len(snapshots) >= 2:
-        span_seconds = (snapshots[-1].poll_ts - snapshots[0].poll_ts).total_seconds()
+    if first_ts is not None and last_ts is not None:
+        span_seconds = (last_ts - first_ts).total_seconds()
         if span_seconds > 0:
             span_days = span_seconds / 86400
     trades_per_day = (len(trades) / span_days) if span_days else None
