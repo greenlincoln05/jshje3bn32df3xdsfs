@@ -28,6 +28,12 @@ truth for scope and phases; the README has the phase status and a dated table of
 - `execution.py` only has a paper backend, and `paper_broker.py` never talks to Kalshi. `live_paper.py`
   (Phase 5) only ever drives that same paper backend. There is still no order-placing code against Kalshi
   anywhere in this repo; do not add any before the owner approves Phase 6.
+- `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
+  and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
+  that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
+  the file by hand; that is not a Claude Code session using a key (nobody here ever sees the value, since it
+  goes from the owner's browser straight to their own disk), and it still doesn't add anywhere for that key
+  to place an order -- the same Phase 6 gate applies to any future addition here.
 
 ## Commands
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
@@ -36,6 +42,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Live paper trading, no credentials, no real orders (Phase 5): `.venv/Scripts/btcbot.exe paper --env prod --hours 9`
 - Calibration report from a recorder database: `.venv/Scripts/btcbot.exe calibrate --db data/recorder-....sqlite`
 - Backtest a recorder database: `.venv/Scripts/btcbot.exe backtest --db data/recorder-....sqlite`
+- Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own
   environment cannot reach Kalshi/Coinbase; that has to happen on the owner's machine).
 

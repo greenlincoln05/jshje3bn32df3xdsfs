@@ -97,7 +97,22 @@ this will say "nothing to score" against one. A `paper` run (step 3) logs predic
 goes, so pointing `calibrate` at a `paper` run's database once some windows have settled will have real
 predictions to score.
 
-## 5. `auth-check` (optional -- needs your own credentials)
+## 5. Dashboard (optional, no credentials, no network needed)
+
+```powershell
+btcbot dashboard
+```
+
+A local web UI (open `http://127.0.0.1:8765` in a browser) for browsing whatever `record`/`paper`/`backtest`
+have produced under `./data/`, instead of re-running CLI commands by hand: a live-updating view of a `paper`
+run's trades and PnL while it's still going, a backtest runner, and a Settings tab for editing the same
+`.env` step 6 below describes editing by hand. It binds to `127.0.0.1` only. Unlike every other command on
+this page, this one needs no real Kalshi/Coinbase access at all -- it only reads local SQLite files and
+rewrites a few lines of a local text file -- so it's the one command here that was already exercised against
+a real (if synthetic) database and a real temporary `.env` file inside the Claude Code session that built it,
+not just the offline pytest suite. Browsing *real* recorded data with it still needs step 2 or 3 run first.
+
+## 6. `auth-check` (optional -- needs your own credentials)
 
 Only relevant once you want to verify a Kalshi API key and its signing work. **No Claude Code session uses
 or stores a Kalshi key, demo or production, ever** -- and a key that has been pasted into a chat with any
@@ -130,3 +145,6 @@ no order-placing code anywhere in this repo yet; see CLAUDE.md's gates on that.
 - `data/`, `.env`, `*.pem`, `*.key`, and `KILL` are all gitignored. Run `git status` before committing if
   you've been testing in this same checkout, so nothing from a live run ends up in a commit by accident.
 - No martingale or size-doubling exists anywhere in this codebase, by design (`risk.py` enforces it).
+- `btcbot dashboard` binds to `127.0.0.1` only. Its Settings tab writes straight to your local `.env` --
+  fine to use instead of editing the file by hand -- but don't run it with `--port` forwarded or exposed to
+  another machine, since anyone who can reach it could read the masked settings status or overwrite `.env`.
