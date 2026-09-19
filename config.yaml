@@ -11,8 +11,12 @@ max_spread: 0.06
 min_tau_sec: 30
 max_tau_sec: 780
 cancel_before_close_sec: 20
+min_price: 0.15               # refuse to enter outside [min_price, max_price]; null disables one side
+max_price: 0.85                # a reasoned starting guardrail, not backtested -- tune with `btcbot lab`
 sizing:
   contracts_per_trade: 5
+  mode: fixed                  # fixed | kelly (fractional Kelly on risk.max_open_exposure_usd)
+  kelly_fraction_multiplier: 0.2
 risk:
   max_contracts_per_trade: 10
   max_open_exposure_usd: 25

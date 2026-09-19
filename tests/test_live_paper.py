@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from btcbot.config import BotConfig
+from btcbot.config import BotConfig, Sizing, SizingMode
 from btcbot.live_paper import LivePaperTrader
 from btcbot.models import Market, OrderBook, PriceLevel
 from btcbot.paper_broker import QueueAssumption
@@ -120,6 +120,54 @@ class TestBasicFillAndSettlement:
         report = trader.report()
         assert report.queue_assumption == "pessimistic"
         assert report.maker_fee_multiplier == Decimal("0.25")
+        trader.close()
+
+
+class TestPriceBandAndKellySizing:
+    """strike=70000 with a flat (zero-volatility) spot warmup at 80000 clamps the model to its p_model=0.98
+    ceiling (model.py's CLAMP_HIGH) regardless of horizon -- a simple, deterministic way to get a strong,
+    reproducible model opinion without needing real volatility."""
+
+    async def test_the_default_price_band_refuses_a_trade_the_model_would_otherwise_take(self, tmp_path):
+        conn = sqlite3.connect(":memory:")
+        trader, buffer = make_trader(conn)  # default BotConfig: max_price=0.85
+        feed_fresh_spot(trader, buffer, Decimal("80000"), ts=T0)
+        market = make_market(TICKER, strike="70000")
+        book = make_book(yes_price="0.90", yes_size="20", no_price="0.05", no_size="20")  # yes ask price band
+
+        await trader.on_orderbook_snapshot(market, book, T0)
+
+        assert trader._resting_order_id is None
+        trader.close()
+
+    async def test_disabling_the_band_lets_the_same_trade_through(self, tmp_path):
+        conn = sqlite3.connect(":memory:")
+        trader, buffer = make_trader(conn, config=BotConfig(max_price=None))
+        feed_fresh_spot(trader, buffer, Decimal("80000"), ts=T0)
+        market = make_market(TICKER, strike="70000")
+        book = make_book(yes_price="0.90", yes_size="20", no_price="0.05", no_size="20")
+
+        await trader.on_orderbook_snapshot(market, book, T0)
+
+        assert trader._resting_order_id is not None
+        trader.close()
+
+    async def test_kelly_mode_sizes_by_edge_instead_of_a_flat_contract_count(self, tmp_path):
+        # p_blend = 0.5*0.98 + 0.5*mid(0.90, 0.95) = 0.9525; kelly_fraction=(0.9525-0.90)/0.10=0.525;
+        # 0.525 * 0.2 multiplier * $25 bankroll = $2.625 -> floor($2.625 / $0.90) = 2 contracts (not 5).
+        conn = sqlite3.connect(":memory:")
+        config = BotConfig(
+            max_price=None, sizing=Sizing(contracts_per_trade=5, mode=SizingMode.KELLY, kelly_fraction_multiplier=0.2)
+        )
+        trader, buffer = make_trader(conn, config=config)
+        feed_fresh_spot(trader, buffer, Decimal("80000"), ts=T0)
+        market = make_market(TICKER, strike="70000")
+        book = make_book(yes_price="0.90", yes_size="20", no_price="0.05", no_size="20")
+
+        await trader.on_orderbook_snapshot(market, book, T0)
+
+        assert trader._resting_order_id is not None
+        assert trader.risk.open_exposure_usd == Decimal("0.90") * Decimal(2)
         trader.close()
 
 

@@ -62,6 +62,17 @@ truth for scope and phases; the README has the phase status and a dated table of
   a configuration profitable (a test checks the wording), because CLAUDE.md's "no profitability claims
   without recorded out-of-sample results" applies to its output. Percent-of-account sizing only ever shrinks
   after a loss, and `risk.py` still enforces "no size increase after a loss" on the ORDERED size.
+- `strategy.decide()` takes an optional `min_price`/`max_price` band and reports each `Decision`'s Kelly
+  fraction (`kelly_fraction()`, `(p - price) / (1 - price)`) -- added after real `btcbot demo` trading took a
+  thin-edge trade on a badly asymmetric payout, which a flat `min_edge` never screens for. `BotConfig`
+  defaults the band to `[0.15, 0.85]`: a reasoned guardrail, not a backtested-optimal cutoff, since the
+  model has no calibration check at the extremes yet (`btcbot calibrate`) -- tune it with `btcbot lab`.
+  `sizing.mode: kelly` sizes by that fraction (times `kelly_fraction_multiplier`, default 0.2 -- full Kelly
+  is most aggressive exactly where the model is least trustworthy, near a price of 0 or 1) against
+  `risk.max_open_exposure_usd`, instead of a flat `contracts_per_trade`; default is `fixed` (unchanged
+  behavior). Wired into `live_paper.py` only, so `btcbot paper` and `btcbot demo` (same decision loop) both
+  get it; `btcbot backtest`/`btcbot lab` are untouched and keep their own separate `EntryFilters`/`risk_pct`
+  mechanism.
 
 ## Commands
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
