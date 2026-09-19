@@ -16,7 +16,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | 2 | Spot feed + recorder (24h+ of order books, spot ticks, settlements) | **built and tested; no real capture run yet** |
 | 3 | Fair-probability model + calibration report | **built and tested; no real calibration report yet (no captured data)** |
 | 4 | Backtest + queue-aware paper broker | **built and tested; no real backtest result yet (no captured data)** |
-| 5 | Live paper run, several days | not started |
+| 5 | Live paper run, several days | **built and tested; no real live run yet (needs real network access)** |
 | 6 | Demo-environment order/cancel/fill validation | not started |
 | 7 | Live, optional, only if phases 4-6 show positive edge after fees | not started |
 
@@ -79,6 +79,31 @@ to replay. Every number this phase can currently produce comes from hand-built s
 market data -- see [docs/running-live.md](docs/running-live.md) for how to actually produce and analyze a
 real capture once you're on a machine with real network access.
 
+**Phase 5, as built:** `live_paper.py`'s `LivePaperTrader` runs the same model/strategy/risk/paper-broker
+stack backtest.py replays offline, but driven by data as it arrives rather than from a finished database.
+It does not poll a second time: `recorder.py` gained two hook attributes, `on_orderbook` and `on_settlement`
+(assigned after construction, not passed to `__init__`, since the trader needs a second connection to the
+same database file the recorder just created), and `btcbot paper` wires the trader's
+`on_orderbook_snapshot`/`on_settlement` methods into a `Recorder` running against the same public endpoints
+`btcbot record` uses -- so a paper run's database has the exact same order-book/spot/settlement tables a
+recording does, plus a `predictions` table (`btcbot.model.log_prediction`, now actually populated
+continuously instead of only during a backtest replay) and the trades the strategy made. Because settlement
+for a window is often still unknown when the next window's first snapshot arrives (per the README's verified
+timings, a market finalizes a few seconds after close), a filled position moves to a pending-settlement map
+at rollover and is only turned into a resolved trade once `on_settlement` actually fires for that ticker;
+anything still pending when the run stops (`shutdown()`, on the kill file or the hour limit) is reported
+unresolved rather than guessed at as a win or loss. `backtest.py`'s report builder (`build_report`) was
+made public and reused as-is, so `btcbot paper`'s own end-of-run summary and `btcbot backtest --db
+<that run's database>` are directly comparable -- spec section 8.5's "compare live paper results to the
+backtest." 14 new offline tests (a fake spot buffer and hand-built order-book snapshots driving the trader
+directly; no recorder or network involved).
+
+**No real live paper run exists yet**, the same root cause as every prior phase: this session's container
+cannot reach Kalshi or Coinbase (confirmed network-policy denial, not a transient failure) and is not a place
+to leave a multi-hour or multi-day process running unattended anyway. Running it for real, for the "several
+days" the spec asks for, has to happen on the owner's own machine -- see
+[docs/running-live.md](docs/running-live.md).
+
 ### A note on API keys
 
 No Kalshi API key has been used by any Claude session working on this repo, demo or production. A key that
@@ -108,6 +133,7 @@ btcbot discover --env prod --watch 5  # one line every 5 s; the ticker rolls ove
 btcbot discover                       # same, against KALSHI_ENV (default: demo)
 btcbot auth-check                     # one signed GET /portfolio/balance: proves your key and signing work
 btcbot record --env prod --hours 9    # poll public market data + Coinbase spot ticks into ./data/*.sqlite
+btcbot paper --env prod --hours 9     # trade the paper strategy against live public data; no real orders
 btcbot calibrate --db data/recorder-....sqlite   # Brier score + reliability table from logged predictions
 btcbot backtest --db data/recorder-....sqlite    # replay through strategy + risk + paper broker; PnL etc.
 ```
@@ -122,12 +148,19 @@ Create a file named `KILL` (or pass `--kill-file`) to stop it early; it also sto
 free disk space, a database size cap, or too many consecutive request failures, and none of those restart on
 their own. It writes one timestamped SQLite file per run under `--data-dir` (default `./data`, gitignored).
 
-`calibrate` reads predictions a running strategy has logged (via `btcbot.model.log_prediction`) into that same
-database, joins them to `record`'s `settlements` table by ticker, and reports a Brier score and a reliability
-table for the model, the market mid, and their blend. Nothing currently logs live predictions into a real
-database -- `backtest.py` recomputes predictions on the fly during replay without persisting them, and a
-loop that would log them continuously is Phase 5 -- so today `calibrate` only has something to report on
-synthetic test data.
+`paper` (Phase 5) also needs no credentials: it runs the same recorder polling as `record`, plus the model,
+strategy, risk and paper-broker stack from Phase 4, driven live instead of replayed -- so a `paper` run's
+database has everything a `record` run's has, plus logged predictions and any simulated trades. It never
+places a real order; `--kill-file` (default `./KILL`) cancels any open order and stops the run. Prints its
+own end-of-run trading report, in the same shape `backtest` prints, so `btcbot backtest --db <that file>`
+gives a directly comparable report from replaying the exact same data (spec section 8.5).
+
+`calibrate` reads predictions logged (via `btcbot.model.log_prediction`) into a database, joins them to
+`record`'s `settlements` table by ticker, and reports a Brier score and a reliability table for the model,
+the market mid, and their blend. `backtest.py` recomputes predictions on the fly during replay without
+persisting them, so a backtest alone still won't give `calibrate` anything new; a `paper` run logs them
+continuously as it goes, so `calibrate` has real predictions to score once a `paper` run has settled some
+windows. Until then, `calibrate` only has something to report on synthetic test data.
 
 `backtest` also needs no credentials: it only reads a local recorder database. By default it runs all four
 combinations of queue assumption (`optimistic`/`pessimistic`) and maker-fee multiplier (`0`/`0.25`) and
@@ -153,7 +186,7 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
 | Mode | Target | Money | Status |
 |------|--------|-------|--------|
 | `record` | prod market data, read-only | none | Phase 2: **built** (REST polling; no key) |
-| `paper` (default) | prod data, simulated fills | none | Phase 4: **built** (`backtest`, offline); live-loop pending Phase 5 |
+| `paper` (default) | prod data, simulated fills | none | Phase 4/5: **built** (`backtest` offline, `paper` live); no real live run yet |
 | `demo` | Kalshi demo environment | fake | Phase 6 |
 | `live` | Kalshi prod | real | Phase 7: needs `mode: live`, `--i-understand-real-money`, `KALSHI_ENV=prod` and a typed confirmation |
 
@@ -178,7 +211,7 @@ src/btcbot/
   models.py                 Market, Series, OrderBook, Balance: Decimal-only views of API payloads
   kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff
   market_discovery.py       find the open KXBTC15M market: series -> open markets (see the discovery note below)
-  cli.py                    discover, auth-check, record, calibrate, backtest
+  cli.py                    discover, auth-check, record, calibrate, backtest, paper
   spot_feed.py              Phase 2: Coinbase public WebSocket ticker -> rolling buffer, staleness, REST fallback
   recorder.py               Phase 2: order books, market state, spot ticks and settlements -> SQLite
   model.py                  Phase 3: v1 fair-probability model, EWMA volatility, prediction logging, calibration
@@ -187,6 +220,7 @@ src/btcbot/
   execution.py              Phase 4: the paper/live-shared order interface -- only the paper backend exists
   paper_broker.py           Phase 4: fees, tick grid, queue-position fill simulation
   backtest.py               Phase 4: replay a recorder database through all of the above; PnL/win-rate/etc.
+  live_paper.py             Phase 5: drives the same stack live via recorder.py's hooks; reuses backtest's report
 tests/
   fixtures/                 real public API payloads and an OpenSSL signing vector
   test_signing.py, test_client.py, test_config.py, test_models.py, test_market_discovery.py, test_cli.py
@@ -194,6 +228,7 @@ tests/
   test_model.py                                          Phase 3, offline (includes hypothesis property tests)
   test_risk.py, test_paper_broker.py, test_strategy.py,
   test_execution.py, test_backtest.py                    Phase 4, offline (synthetic fixtures + hypothesis)
+  test_live_paper.py                                     Phase 5, offline (fake spot buffer + hand-built snapshots)
 ```
 
 `config.py` and `models.py` are additions to the layout in the build spec. Kalshi's own WebSocket (order-book
