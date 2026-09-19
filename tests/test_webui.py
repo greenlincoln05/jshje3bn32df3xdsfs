@@ -469,3 +469,63 @@ class TestStrategyLabEndpoints:
 
     def test_unknown_run_id_is_404(self, dashboard):
         assert _get(dashboard.base_url, "/api/lab/status?id=nope")[0] == 404
+
+
+class TestDemoOrdersView:
+    def _demo_db(self, dashboard, rows):
+        from btcbot.demo_trader import DEMO_SCHEMA
+
+        db_path = make_db(dashboard.data_dir, "demo-KXBTC15M-demo-20260919T000000Z.sqlite")
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(DEMO_SCHEMA)
+        for r in rows:
+            conn.execute(
+                """INSERT INTO demo_orders (ticker, side, price, size, placed_ts, order_id, demo_filled, demo_cost, demo_fee,
+                   paper_filled, paper_cost, paper_fee, closed_ts, result, demo_pnl, paper_pnl)
+                   VALUES (:ticker,:side,:price,:size,:placed_ts,:order_id,:demo_filled,:demo_cost,:demo_fee,:paper_filled,
+                   :paper_cost,:paper_fee,:closed_ts,:result,:demo_pnl,:paper_pnl)""", r)
+        conn.execute("INSERT INTO demo_events (ts, ticker, event, detail) VALUES (?,?,?,?)",
+                     (T0.isoformat(), TICKER, "order_rejected", "yes 5@0.30: post only cross"))
+        conn.commit()
+        conn.close()
+        return db_path.name
+
+    def row(self, oid, **over):
+        base = {"ticker": TICKER, "side": "yes", "price": "0.30", "size": "5", "placed_ts": T0.isoformat(), "order_id": oid,
+                "demo_filled": "0", "demo_cost": "0", "demo_fee": "0", "paper_filled": "0", "paper_cost": "0", "paper_fee": "0",
+                "closed_ts": None, "result": None, "demo_pnl": None, "paper_pnl": None}
+        return {**base, **over}
+
+    def test_states_summary_and_events(self, dashboard):
+        name = self._demo_db(dashboard, [
+            self.row("o1"),                                                                        # resting
+            self.row("o2", demo_filled="5", demo_cost="1.50", paper_filled="4", paper_cost="1.20"),  # filled
+            self.row("o3", closed_ts=T0.isoformat()),                                              # cancelled unfilled
+            self.row("o4", demo_filled="4", demo_cost="1.20", demo_fee="0.01", paper_filled="4", paper_cost="1.20",
+                     closed_ts=T0.isoformat(), result="yes", demo_pnl="2.7900", paper_pnl="2.8000"),  # settled
+        ])
+        status, body = _get(dashboard.base_url, f"/api/demo?db={name}")
+        assert status == 200
+        states = {o["order_id"]: o["state"] for o in body["orders"]}
+        assert states == {"o1": "resting", "o2": "filled", "o3": "cancelled, unfilled", "o4": "settled YES"}
+        assert next(o for o in body["orders"] if o["order_id"] == "o2")["demo_avg_price"] == "0.30"
+        s = body["summary"]
+        assert s["placed"] == 4 and s["filled_on_demo"] == 2 and s["filled_in_paper"] == 2 and s["rejected"] == 1
+        assert s["demo_pnl"] == "2.7900" and s["paper_pnl"] == "2.8000" and s["demo_fees"] == "0.01"
+        assert body["events"][0]["event"] == "order_rejected"
+
+    def test_the_ledger_tail_is_newest_first_and_skips_garbage(self, dashboard):
+        name = self._demo_db(dashboard, [])
+        lines = [json.dumps({"ts": f"2026-09-19T00:00:0{i}+00:00", "event": "create_order", "side": "yes"}) for i in range(3)]
+        (dashboard.data_dir / "order-audit.jsonl").write_text("\n".join([lines[0], "not json {", lines[1], lines[2]]) + "\n", encoding="utf-8")
+        _, body = _get(dashboard.base_url, f"/api/demo?db={name}")
+        assert [a["ts"][17:19] for a in body["audit"]] == ["02", "01", "00"]
+
+    def test_a_database_without_demo_tables_and_a_missing_ledger_are_just_empty(self, dashboard):
+        db_path = make_db(dashboard.data_dir)  # a plain paper/recorder database
+        status, body = _get(dashboard.base_url, f"/api/demo?db={db_path.name}")
+        assert status == 200 and body["orders"] == [] and body["events"] == [] and body["audit"] == []
+        assert body["summary"]["placed"] == 0
+
+    def test_unknown_database_is_a_404(self, dashboard):
+        assert _get(dashboard.base_url, "/api/demo?db=missing.sqlite")[0] == 404
