@@ -481,3 +481,16 @@ def test_market_spot_is_bounded_to_selected_window(tmp_path):
     assert len(view['spot_series']) == 4
     assert view['spot_ts'] == (T0 + timedelta(seconds=3)).isoformat()
     assert view['book_latency_ms'] == 10.0
+
+def test_fast_quote_matches_window_and_excludes_history(tmp_path):
+    from btcbot.webui import market_quote
+    db = make_db(tmp_path)
+    with sqlite3.connect(db) as conn:
+        insert_market(conn, TICKER, strike=80000, close_time=T0 + timedelta(seconds=3), open_time=T0)
+        insert_snapshot(conn, TICKER, T0, yes=[('0.55', '8')])
+        insert_spot_run(conn, T0, 10)
+    q = market_quote(db, TICKER)
+    assert q['book']['yes'] == [['0.55', '8']]
+    assert q['spot_ts'] == (T0 + timedelta(seconds=3)).isoformat()
+    assert 'spot_series' not in q
+    assert market_quote(db, 'unknown')['book_ts'] is None
