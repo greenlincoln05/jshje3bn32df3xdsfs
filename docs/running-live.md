@@ -118,6 +118,28 @@ subscribe/unsubscribe on market-data channels. It cannot place, cancel or modify
   `run_log` rows (`select * from run_log where level='warning'`); the parser is deliberately loud about this.
 - If BRTI needs an entitlement on your account the server will say so in a `ws_error` row.
 
+## 4c. Strategy lab (offline, no credentials)
+
+```powershell
+btcbot lab --grid min_edge=0.02,0.04,0.06 --grid max_price=none,0.6 --grid trend_mode=off,with --account 500
+```
+
+or the dashboard's **Strategy Lab** tab. It replays every prod recording in `data\` (demo files are skipped unless
+you name them with `--db`) through the model, strategy, risk manager and queue-aware paper broker for each
+combination of the settings you list, then reports every combination twice: on the **train** windows it was ranked
+on, and on the later **test** windows it never saw. Things it can vary: `min_edge`, `max_spread`, `min_depth`,
+entry timing (`max_tau_sec` = earliest entry, `min_tau_sec` = latest entry, both in seconds left), an entry price
+band (`min_price`, `max_price`), a trend filter (`trend_mode` off/with/against, `trend_lookback_sec`,
+`trend_min_move_usd`), `model_blend`, and sizing (`risk_pct` of the account per trade, or fixed `contracts`) with
+`--account`, `--exposure-pct` and `--daily-loss-pct`.
+
+How to read it: ignore the train columns except as "what it was tuned on". A row that wins on train and loses on
+test is overfit noise, which is what most rows will be. `t` is average PnL per trade over its noise; under 2 is
+indistinguishable from luck. It needs at least 6 market windows (there are 96 a day) and needs hundreds before a
+result deserves any belief. The optimistic fill assumption is a best case (every drop in queue size counts as a
+trade), and a replay cannot see adverse selection, so a "good" result is a reason to forward paper-trade on new
+data, never a profitability claim.
+
 ## 5. Dashboard (optional, no credentials, no network needed)
 
 ```powershell

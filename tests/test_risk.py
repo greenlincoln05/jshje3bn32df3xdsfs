@@ -199,3 +199,12 @@ class TestPrecedence:
         r.record_trade_closed(TradeOutcome(ts=T0, size=Decimal(1), pnl_usd=Decimal("-1")), exposure_released_usd=Decimal(0))
         decision = r.check_new_order(size=Decimal(1), price=Decimal("0.1"), now=T0)
         assert decision.approved is False and "KILL" in decision.reason
+
+
+class TestPartialFillDoesNotLockOutTrading:
+    def test_a_partly_filled_loss_caps_the_next_order_at_the_ordered_size(self):
+        r = RiskManager(RiskLimits(), kill_file=NO_KILL_FILE, clock=lambda: T0)
+        r.record_order_opened(size=Decimal(5), price=Decimal("0.3"), now=T0)
+        r.record_trade_closed(TradeOutcome(ts=T0, size=Decimal(4), pnl_usd=Decimal("-1.2")), exposure_released_usd=Decimal("1.2"))
+        assert r.check_new_order(size=Decimal(5), price=Decimal("0.3"), now=T0).approved is True
+        assert r.check_new_order(size=Decimal(6), price=Decimal("0.3"), now=T0).approved is False

@@ -42,6 +42,7 @@ from btcbot.backtest import BacktestError, BacktestReport, run_backtest
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
+from btcbot.lab import DEFAULT_GRID, AccountSettings, LabError, load_lab_data, parse_values, render_lab_report, run_lab
 from btcbot.live_paper import LivePaperTrader
 from btcbot.market_discovery import find_current_market
 from btcbot.model import CalibrationSummary, compute_calibration_report
@@ -416,6 +417,54 @@ async def _cmd_stream(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_lab(args: argparse.Namespace) -> int:
+    """Sweep entry timing / price band / trend / account size / risk sizing on recorded data, ranked on a
+    training slice and judged on a held-out test slice. Offline: no network, no credentials."""
+    config = load_config(args.config)
+    paths = [Path(p) for p in args.db]
+    if not paths:
+        # demo-environment books are mostly synthetic (1-contract bids, 22c/78c quotes); sweeping them would
+        # teach the lab nothing true about prod, so they are only used when named with --db.
+        found = sorted(Path(args.data_dir).glob("*.sqlite"))
+        paths = [p for p in found if "-demo-" not in p.name]
+        if len(paths) != len(found):
+            print(f"Skipping {len(found) - len(paths)} demo-environment file(s); name one with --db to include it.", file=sys.stderr)
+    if not paths:
+        print(f"error: no data files. Run `btcbot paper` or `btcbot record` first (looked in {args.data_dir}).", file=sys.stderr)
+        return 1
+    grid: dict = {}
+    for spec in args.grid or []:
+        key, sep, raw = spec.partition("=")
+        if not sep:
+            print(f"error: --grid expects key=value1,value2 (got {spec!r})", file=sys.stderr)
+            return 2
+        grid[key.strip()] = parse_values(key.strip(), raw)
+    if not grid:
+        grid = DEFAULT_GRID
+        print("No --grid given; sweeping the default grid (see `btcbot lab --help`).", file=sys.stderr)
+    account = AccountSettings(
+        account_usd=Decimal(args.account), max_exposure_pct=Decimal(args.exposure_pct),
+        daily_loss_pct=Decimal(args.daily_loss_pct),
+    )
+
+    def progress(done: int, total: int, label: str) -> None:
+        if done % 10 == 0 or done == total:
+            print(f"  {done}/{total} {label}", file=sys.stderr, flush=True)
+
+    try:
+        data = load_lab_data(paths)
+        report = run_lab(
+            data, config, grid, account=account, train_fraction=args.split, queue=QueueAssumption(args.queue),
+            maker_fee_multiplier=Decimal(args.maker_fee_multiplier), top_k=args.top,
+            min_train_trades=args.min_train_trades, max_combos=args.max_combos, progress=progress,
+        )
+    except (LabError, BacktestError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(render_lab_report(report))
+    return 0
+
+
 async def _cmd_calibrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db)
     if not db_path.is_file():
@@ -600,6 +649,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stream.set_defaults(handler=_cmd_stream)
 
+    lab = commands.add_parser(
+        "lab",
+        help="strategy lab: sweep entry timing, price band, trend, account size, risk sizing; judged on held-out windows",
+        description="Sweep strategy parameters over recorded data. Combinations are ranked on the first part of "
+        "the windows and shown on the held-out rest. Tunable keys: "
+        + ", ".join(sorted(DEFAULT_GRID.keys() | {"min_depth", "max_spread", "min_price", "trend_lookback_sec",
+                                                  "trend_min_move_usd", "model_blend", "risk_pct", "contracts"})),
+    )
+    lab.add_argument("--db", action="append", default=[], help="recorded database (repeatable; default: every *.sqlite in --data-dir)")
+    lab.add_argument("--data-dir", default="data", help="where to look when no --db is given (default: ./data)")
+    lab.add_argument("--grid", action="append", metavar="KEY=V1,V2", help="e.g. --grid min_edge=0.02,0.04 --grid max_price=none,0.6 (repeatable)")
+    lab.add_argument("--account", default="500", help="pretend account size in USD (default: 500)")
+    lab.add_argument("--exposure-pct", default="25", help="max percent of the account at risk at once (default: 25)")
+    lab.add_argument("--daily-loss-pct", default="10", help="daily loss percent that halts new orders (default: 10)")
+    lab.add_argument("--split", type=float, default=0.7, help="fraction of windows used for ranking; the rest is the held-out test (default: 0.7)")
+    lab.add_argument("--queue", choices=[q.value for q in QueueAssumption], default="optimistic", help="queue-fill assumption (default: optimistic, a best case)")
+    lab.add_argument("--maker-fee-multiplier", default="0", help="a non-negative number (default: 0)")
+    lab.add_argument("--top", type=int, default=8, help="how many top combinations to show on the test slice (default: 8)")
+    lab.add_argument("--min-train-trades", type=int, default=20, help="combinations with fewer resolved training trades are not ranked (default: 20)")
+    lab.add_argument("--max-combos", type=int, default=400, help="refuse grids larger than this (default: 400)")
+    lab.set_defaults(handler=_cmd_lab)
+
     calibrate = commands.add_parser(
         "calibrate", help="Brier score + reliability table from predictions logged into a recorder database"
     )
@@ -688,6 +759,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not math.isfinite(value) or value <= 0:
                 print(f"error: {name} must be finite and greater than 0", file=sys.stderr)
                 return 2
+    if args.command == "lab":
+        if not _is_non_negative_decimal(args.maker_fee_multiplier):
+            print("error: --maker-fee-multiplier must be a non-negative number", file=sys.stderr)
+            return 2
+        for name, value in (("--account", args.account), ("--exposure-pct", args.exposure_pct), ("--daily-loss-pct", args.daily_loss_pct)):
+            if not _is_non_negative_decimal(value) or Decimal(value) == 0:
+                print(f"error: {name} must be a positive number", file=sys.stderr)
+                return 2
+        if not (0.2 <= args.split <= 0.9):
+            print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
+            return 2
+        if args.top < 1 or args.min_train_trades < 1 or args.max_combos < 1:
+            print("error: --top, --min-train-trades and --max-combos must be at least 1", file=sys.stderr)
+            return 2
     if args.command == "calibrate" and args.bins <= 0:
         print("error: --bins must be greater than 0", file=sys.stderr)
         return 2

@@ -57,6 +57,7 @@ class RiskManager:
         self._daily_loss_usd = Decimal("0")
         self._daily_reset_date = None
         self._max_size_since_loss: Decimal | None = None
+        self._last_order_size: Decimal | None = None
 
     # ---- read-only state, useful for reporting
 
@@ -120,6 +121,7 @@ class RiskManager:
         now = now if now is not None else self._clock()
         self._trade_times.append(now)
         self._open_exposure_usd += price * size
+        self._last_order_size = size
 
     def release_exposure(self, usd: Decimal) -> None:
         """For a position closed with an unknown outcome (e.g. replay data ends before settlement):
@@ -132,8 +134,12 @@ class RiskManager:
         if outcome.pnl_usd < 0:
             self._daily_loss_usd += -outcome.pnl_usd
             self._consecutive_losses += 1
+            # The cap is the size of the ORDER that lost, not the (possibly smaller) filled amount. A partial fill
+            # (ordered 5, filled 4) must not lock out every later 5-contract order: that would stop trading
+            # for good, since only a win clears the cap and no win can happen without a trade.
+            lost_size = max(outcome.size, self._last_order_size or Decimal(0))
             self._max_size_since_loss = (
-                outcome.size if self._max_size_since_loss is None else min(self._max_size_since_loss, outcome.size)
+                lost_size if self._max_size_since_loss is None else min(self._max_size_since_loss, lost_size)
             )
             if self._consecutive_losses >= self._limits.max_consecutive_losses:
                 self._paused = True

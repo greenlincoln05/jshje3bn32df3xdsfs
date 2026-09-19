@@ -48,6 +48,13 @@ truth for scope and phases; the README has the phase status and a dated table of
   tests it offline against fake sockets and the owner runs it; a session never uses the key. Message shapes
   come from docs.kalshi.com and are unverified against the live server until the owner's first run.
 
+- `lab.py` (`btcbot lab`, dashboard "Strategy Lab" tab) sweeps entry timing, price bands, trend filters,
+  account size and risk sizing over recorded data. It is offline research: no network, no key, no order code.
+  Every combination is ranked on a training slice and judged on held-out windows; its verdict must never call
+  a configuration profitable (a test checks the wording), because CLAUDE.md's "no profitability claims
+  without recorded out-of-sample results" applies to its output. Percent-of-account sizing only ever shrinks
+  after a loss, and `risk.py` still enforces "no size increase after a loss" on the ORDERED size.
+
 ## Commands
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
 - Read-only live check, no credentials needed: `.venv/Scripts/btcbot.exe discover --env prod`
@@ -56,6 +63,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Calibration report from a recorder database: `.venv/Scripts/btcbot.exe calibrate --db data/recorder-....sqlite`
 - Backtest a recorder database: `.venv/Scripts/btcbot.exe backtest --db data/recorder-....sqlite`
 - BRTI + order-book stream, READ-ONLY, needs YOUR key in `.env` (run by the owner): `.venv/Scripts/btcbot.exe stream --env prod --hours 9`
+- Strategy lab on recorded data (offline): `.venv/Scripts/btcbot.exe lab --grid min_edge=0.02,0.04 --grid max_price=none,0.6`
 - Demo-only order validation, needs a demo key (Phase 6, owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe demo-check`
 - Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own

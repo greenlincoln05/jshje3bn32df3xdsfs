@@ -1,0 +1,272 @@
+"""Offline tests for the strategy lab: synthetic windows in a real recorder-schema SQLite file, no network."""
+
+import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import pytest
+
+from btcbot.backtest import (
+    EntryFilters,
+    ReplayData,
+    load_replay_data,
+    merge_replay_data,
+    prepare_replay,
+    replay_prepared,
+    run_backtest,
+)
+from btcbot.config import BotConfig
+from btcbot.lab import (
+    AccountSettings,
+    LabError,
+    LabParams,
+    expand_grid,
+    parse_values,
+    render_lab_report,
+    run_lab,
+    split_windows,
+)
+from btcbot.paper_broker import QueueAssumption
+from btcbot.recorder import Recorder
+
+T0 = datetime(2026, 9, 19, 0, 0, 0, tzinfo=timezone.utc)
+WIN = 1000  # seconds between window starts
+
+
+def make_db(tmp_path, name="lab.sqlite"):
+    db_path = tmp_path / name
+    Recorder(None, series_ticker="KXBTC15M", db_path=db_path).close()
+    return sqlite3.connect(str(db_path))
+
+
+def seed_window(conn, index, result, *, yes_price="0.30", start=T0):
+    """One window that produces exactly one maker fill of 4 contracts (the depth shrinks, then refills), with
+    spot drifting up ~+15 USD per minute. Same shape as tests/test_backtest.py's seed_fillable_window."""
+    ticker = f"KXBTC15M-LAB{index:03d}-00"
+    start_ts = start + timedelta(seconds=index * WIN)
+    close_time = start_ts + timedelta(seconds=500)
+    price = Decimal("80000") + index
+    for i in range(110):
+        ts = start_ts - timedelta(seconds=90) + timedelta(seconds=i)
+        price = price + Decimal("1") if i % 2 == 0 else price - Decimal("0.5")
+        conn.execute("INSERT INTO spot_ticks (source, price, source_ts, receive_ts, monotonic_ts) VALUES (?,?,?,?,?)",
+                     ("coinbase-ws", str(price), ts.isoformat(), ts.isoformat(), float(i)))
+    open_time = start_ts - timedelta(seconds=300)
+    conn.execute(
+        """INSERT INTO market_state (ticker, event_ticker, poll_ts, status, strike, open_time, close_time, volume, open_interest)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (ticker, ticker.rsplit("-", 1)[0], open_time.isoformat(), "active", "80000", open_time.isoformat(),
+         close_time.isoformat(), "0", "0"))
+    for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+        ts = start_ts + timedelta(seconds=offset)
+        payload = json.dumps({"yes": [[yes_price, str(size)]], "no": [["0.68", "15"]]})
+        conn.execute(
+            """INSERT INTO orderbook_snapshots (ticker, request_started_ts, poll_ts, latency_ms, yes_bid_price, yes_bid_size,
+               yes_ask_price, yes_ask_size, no_bid_price, no_bid_size, no_ask_price, no_ask_size, book_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ticker, ts.isoformat(), ts.isoformat(), 10.0, yes_price, str(size), None, None, "0.68", "15", None, None, payload))
+    if result is not None:
+        conn.execute(
+            """INSERT INTO settlements (ticker, event_ticker, result, settled_avg, strike, close_time, finalized_poll_ts)
+               VALUES (?,?,?,?,?,?,?)""",
+            (ticker, ticker.rsplit("-", 1)[0], result, "80000", "80000", close_time.isoformat(), close_time.isoformat()))
+    conn.commit()
+    return ticker
+
+
+def seeded(tmp_path, results):
+    conn = make_db(tmp_path)
+    for i, result in enumerate(results):
+        seed_window(conn, i, result)
+    return load_replay_data(conn)
+
+
+def replay(data, config=None, *, filters=None, tickers=None):
+    config = config or BotConfig()
+    prepared = prepare_replay(data, config, tickers=tickers)
+    return replay_prepared(prepared, config, queue_assumption=QueueAssumption.OPTIMISTIC, filters=filters)
+
+
+# --------------------------------------------------------------------------- grid parsing
+
+
+class TestParsing:
+    def test_typed_values_and_optional_none(self):
+        assert parse_values("min_edge", "0.02, 0.04") == [Decimal("0.02"), Decimal("0.04")]
+        assert parse_values("min_tau_sec", "30,120") == [30, 120]
+        assert parse_values("max_price", "none, 0.6") == [None, Decimal("0.6")]
+        assert parse_values("trend_mode", "Off, WITH") == ["off", "with"]
+        assert parse_values("model_blend", ["0.3", 0.7]) == [0.3, 0.7]
+
+    @pytest.mark.parametrize("key,raw", [
+        ("min_edge", "1.5"), ("min_edge", "abc"), ("min_tau_sec", "1.5"), ("trend_mode", "sideways"),
+        ("max_price", "1.2"), ("risk_pct", "0"), ("bogus", "1"), ("min_edge", ""), ("min_edge", "NaN"),
+    ])
+    def test_bad_values_are_rejected(self, key, raw):
+        with pytest.raises(LabError):
+            parse_values(key, raw)
+
+    def test_contradictory_combinations_are_dropped_not_errors(self):
+        base = LabParams.from_config(BotConfig())
+        combos = expand_grid(base, {"min_tau_sec": [30, 700], "max_tau_sec": [600, 780],
+                                    "min_price": [Decimal("0.5")], "max_price": [Decimal("0.4"), Decimal("0.6")]})
+        assert all(c.min_tau_sec < c.max_tau_sec for c in combos)
+        assert all(c.max_price == Decimal("0.6") for c in combos)
+        assert len(combos) == 3  # (30,600), (30,780), (700,780)
+
+    def test_too_many_combinations_is_an_error(self):
+        base = LabParams.from_config(BotConfig())
+        with pytest.raises(LabError, match="too many"):
+            expand_grid(base, {"min_edge": [Decimal(i) / 1000 for i in range(1, 30)],
+                               "max_spread": [Decimal(i) / 100 for i in range(1, 30)]}, max_combos=100)
+
+
+# --------------------------------------------------------------------------- split
+
+
+class TestSplit:
+    def test_train_is_earlier_than_test_with_a_window_skipped(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 10)
+        train, test, ordered = split_windows(data, 0.7)
+        assert len(ordered) == 10 and train.isdisjoint(test)
+        assert train == set(ordered[:7]) and test == set(ordered[8:])  # ordered[7] is the embargo
+
+    def test_too_few_windows_explains_what_to_do(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 3)
+        with pytest.raises(LabError, match="at least 6"):
+            split_windows(data, 0.7)
+
+
+# --------------------------------------------------------------------------- filters and sizing
+
+
+class TestFilters:
+    def test_no_filters_is_identical_to_the_plain_backtest(self, tmp_path):
+        conn = make_db(tmp_path)
+        for i, r in enumerate(["yes", "no", "yes"]):
+            seed_window(conn, i, r)
+        plain = run_backtest(conn, BotConfig(), queue_assumption=QueueAssumption.OPTIMISTIC)
+        result = replay(load_replay_data(conn))
+        assert len(result.trades) == plain.trades == 3
+        assert sum((t.pnl_usd for t in result.trades), Decimal(0)) == plain.total_pnl_usd
+
+    def test_price_band_blocks_and_counts(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 3)
+        blocked = replay(data, filters=EntryFilters(max_price=Decimal("0.20")))
+        assert blocked.trades == [] and blocked.filter_counts["price_band"] > 0
+        allowed = replay(data, filters=EntryFilters(min_price=Decimal("0.25"), max_price=Decimal("0.35")))
+        assert len(allowed.trades) == 3
+        assert replay(data, filters=EntryFilters(min_price=Decimal("0.31"))).trades == []
+
+    def test_trend_with_and_against(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 3)  # spot drifts up, the strategy wants YES
+        with_trend = replay(data, filters=EntryFilters(trend_mode="with", trend_lookback_sec=60, trend_min_move_usd=Decimal(5)))
+        assert len(with_trend.trades) == 3
+        against = replay(data, filters=EntryFilters(trend_mode="against", trend_lookback_sec=60, trend_min_move_usd=Decimal(5)))
+        assert against.trades == [] and against.filter_counts["trend"] > 0
+        too_strict = replay(data, filters=EntryFilters(trend_mode="with", trend_lookback_sec=60, trend_min_move_usd=Decimal(500)))
+        assert too_strict.trades == []
+
+    def test_percent_of_account_sizing_and_bankroll(self, tmp_path):
+        data = seeded(tmp_path, ["yes", "yes", "no", "yes"])
+        config = BotConfig()
+        result = replay(data, config, filters=EntryFilters(account_usd=Decimal(500), risk_pct_per_trade=Decimal("0.05")))
+        # 5% of 500 = $25 at 0.30 -> 83 contracts ordered; the simulated fill is what the book gives (4)
+        assert len(result.trades) == 4 and all(t.size == 4 for t in result.trades)
+        assert result.final_bankroll == Decimal(500) + sum((t.pnl_usd for t in result.trades), Decimal(0))
+        assert len(result.equity_curve) == 4
+
+    def test_a_tiny_account_cannot_afford_a_contract(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 3)
+        result = replay(data, filters=EntryFilters(account_usd=Decimal(5), risk_pct_per_trade=Decimal("0.01")))
+        assert result.trades == [] and result.filter_counts["too_small"] > 0
+
+    def test_train_and_test_subsets_replay_only_their_windows(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 10)
+        train, test, _ = split_windows(data, 0.7)
+        assert {t.ticker for t in replay(data, tickers=train).trades} <= train
+        assert {t.ticker for t in replay(data, tickers=test).trades} <= test
+
+
+# --------------------------------------------------------------------------- merge
+
+
+class TestMerge:
+    def test_a_window_recorded_twice_is_replayed_once(self, tmp_path):
+        a = seeded(tmp_path, ["yes", "no"])
+        conn_b = make_db(tmp_path, "b.sqlite")
+        for i, r in enumerate(["yes", "no"]):
+            seed_window(conn_b, i, r)
+        merged = merge_replay_data([a, load_replay_data(conn_b)])
+        assert len(merged.snapshots) == len(a.snapshots)          # not doubled
+        assert len(merged.spot_ticks) == len(a.spot_ticks)        # overlapping span not doubled either
+        assert [s.poll_ts for s in merged.snapshots] == sorted(s.poll_ts for s in merged.snapshots)
+
+    def test_disjoint_recordings_are_concatenated(self, tmp_path):
+        a = seeded(tmp_path, ["yes", "no"])
+        conn_b = make_db(tmp_path, "b.sqlite")
+        seed_window(conn_b, 5, "yes")
+        merged = merge_replay_data([a, load_replay_data(conn_b)])
+        assert len({s.ticker for s in merged.snapshots}) == 3
+
+
+# --------------------------------------------------------------------------- the sweep
+
+
+def alternating(n):
+    return ["yes" if i % 3 else "no" for i in range(n)]  # wins and losses, so per-trade PnL has variance
+
+
+class TestRunLab:
+    def grid(self):
+        return {"min_edge": [Decimal("0.02"), Decimal("0.04")], "max_price": [None, Decimal("0.20")]}
+
+    def test_ranks_on_train_reports_test_and_never_calls_anything_profitable(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        progress = []
+        report = run_lab(data, BotConfig(), self.grid(), min_train_trades=3,
+                         progress=lambda done, total, label: progress.append((done, total)))
+        assert report.windows_train + report.windows_test == report.windows_total - 1
+        assert report.combinations == 4 and progress[-1] == (4, 4)
+        assert report.rows, "the unfiltered configurations trade on every window"
+        t_stats = [r.train.t_stat for r in report.rows]
+        assert t_stats == sorted(t_stats, reverse=True)
+        text = render_lab_report(report)
+        assert "profitable" not in report.verdict.replace("not a profitability claim", "")
+        assert "combinations were tried" in " ".join(report.warnings)
+        assert "Verdict [" in text and "TRAIN" in text and "TEST" in text
+        # too few test trades in a 12-window sample: the lab must say so rather than crown a winner
+        assert report.verdict_level == "insufficient"
+
+    def test_the_price_band_that_blocks_everything_is_not_ranked(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        report = run_lab(data, BotConfig(), {"max_price": [Decimal("0.20")]}, min_train_trades=3)
+        assert report.rows == [] and report.verdict_level == "insufficient"
+
+    def test_account_size_and_risk_percent_flow_through(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        report = run_lab(data, BotConfig(), {"risk_pct": [Decimal(2), Decimal(5)]},
+                         account=AccountSettings(account_usd=Decimal(1000)), min_train_trades=3)
+        assert report.account_usd == "1000" and report.rows
+        assert all(r.train.return_pct is not None for r in report.rows)
+
+    def test_cancel_stops_the_sweep(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        with pytest.raises(LabError, match="cancelled"):
+            run_lab(data, BotConfig(), self.grid(), min_train_trades=3, cancelled=lambda: True)
+
+    def test_too_little_data_says_how_much_is_needed(self, tmp_path):
+        data = seeded(tmp_path, ["yes", "no"])
+        with pytest.raises(LabError, match="96 per day"):
+            run_lab(data, BotConfig(), self.grid())
+
+
+class TestEquivalentSettings:
+    def test_settings_that_never_bind_are_collapsed_into_one_row(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        # a 0.90 price cap never binds (bids are 0.30), so all three settings make identical trades
+        report = run_lab(data, BotConfig(), {"max_price": [Decimal("0.90"), Decimal("0.80"), Decimal("0.70")]},
+                         min_train_trades=3)
+        assert len(report.rows) == 1 and report.rows[0].equivalent == 2
+        assert "identical results" in render_lab_report(report)

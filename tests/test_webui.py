@@ -397,3 +397,75 @@ class TestMarketEndpointAndNoTradesTable:
         (tmp_path / "recorder-KXBTC15M-prod-20260919T000000Z.sqlite").write_bytes(b"")
         kinds = {e["name"].split("-")[0]: e["kind"] for e in list_databases(tmp_path)}
         assert kinds == {"stream": "stream", "recorder": "recorder"}
+
+
+class TestStrategyLabEndpoints:
+    def _seed(self, dashboard, n=12):
+        from test_lab import alternating, seed_window
+
+        db_path = make_db(dashboard.data_dir, "paper-KXBTC15M-prod-20260919T000000Z.sqlite")
+        conn = sqlite3.connect(str(db_path))
+        for i, result in enumerate(alternating(n)):
+            seed_window(conn, i, result)
+        conn.close()
+        return db_path.name
+
+    def _wait(self, dashboard, job_id, timeout=30):
+        import time
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status, body = _get(dashboard.base_url, f"/api/lab/status?id={job_id}")
+            assert status == 200
+            if body["state"] != "running":
+                return body
+            time.sleep(0.05)
+        raise AssertionError("lab run did not finish")
+
+    def test_defaults_list_the_tunable_parameters(self, dashboard):
+        status, body = _get(dashboard.base_url, "/api/lab/defaults")
+        assert status == 200 and "min_edge" in body["tunable"] and "risk_pct" in body["tunable"]
+
+    def test_preview_counts_combinations_and_windows(self, dashboard):
+        name = self._seed(dashboard)
+        status, body = _post(dashboard.base_url, "/api/lab/preview",
+                             {"dbs": [name], "grid": {"min_edge": "0.02, 0.04", "max_price": "none, 0.6", "trend_mode": ""}})
+        assert status == 200 and body == {"combinations": 4, "windows": 12}
+
+    def test_bad_grid_values_are_a_400_not_a_crash(self, dashboard):
+        name = self._seed(dashboard)
+        for grid in ({"min_edge": "banana"}, {"bogus": "1"}, {}, {"min_edge": "5"}):
+            status, body = _post(dashboard.base_url, "/api/lab/start", {"dbs": [name], "grid": grid})
+            assert status == 400 and "error" in body
+
+    def test_start_requires_a_real_data_file(self, dashboard):
+        assert _post(dashboard.base_url, "/api/lab/start", {"dbs": [], "grid": {"min_edge": "0.02"}})[0] == 400
+        assert _post(dashboard.base_url, "/api/lab/start", {"dbs": ["../evil.sqlite"], "grid": {"min_edge": "0.02"}})[0] == 404
+
+    def test_a_run_completes_with_a_report(self, dashboard):
+        name = self._seed(dashboard)
+        status, job = _post(dashboard.base_url, "/api/lab/start", {
+            "dbs": [name], "grid": {"min_edge": "0.02, 0.04", "max_price": "none, 0.2"}, "min_train_trades": 3,
+            "account_usd": "1000", "split": "0.7",
+        })
+        assert status == 200 and job["state"] == "running"
+        done = self._wait(dashboard, job["id"])
+        assert done["state"] == "done", done
+        report = done["report"]
+        assert report["combinations"] == 4 and report["account_usd"] == "1000"
+        assert report["verdict_level"] in {"insufficient", "not_supported", "weak_signal"}
+        assert report["rows"] and {"train", "test", "description"} <= set(report["rows"][0])
+
+    def test_too_little_data_is_reported_as_an_error_state(self, dashboard):
+        from test_lab import seed_window
+
+        db_path = make_db(dashboard.data_dir, "paper-KXBTC15M-prod-20260919T010000Z.sqlite")
+        conn = sqlite3.connect(str(db_path))
+        seed_window(conn, 0, "yes")
+        conn.close()
+        _, job = _post(dashboard.base_url, "/api/lab/start", {"dbs": [db_path.name], "grid": {"min_edge": "0.02"}})
+        done = self._wait(dashboard, job["id"])
+        assert done["state"] == "error" and "at least 6" in done["error"]
+
+    def test_unknown_run_id_is_404(self, dashboard):
+        assert _get(dashboard.base_url, "/api/lab/status?id=nope")[0] == 404
