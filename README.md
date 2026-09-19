@@ -71,7 +71,7 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
 | `live` | Kalshi prod | real | Phase 7: needs `mode: live`, `--i-understand-real-money`, `KALSHI_ENV=prod` and a typed confirmation |
 
 - The client defaults to the **demo** environment. Production is opt-in per command (`--env prod`) or `KALSHI_ENV=prod`.
-- `.env`, `*.pem` and `*.key` are gitignored. The API key id is a `SecretStr` and `KalshiAuth` masks itself in
+- `.env` (and `.env.*` except `.env.example`), `*.pem`, `*.key`, key-like `.txt` files and a `secrets/` folder are gitignored. The API key id is a `SecretStr` and `KalshiAuth` masks itself in
   `repr`. Request headers are never logged.
 - Prices and contract counts are `Decimal` end to end. Kalshi sends fixed-point strings, and bare JSON numbers such
   as `floor_strike` are decoded straight to `Decimal`, never through `float`.

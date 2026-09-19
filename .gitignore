@@ -1,7 +1,12 @@
-# Secrets - never commit
+# Secrets - never commit. Kalshi's private key downloads as a .key file, or as a .txt file named by you.
 .env
+.env.*
+!.env.example
 *.pem
 *.key
+*key*.txt
+kalshi*.txt
+secrets/
 
 # Runtime data and logs
 data/

@@ -8,7 +8,7 @@ truth for scope and phases; the README has the phase status and a dated table of
   it, open questions) and wait for the owner's explicit go-ahead before starting the next one.
 - Paper trading is the default, and live trading must be impossible to enable by accident (all four gates in spec
   section 7). There is no order-placing code yet; do not add any before the owner approves Phase 6.
-- No martingale, doubling or any size increase after a loss. No secrets in the repo (`.env`, `*.pem` and `*.key` are
+- No martingale, doubling or any size increase after a loss. No secrets in the repo (`.env*`, `*.pem`, `*.key`, key-like `.txt` files and `secrets/` are
   gitignored). No profitability claims without recorded out-of-sample results. No Robinhood scraping and no unofficial
   data sources.
 - The placeholder modules (`spot_feed`, `recorder`, `model`, `strategy`, `risk`, `execution`, `paper_broker`,
