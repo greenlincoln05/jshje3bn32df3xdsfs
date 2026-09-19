@@ -796,3 +796,29 @@ class TestEmptyBodyOnlyWhereKalshiSendsNone:
         async with client:
             with pytest.raises(KalshiError, match="not valid JSON"):
                 await client.get_balance()
+
+
+class TestCredentialDiagnostics:
+    async def test_the_clock_skew_is_measured_from_the_date_header(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+
+        server_now = datetime.now(timezone.utc) - timedelta(seconds=30)  # this machine is 30 s ahead of Kalshi
+        script = Script(lambda: httpx.Response(200, json={}, headers={"Date": format_datetime(server_now, usegmt=True)}))
+        client, _ = make_client(script, env=KalshiEnv.DEMO)
+        async with client:
+            skew = await client.server_time_skew_sec()
+        assert 29 <= skew <= 32 and script.requests[0].url.path == "/trade-api/v2/exchange/status"
+        assert "KALSHI-ACCESS-KEY" not in script.requests[0].headers  # measured without signing anything
+
+    async def test_an_unmeasurable_skew_is_none_not_an_error(self):
+        client, _ = make_client(Script(lambda: httpx.Response(200, json={})), env=KalshiEnv.DEMO)  # no Date header
+        async with client:
+            assert await client.server_time_skew_sec() is None
+        client2, _ = make_client(Script(raises(httpx.ConnectError)), env=KalshiEnv.DEMO)
+        async with client2:
+            assert await client2.server_time_skew_sec() is None
+
+    def test_the_key_id_suffix_is_only_the_last_four_characters(self, rsa_key):
+        auth = KalshiAuth("0123456789abcdef-57a5", rsa_key)
+        assert auth.key_id_suffix == "57a5" and "0123456789" not in repr(auth)

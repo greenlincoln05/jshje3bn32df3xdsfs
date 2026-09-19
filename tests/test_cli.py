@@ -456,3 +456,25 @@ class TestDemoAllocation:
         for bad in (0, 101, -5):
             with pytest.raises(ValueError):
                 cli.allocation_for(2, bad)
+
+
+class TestAuthCheckDescribesWhatItUses:
+    def test_it_shows_the_environment_key_suffix_and_file_but_never_the_key(self, tmp_path):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from btcbot.kalshi_client import KalshiAuth
+
+        key_file = tmp_path / "k.pem"
+        key_file.write_text("-----BEGIN RSA PRIVATE KEY-----\nSECRET-BODY\n", encoding="utf-8")
+        auth = KalshiAuth("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee57a5", rsa.generate_private_key(public_exponent=65537, key_size=2048))
+        text = cli.describe_credentials(auth, key_file, KalshiEnv.DEMO)
+        assert "demo" in text and "external-api.demo.kalshi.co" in text and "...57a5" in text and str(key_file) in text
+        assert "SECRET-BODY" not in text and "aaaaaaaa" not in text
+
+    def test_a_missing_key_file_is_reported_not_raised(self, tmp_path):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from btcbot.kalshi_client import KalshiAuth
+
+        auth = KalshiAuth("id-1234", rsa.generate_private_key(public_exponent=65537, key_size=2048))
+        assert "missing" in cli.describe_credentials(auth, tmp_path / "nope.pem", KalshiEnv.DEMO)

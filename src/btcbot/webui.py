@@ -293,6 +293,70 @@ def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
     }
 
 
+def demo_view(db_path: Path, audit_path: Path, *, audit_tail: int = 40) -> dict[str, Any]:
+    """What ``btcbot demo`` has done so far, read straight from its database and the order ledger: each real
+    order beside its paper twin, the run's problem events, and the tail of ``order-audit.jsonl`` (the bot's own
+    record of every request it sent to Kalshi). Read-only; safe while the run is still writing."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        try:
+            cols = ("id", "ticker", "side", "price", "size", "placed_ts", "order_id", "demo_filled", "demo_cost", "demo_fee",
+                    "demo_first_fill_ts", "paper_filled", "paper_cost", "paper_fee", "paper_first_fill_ts", "closed_ts",
+                    "result", "demo_pnl", "paper_pnl")
+            orders = [dict(zip(cols, row, strict=True)) for row in conn.execute(
+                f"SELECT {', '.join(cols)} FROM demo_orders ORDER BY id DESC LIMIT 200")]
+        except sqlite3.OperationalError:
+            orders = []  # not a demo database (or the run has not created its tables yet)
+        try:
+            events = [{"ts": r[0], "ticker": r[1], "event": r[2], "detail": r[3]} for r in conn.execute(
+                "SELECT ts, ticker, event, detail FROM demo_events ORDER BY id DESC LIMIT 50")]
+        except sqlite3.OperationalError:
+            events = []
+        try:
+            last_snapshot = conn.execute("SELECT MAX(poll_ts) FROM orderbook_snapshots").fetchone()[0]
+        except sqlite3.OperationalError:
+            last_snapshot = None
+    finally:
+        conn.close()
+
+    for order in orders:
+        filled, size = Decimal(order["demo_filled"]), Decimal(order["size"])
+        if order["result"]:
+            state = "settled " + order["result"].upper()
+        elif filled >= size:
+            state = "filled"
+        elif order["closed_ts"]:
+            state = "partly filled, closed" if filled > 0 else "cancelled, unfilled"
+        else:
+            state = "partly filled, resting" if filled > 0 else "resting"
+        order["state"] = state
+        order["demo_avg_price"] = str(Decimal(order["demo_cost"]) / filled) if filled > 0 else None
+
+    def total(key: str) -> str:
+        return str(sum((Decimal(o[key]) for o in orders if o[key] is not None), Decimal(0)))
+
+    audit: list[dict[str, Any]] = []
+    try:
+        for line in audit_path.read_text(encoding="utf-8").splitlines()[-audit_tail:]:
+            try:
+                audit.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return {
+        "orders": orders, "events": events, "audit": list(reversed(audit)), "last_snapshot": last_snapshot,
+        "summary": {
+            "placed": len(orders),
+            "filled_on_demo": sum(1 for o in orders if Decimal(o["demo_filled"]) > 0),
+            "filled_in_paper": sum(1 for o in orders if Decimal(o["paper_filled"]) > 0),
+            "rejected": sum(1 for e in events if e["event"] == "order_rejected"),
+            "problems": len(events),
+            "demo_pnl": total("demo_pnl"), "paper_pnl": total("paper_pnl"), "demo_fees": total("demo_fee"),
+        },
+    }
+
+
 def backtest_reports(db_path: Path, config_path: Path, *, queue: str, maker_fee_multiplier: str) -> list[dict[str, Any]]:
     config = load_config(str(config_path))
     queues = (
@@ -473,6 +537,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_json(200, market_view(db_path, query.get("ticker")))
                 except (sqlite3.OperationalError, ParseError, ValueError) as exc:
                     raise _ApiError(400, f"market view error: {exc}") from exc
+            elif parsed.path == "/api/demo":
+                db_path = self._require_db(query)
+                try:
+                    self._send_json(200, demo_view(db_path, self.server.data_dir / "order-audit.jsonl"))
+                except (sqlite3.OperationalError, ValueError, ArithmeticError) as exc:
+                    raise _ApiError(400, f"demo view error: {exc}") from exc
             elif parsed.path == "/api/lab/defaults":
                 self._send_json(200, lab_defaults())
             elif parsed.path == "/api/lab/status":
@@ -751,6 +821,7 @@ INDEX_HTML = r"""<!doctype html>
     <button data-tab="monitor">Paper PnL</button>
     <button data-tab="backtest">Backtest</button>
     <button data-tab="lab">Strategy Lab</button>
+    <button data-tab="demo">Demo orders</button>
     <button data-tab="settings">Settings</button>
   </nav>
 
@@ -816,6 +887,22 @@ INDEX_HTML = r"""<!doctype html>
         <thead><tr><th>Queue</th><th>Fee mult.</th><th>Trades</th><th>Win rate</th><th>Total PnL</th><th>Max drawdown</th><th>Trades/day</th><th>Beats trade-nothing?</th><th>Sample size</th></tr></thead>
         <tbody></tbody></table>
       <div class="note" id="backtest-note"></div>
+    </div>
+  </section>
+
+  <section id="tab-demo">
+    <div class="tiles" id="demo-tiles"></div>
+    <div class="pad">
+      <div class="note" id="demo-note"></div>
+      <h3>Each real demo order next to its paper simulation</h3>
+      <table id="demo-orders"><thead><tr><th>Placed (UTC)</th><th>Window</th><th>Side</th><th class="num">Price</th><th class="num">Size</th>
+        <th>State</th><th class="num">Demo filled</th><th class="num">Demo avg</th><th class="num">Demo fee</th><th class="num">Paper filled</th>
+        <th class="num">Demo PnL</th><th class="num">Paper PnL</th></tr></thead><tbody></tbody></table>
+      <h3>Problems this run <span class="sub">(rejected orders, failed cancels, unavailable fills)</span></h3>
+      <table id="demo-events"><thead><tr><th>Time (UTC)</th><th>Window</th><th>Event</th><th>Detail</th></tr></thead><tbody></tbody></table>
+      <h3>Order ledger: everything the bot sent to Kalshi <span class="sub">(data/order-audit.jsonl, newest first)</span></h3>
+      <table id="demo-audit"><thead><tr><th>Time (UTC)</th><th>Event</th><th>Side</th><th class="num">Price</th><th class="num">Count</th><th>Order id</th><th>Error</th></tr></thead><tbody></tbody></table>
+      <div class="note">Compare this ledger with the Orders and History tabs on Kalshi's demo Portfolio page. Any order there that is not in this ledger did not come from this bot.</div>
     </div>
   </section>
 
@@ -1281,6 +1368,34 @@ async function labRun() {
 async function labCancel() { if (labJob) { try { await postJson("/api/lab/cancel", { id: labJob }); } catch (e) { /* the poll will surface it */ } } }
 
 let tab = "market";
+async function refreshDemo() {
+  const db = $("db-select").value, note = $("demo-note");
+  if (!db) { note.className = "note"; note.textContent = "No data files yet. Start btcbot demo, then click Refresh."; return; }
+  try {
+    const d = await getJson(`/api/demo?db=${encodeURIComponent(db)}`);
+    const s = d.summary, t = (iso) => (iso ? iso.slice(11, 19) : "--");
+    const age = d.last_snapshot ? (Date.now() - new Date(d.last_snapshot).getTime()) / 1000 : null;
+    $("demo-tiles").innerHTML = [
+      ["Orders placed", s.placed], ["Filled on demo", s.filled_on_demo], ["Filled in paper", s.filled_in_paper],
+      ["Rejected", s.rejected], ["Problems", s.problems], ["Demo PnL (settled)", fmtUsd(s.demo_pnl)],
+      ["Paper PnL (settled)", fmtUsd(s.paper_pnl)], ["Data age", age === null ? "--" : (age < 60 ? age.toFixed(1) + "s" : "stale")],
+    ].map(([label, value]) => `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
+    note.className = "note";
+    note.textContent = d.orders.length || d.events.length ? "" : "No demo orders yet. Normal: the strategy only orders when it sees an edge. If this is not a demo file, pick the newest Demo orders file above.";
+    $q("#demo-orders tbody").innerHTML = d.orders.length ? d.orders.map((o) => `<tr><td>${t(o.placed_ts)}</td><td>${esc(o.ticker.slice(-8))}</td>
+      <td>${esc(o.side)}</td><td class="num">${cents(o.price)}</td><td class="num">${esc(o.size)}</td><td>${esc(o.state)}</td>
+      <td class="num">${num(o.demo_filled)}</td><td class="num">${o.demo_avg_price === null ? "--" : cents(o.demo_avg_price)}</td>
+      <td class="num">$${Number(o.demo_fee).toFixed(4)}</td><td class="num">${num(o.paper_filled)}</td>
+      <td class="num">${o.demo_pnl === null ? "--" : fmtUsd(o.demo_pnl)}</td><td class="num">${o.paper_pnl === null ? "--" : fmtUsd(o.paper_pnl)}</td></tr>`).join("")
+      : '<tr><td colspan="12" class="empty">No orders yet.</td></tr>';
+    $q("#demo-events tbody").innerHTML = d.events.length ? d.events.map((e) => `<tr><td>${t(e.ts)}</td><td>${esc((e.ticker || "").slice(-8))}</td><td>${esc(e.event)}</td><td>${esc(e.detail)}</td></tr>`).join("")
+      : '<tr><td colspan="4" class="empty">No problems. </td></tr>';
+    $q("#demo-audit tbody").innerHTML = d.audit.length ? d.audit.map((a) => `<tr><td>${t(a.ts)}</td><td>${esc(a.event)}</td><td>${esc(a.side || "")}</td>
+      <td class="num">${a.price ? cents(a.price) : ""}</td><td class="num">${esc(a.count || "")}</td><td>${esc((a.order_id || "").slice(0, 13))}</td><td>${esc(a.error || "")}</td></tr>`).join("")
+      : '<tr><td colspan="7" class="empty">No ledger yet.</td></tr>';
+  } catch (err) { note.className = "error"; note.textContent = "Error: " + err.message; }
+}
+
 let refreshing = false;
 let quoting = false;
 async function refreshQuote() {
@@ -1309,7 +1424,7 @@ async function refreshTab() {
   if (refreshing) return;  // a slow response must not pile up requests behind it
   refreshing = true;
   try {
-    if (tab === "market") await refreshMarket(); else if (tab === "monitor") await refreshMonitor();
+    if (tab === "market") await refreshMarket(); else if (tab === "monitor") await refreshMonitor(); else if (tab === "demo") await refreshDemo();
   } finally { refreshing = false; }
 }
 document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("click", () => {
@@ -1346,7 +1461,7 @@ window.addEventListener("resize", () => { if (tab === "market" || tab === "monit
   buildLabForm(dbList);
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
-  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor")) refreshTab(); }, 1000);
+  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor" || tab === "demo")) refreshTab(); }, 1000);
   setInterval(refreshQuote, 50);
   setInterval(updateAge, 50);
 })();

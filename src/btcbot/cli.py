@@ -42,7 +42,7 @@ from pathlib import Path
 from btcbot.backtest import BacktestError, BacktestReport, run_backtest
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.demo_check import DemoCheckReport, run_demo_check
-from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
+from btcbot.kalshi_client import HOSTS, KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.lab import DEFAULT_GRID, AccountSettings, LabError, load_lab_data, parse_values, render_lab_report, run_lab
 from btcbot.demo_check import collateral_preflight
 from btcbot.demo_probe import run_probe
@@ -248,14 +248,39 @@ async def _cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def describe_credentials(auth: KalshiAuth, key_path: Path, env: KalshiEnv) -> str:
+    """What auth-check is about to use, so it can be compared with what Kalshi lists. Never the key itself."""
+    size = key_path.stat().st_size if key_path.exists() else "missing"
+    return (
+        f"Checking the {env.value} environment ({HOSTS[env]})\n"
+        f"    key id ends in ...{auth.key_id_suffix} (compare with the id Kalshi lists for this key)\n"
+        f"    key file {key_path} ({size} bytes)"
+    )
+
+
 async def _cmd_auth_check(args: argparse.Namespace) -> int:
     settings = KalshiSettings()
     if settings.key_id is None or settings.private_key_path is None:
         raise ConfigError("KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (see .env.example)")
     auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
     env = KalshiEnv(args.env) if args.env else settings.env
+    print(describe_credentials(auth, Path(settings.private_key_path), env), flush=True)
     async with KalshiClient(env, auth=auth) as client:
-        balance = await client.get_balance()
+        try:
+            balance = await client.get_balance()
+        except KalshiAuthError:
+            skew = await client.server_time_skew_sec()
+            if skew is None:
+                print("    clock: could not be measured", file=sys.stderr)
+            else:
+                verdict = "fine" if abs(skew) < 5 else "TOO FAR OFF: fix the system clock, Kalshi rejects skewed timestamps"
+                print(f"    clock: {skew:+.1f} s vs Kalshi ({verdict})", file=sys.stderr)
+            print(
+                "    If the clock is fine, Kalshi does not accept this key id with this key file. A private key cannot "
+                "be re-downloaded, so if this file is not the one generated with that id, create a new API key.",
+                file=sys.stderr,
+            )
+            raise
     print(f"OK: the {env.value} environment accepted the signed request.")
     print(f"    available balance ${balance.available:,.2f}; portfolio value ${balance.portfolio_value:,.2f}")
     return 0

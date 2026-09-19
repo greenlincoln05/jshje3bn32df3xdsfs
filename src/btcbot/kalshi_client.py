@@ -25,6 +25,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -120,6 +121,12 @@ class KalshiAuth:
             "KALSHI-ACCESS-TIMESTAMP": timestamp,
             "KALSHI-ACCESS-SIGNATURE": self.sign(signing_message(timestamp, method, path)),
         }
+
+    @property
+    def key_id_suffix(self) -> str:
+        """The last four characters of the key id: enough to match it against the id Kalshi lists, not enough to
+        use it."""
+        return self._key_id[-4:]
 
     def __repr__(self) -> str:  # never expose key material
         return f"KalshiAuth(key_id=...{self._key_id[-4:]})"
@@ -458,6 +465,17 @@ class KalshiClient:
             self._write_log({"ts": datetime.now(timezone.utc).isoformat(), "env": self.env.value, "event": event, **fields})
         except Exception as exc:  # noqa: BLE001 -- an audit-log problem must never take an order path down
             log.warning("order audit log failed: %s", exc)
+
+    async def server_time_skew_sec(self) -> float | None:
+        """How far this machine's clock is ahead of Kalshi's (negative = behind), from the ``Date`` header of one
+        public request; None if it could not be measured. Kalshi rejects a signature whose timestamp is too far
+        from its own clock with the same 401 as a bad key, so this separates the two."""
+        try:
+            response = await self._http.request("GET", f"{API_PREFIX}/exchange/status")
+            server = parsedate_to_datetime(response.headers["Date"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            return None
+        return (datetime.now(timezone.utc) - server).total_seconds()
 
     async def probe_get(
         self, endpoint: str, params: Mapping[str, str] | None = None, *, authenticated: bool = True
