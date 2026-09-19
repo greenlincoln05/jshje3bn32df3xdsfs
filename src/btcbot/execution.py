@@ -9,7 +9,7 @@ cannot become a live backend just by pointing it at a different `KalshiEnv`).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
@@ -137,7 +137,16 @@ class DemoExecutionBackend:
             await self._prime()
         order = await self._client.create_order(self._ticker, side, count=size)  # no price -> marketable IOC
         fills = await self._client.list_fills(ticker=self._ticker, order_id=order.order_id)
-        return [self._to_fill(f) for f in fills if self._mark_seen(f)]
+        result = [self._to_fill(f) for f in fills if self._mark_seen(f)]
+        acked = getattr(order, "fill_count", None) or Decimal(0)
+        price = getattr(order, "average_fill_price", None)
+        if not result and acked > 0 and price:
+            # The fill list can lag or be blind to V2 orders (seen on a real demo account), but the create
+            # response itself reports what filled. ``average_fee_paid`` is read as per contract; the fidelity
+            # report compares it with the fee formula, so a wrong reading shows up there.
+            fee = (getattr(order, "average_fee_paid", None) or Decimal(0)) * acked
+            result = [Fill(side=side, price=price, size=acked, fee=fee, maker=False, ts=datetime.now(timezone.utc))]
+        return result
 
     async def poll_fills(self) -> list[Fill]:
         """Call once per polled snapshot (the same cadence :meth:`PaperExecutionBackend.sync_market` is fed

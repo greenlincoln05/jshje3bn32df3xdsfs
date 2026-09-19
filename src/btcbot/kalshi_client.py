@@ -440,7 +440,7 @@ class KalshiClient:
         self._require_demo("cancel_all_resting_orders")
         self._audit("cancel_all_resting_orders")
         try:
-            data = await self._request("DELETE", _ORDERS_V2, authenticated=True)
+            data = await self._request("DELETE", _ORDERS_V2, authenticated=True, allow_empty=True)
         except KalshiError as exc:
             self._audit("cancel_all_resting_orders_failed", error=str(exc)[:300])
             raise
@@ -505,6 +505,7 @@ class KalshiClient:
         params: Mapping[str, str] | None = None,
         authenticated: bool = False,
         json_body: Mapping[str, Any] | None = None,
+        allow_empty: bool = False,
     ) -> Any:
         method = method.upper()
         path = f"{API_PREFIX}{endpoint}"
@@ -526,7 +527,7 @@ class KalshiClient:
             status = response.status_code
             log.debug("%s -> %d in %.0f ms", label, status, (time.monotonic() - started) * 1000)
             if status < 400:
-                return self._decode(label, response)
+                return self._decode(label, response, allow_empty=allow_empty)
             retryable = status == 429 or (status in _RETRYABLE_SERVER_STATUSES and idempotent)
             if retryable and attempt < self._max_retries:
                 await self._backoff(attempt, response.headers.get("Retry-After"), f"{label} (HTTP {status})")
@@ -542,7 +543,9 @@ class KalshiClient:
         return self._auth.headers(method, path)
 
     @staticmethod
-    def _decode(label: str, response: httpx.Response) -> dict[str, Any]:
+    def _decode(label: str, response: httpx.Response, *, allow_empty: bool = False) -> dict[str, Any]:
+        if allow_empty and not response.content.strip():
+            return {}  # e.g. cancel-all: Kalshi answers a success with no body at all
         try:
             # parse_float=Decimal keeps bare JSON numbers (floor_strike) out of binary floating point.
             data = response.json(parse_float=Decimal)

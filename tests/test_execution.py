@@ -279,3 +279,26 @@ class TestReconcileSweepsWithoutReading:
         client.sweep_error = KalshiConnectionError("down")
         report = await DemoExecutionBackend(client, TICKER).reconcile()
         assert report.sweep_error and "down" in report.sweep_error
+
+
+class TestTakerFillsFromTheAck:
+    async def test_the_ack_supplies_the_fill_when_the_fill_list_is_blind(self):
+        from types import SimpleNamespace
+
+        client = FakeKalshiClient()
+
+        async def create(ticker, side, *, count, price=None, client_order_id=None):
+            client.created_orders.append({"ticker": ticker, "side": side, "count": count, "price": price})
+            return SimpleNamespace(order_id="ord-1", fill_count=Decimal(3), average_fill_price=Decimal("0.55"),
+                                   average_fee_paid=Decimal("0.01"))
+
+        client.create_order = create
+        fills = await DemoExecutionBackend(client, TICKER).place_taker_order("yes", Decimal(3))
+        assert len(fills) == 1 and fills[0].size == Decimal(3) and fills[0].price == Decimal("0.55")
+        assert fills[0].fee == Decimal("0.03") and fills[0].maker is False
+
+    async def test_the_list_wins_when_it_does_show_the_fill(self):
+        client = FakeKalshiClient()
+        client.fills_on_create = [make_fill("t-1", "ord-1", price=Decimal("0.55"), count=Decimal(3), is_taker=True, fill_id="f-1")]
+        fills = await DemoExecutionBackend(client, TICKER).place_taker_order("yes", Decimal(3))
+        assert len(fills) == 1  # not double counted by also using the ack

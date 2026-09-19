@@ -774,3 +774,25 @@ class TestOrderAuditLog:
         async with client:
             ack = await client.create_order(TICKER, "yes", count=Decimal("1"), price=Decimal("0.5"))
         assert ack.order_id == "ord-1"
+
+
+class TestEmptyBodyOnlyWhereKalshiSendsNone:
+    async def test_cancel_all_accepts_an_empty_success_body(self, rsa_key):
+        script = Script(lambda: httpx.Response(200, content=b""))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            assert await client.cancel_all_resting_orders() == {}
+
+    async def test_cancel_all_still_rejects_a_garbage_body(self, rsa_key):
+        script = Script(lambda: httpx.Response(200, content=b"<html>oops</html>"))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            with pytest.raises(KalshiError, match="not valid JSON"):
+                await client.cancel_all_resting_orders()
+
+    async def test_other_endpoints_still_reject_an_empty_body(self, rsa_key):
+        script = Script(lambda: httpx.Response(200, content=b""))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            with pytest.raises(KalshiError, match="not valid JSON"):
+                await client.get_balance()

@@ -21,6 +21,10 @@ def make_market(ticker=TICKER, *, open_time=T0 - timedelta(seconds=60), close_ti
     )
 
 
+async def instant(_seconds):
+    return None
+
+
 class FakeClient:
     """Everything run_demo_check needs from a real KalshiClient, fully scripted -- no network, no signing.
     Each rejection knob defaults to "behaves correctly" so TestHappyPath exercises every row passing."""
@@ -39,6 +43,9 @@ class FakeClient:
         self.get_order_raises: Exception | None = None  # e.g. Kalshi answering 404 for an order it just accepted
         self.sweep_raises: Exception | None = None
         self.sweeps = 0
+        self.hide_fills = False  # fills exist but only the create ack reports them (the fill list is blind)
+        self.book_blind = False  # our orders never show in the public book
+        self.list_orders_blind = False
         self.wrong_side_mapping = False  # Kalshi records a NO order as YES (a broken side mapping)
         self.orders: dict[str, KalshiOrder] = {}
         self.fills: dict[str, list[KalshiFill]] = {}
@@ -84,6 +91,11 @@ class FakeClient:
             ]
             self.orders[order_id] = replace(order, status="executed", remaining_count=Decimal(0))
             self.positions.append(Position(ticker=ticker, side=side, count=Decimal(count), market_exposure_usd=None))
+            if self.hide_fills:
+                from types import SimpleNamespace
+
+                return SimpleNamespace(order_id=order_id, fill_count=Decimal(count), remaining_count=Decimal(0),
+                                       average_fill_price=Decimal("0.50"), average_fee_paid=Decimal("0.02"))
         return order
 
     async def cancel_order(self, order_id, *, market_ticker=None):
@@ -91,6 +103,18 @@ class FakeClient:
         if self.cancel_actually_works:
             self.orders[order_id] = replace(order, status="canceled", remaining_count=Decimal(0))
         return self.orders[order_id]
+
+    async def get_orderbook(self, ticker, *, depth=0):
+        from btcbot.models import OrderBook, PriceLevel
+
+        def resting(side):
+            if self.book_blind:
+                return Decimal(0)
+            return sum((o.remaining_count for o in self.orders.values()
+                        if not o.is_done and o.ticker == ticker and o.side == side and o.price == Decimal("0.01")), Decimal(0))
+
+        return OrderBook(ticker, (PriceLevel(Decimal("0.01"), Decimal(2) + resting("yes")),),
+                         (PriceLevel(Decimal("0.01"), Decimal(2) + resting("no")),))
 
     async def get_order(self, order_id):
         if self.get_order_raises is not None:
@@ -108,10 +132,14 @@ class FakeClient:
         return {}
 
     async def list_orders(self, *, ticker=None, status=None):
+        if self.list_orders_blind:
+            return []
         return [o for o in self.orders.values() if ticker is None or o.ticker == ticker]
 
     async def list_fills(self, *, ticker=None, order_id=None, min_ts=None):
         all_fills = [f for fills in self.fills.values() for f in fills]
+        if self.hide_fills:
+            return []
         return [f for f in all_fills if order_id is None or f.order_id == order_id]
 
     async def get_positions(self):
@@ -127,7 +155,7 @@ class TestHappyPath:
         client = FakeClient()
         client.settled_markets = [make_market("KXBTC15M-26SEP180000-00", raw={"result": "yes"})]
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         assert report.ticker == TICKER
         assert report.ok is True
@@ -147,7 +175,7 @@ class TestAuthAndDiscoveryGateEverythingElse:
         client = FakeClient()
         client.get_balance_raises = KalshiConnectionError("network down")
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         assert report.ok is False
         assert len(report.results) == 1
@@ -157,7 +185,7 @@ class TestAuthAndDiscoveryGateEverythingElse:
         client = FakeClient()
         client.open_markets = []
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         assert report.ok is False
         assert [r.name for r in report.results] == ["auth-check + balance", "market discovery"]
@@ -169,7 +197,7 @@ class TestRestingOrderAndCancel:
         client = FakeClient()
         client.cancel_actually_works = False
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         assert result_named(report, "resting YES order + cancel").passed is False
 
@@ -179,7 +207,7 @@ class TestFillableOrder:
         client = FakeClient()
         client.fillable = False
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         assert result_named(report, "fillable order + position").passed is False
 
@@ -187,13 +215,13 @@ class TestFillableOrder:
 class TestSettlementCheck:
     async def test_skipped_by_default(self):
         client = FakeClient()
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         result = result_named(report, "settlement check")
         assert result.passed is None and "skipped" in result.detail
 
     async def test_skipped_when_time_remains_even_if_asked_to_wait(self):
         client = FakeClient()  # the fixture market closes 800s from "now"
-        report = await run_demo_check(client, SERIES, wait_for_settlement=True, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, wait_for_settlement=True, clock=lambda: T0, sleep=instant)
         result = result_named(report, "settlement check")
         assert result.passed is None
 
@@ -222,39 +250,39 @@ class TestRejectionChecksCatchDangerousBehavior:
     async def test_bad_tick_not_rejected_is_a_failure_not_a_pass(self):
         client = FakeClient()
         client.reject_bad_tick = False
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "rejection: bad tick").passed is False
 
     async def test_insufficient_balance_not_rejected_is_a_failure(self):
         client = FakeClient()
         client.reject_insufficient_balance = False
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "rejection: insufficient balance").passed is False
 
     async def test_closed_market_not_rejected_is_a_failure(self):
         client = FakeClient()
         client.settled_markets = [make_market("KXBTC15M-26SEP180000-00", raw={"result": "yes"})]
         client.reject_closed_market = False
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "rejection: closed market").passed is False
 
     async def test_closed_market_check_is_skipped_without_a_settled_market_to_use(self):
         client = FakeClient()  # no settled_markets configured
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "rejection: closed market").passed is None
 
 
 class TestReconciliation:
     async def test_a_stray_order_is_found_and_cancelled_by_a_fresh_backend(self):
         client = FakeClient()
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         result = result_named(report, "crash-and-restart reconciliation")
         assert result.passed is True
 
     async def test_failure_when_reconcile_cannot_actually_cancel_the_stray_order(self):
         client = FakeClient()
         client.cancel_actually_works = False
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         result = result_named(report, "crash-and-restart reconciliation")
         assert result.passed is False
 
@@ -262,7 +290,7 @@ class TestReconciliation:
 class TestRequestBurst:
     async def test_passes_when_every_call_in_the_burst_succeeds(self):
         client = FakeClient()
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "request burst (rate-limit survival)").passed is True
 
 
@@ -303,21 +331,21 @@ class TestFidelityReportSummary:
 class TestRunDemoCheckPopulatesFidelity:
     async def test_the_happy_paths_taker_fill_is_captured_for_comparison(self):
         client = FakeClient()
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert len(report.fidelity.comparisons) == 1
         assert report.fidelity.comparisons[0].is_maker is False
 
     async def test_no_fill_means_an_empty_fidelity_report(self):
         client = FakeClient()
         client.fillable = False
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert report.fidelity.comparisons == []
         assert "nothing to compare" in report.fidelity.summary
 
 
 class TestSideMappingIsVerifiedAgainstTheExchange:
     async def test_both_sides_are_checked_and_pass_when_kalshi_reads_them_back_correctly(self):
-        report = await run_demo_check(FakeClient(), SERIES, clock=lambda: T0)
+        report = await run_demo_check(FakeClient(), SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "resting YES order + cancel").passed is True
         assert result_named(report, "resting NO order + cancel").passed is True
         assert "read back correctly" in result_named(report, "resting NO order + cancel").detail
@@ -326,7 +354,7 @@ class TestSideMappingIsVerifiedAgainstTheExchange:
         client = FakeClient()
         client.wrong_side_mapping = True
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         result = result_named(report, "resting NO order + cancel")
         assert result.passed is False and "mapping" in result.detail and "WRONG" in result.detail
@@ -340,7 +368,7 @@ class TestShardCollateralPreflight:
         client.open_markets = [make_market(raw={"exchange_index": 2})]
         client.balance = Balance(available=Decimal("100"), portfolio_value=Decimal(0), by_exchange={0: Decimal("100"), 2: Decimal(0)})
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         row = result_named(report, "collateral on the market's exchange shard")
         assert row.passed is False and "shard 2" in row.detail and "demo-allocate" in row.detail
@@ -352,12 +380,12 @@ class TestShardCollateralPreflight:
         client = FakeClient()
         client.open_markets = [make_market(raw={"exchange_index": 2})]
         client.balance = Balance(available=Decimal("100"), portfolio_value=Decimal(0), by_exchange={2: Decimal("100")})
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "collateral on the market's exchange shard").passed is True
         assert result_named(report, "resting YES order + cancel").passed is True
 
     async def test_an_unreported_shard_is_a_skip_not_a_failure(self):
-        report = await run_demo_check(FakeClient(), SERIES, clock=lambda: T0)  # no exchange_index, no breakdown
+        report = await run_demo_check(FakeClient(), SERIES, clock=lambda: T0, sleep=instant)  # no exchange_index, no breakdown
         assert result_named(report, "collateral on the market's exchange shard").passed is None
         assert report.ok is True
 
@@ -371,23 +399,24 @@ class TestNothingIsLeftRestingOnTheAccount:
 
         client = FakeClient()
         client.get_order_raises = KalshiAPIError(404, "not found", code="not_found")
+        client.book_blind = True  # neither the read-back nor the order book can confirm the order
 
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
 
         for side in ("YES", "NO"):
             row = result_named(report, f"resting {side} order + cancel")
-            assert row.passed is False and "could not be read back" in row.detail and row.detail.endswith("; cancelled")
+            assert row.passed is False and "would not read the order back" in row.detail and row.detail.endswith("; cancelled")
         assert all(o.is_done for o in client.orders.values() if o.price == Decimal("0.01"))  # none left resting
 
     async def test_a_failed_cancel_is_reported_not_hidden(self):
         client = FakeClient()
         client.cancel_actually_works = False
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert "cancel FAILED" in "\n".join(r.detail for r in report.results) or result_named(report, "resting YES order + cancel").passed is False
 
     async def test_the_last_row_sweeps_every_resting_order_and_passes(self):
         client = FakeClient()
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         last = report.results[-1]
         assert last.name == "cleanup: cancel any resting demo orders" and last.passed is True
         assert client.sweeps >= 1 and all(o.is_done for o in client.orders.values())  # reconcile sweeps once too
@@ -397,6 +426,97 @@ class TestNothingIsLeftRestingOnTheAccount:
 
         client = FakeClient()
         client.sweep_raises = KalshiConnectionError("down")
-        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         last = report.results[-1]
         assert last.passed is False and "Orders tab" in last.detail and report.ok is False
+
+
+class TestReadBackUnavailableFallsBackToTheOrderBook:
+    """On the owner's real demo account GET /portfolio/orders/{id} returns 404 for a V2 order that was just
+    accepted. The side mapping is then proven from the public order book, or the check fails."""
+
+    def not_found(self):
+        from btcbot.kalshi_client import KalshiAPIError
+
+        return KalshiAPIError(404, "not found", code="not_found")
+
+    async def test_the_mapping_is_verified_through_the_book_when_the_read_back_404s(self):
+        client = FakeClient()
+        client.get_order_raises = self.not_found()
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        for side in ("YES", "NO"):
+            row = result_named(report, f"resting {side} order + cancel")
+            assert row.passed is True and "public order book" in row.detail and f"+1 contract on {side}" in row.detail
+        assert all(o.is_done for o in client.orders.values() if o.price == Decimal("0.01"))
+
+    async def test_an_order_that_shows_up_on_the_wrong_side_of_the_book_fails_loudly(self):
+        client = FakeClient()
+        client.get_order_raises = self.not_found()
+        client.wrong_side_mapping = True  # a NO order lands on the YES side of the book
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        row = result_named(report, "resting NO order + cancel")
+        assert row.passed is False and "WRONG" in row.detail and "shows it on YES" in row.detail
+
+    async def test_an_order_that_neither_reads_back_nor_shows_in_the_book_fails(self):
+        client = FakeClient()
+        client.get_order_raises = self.not_found()
+        client.book_blind = True
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        row = result_named(report, "resting YES order + cancel")
+        assert row.passed is False and "did not show in the order book either" in row.detail
+
+    async def test_a_slow_index_is_retried_before_falling_back(self):
+        client = FakeClient()
+        seen: dict[str, int] = {}
+        original = client.get_order
+
+        async def slow(order_id):
+            seen[order_id] = seen.get(order_id, 0) + 1
+            if seen[order_id] <= 2:  # the first two reads of each order 404 (not indexed yet), then it is visible
+                raise self.not_found()
+            return await original(order_id)
+
+        client.get_order = slow
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        assert result_named(report, "resting YES order + cancel").passed is True
+        assert "read back correctly" in result_named(report, "resting YES order + cancel").detail
+
+
+class TestReconcileWhenTheOrderListIsBlind:
+    async def test_the_sweep_clears_the_orphan_and_the_book_proves_it(self):
+        client = FakeClient()
+        client.list_orders_blind = True
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        row = result_named(report, "crash-and-restart reconciliation")
+        assert row.passed is True and "cancel-all" in row.detail and "order book is back" in row.detail
+
+    async def test_a_failing_sweep_leaves_it_a_failure(self):
+        from btcbot.kalshi_client import KalshiConnectionError
+
+        client = FakeClient()
+        client.list_orders_blind = True
+        client.sweep_raises = KalshiConnectionError("down")
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        assert result_named(report, "crash-and-restart reconciliation").passed is False
+
+
+class TestFillsReportedOnlyByTheCreateAck:
+    async def test_a_fill_the_list_cannot_see_is_taken_from_the_ack(self):
+        client = FakeClient()
+        client.hide_fills = True
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        row = result_named(report, "fillable order + position")
+        assert row.passed is True and "1 fill(s)" in row.detail
+        (comparison,) = report.fidelity.comparisons
+        assert comparison.is_maker is False and comparison.price == Decimal("0.50") and comparison.real_fee_usd == Decimal("0.02")
+
+    async def test_a_fill_with_no_visible_position_is_inconclusive_not_a_pass(self):
+        client = FakeClient()
+        original = client.get_positions
+
+        async def none_visible():
+            return []
+
+        client.get_positions = none_visible
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        assert result_named(report, "fillable order + position").passed is None

@@ -21,7 +21,8 @@ outcome against Kalshi's actual API, which the owner's own first run is what act
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_FLOOR, Decimal
@@ -50,6 +51,7 @@ class DemoCheckClient(Protocol):
     ) -> object: ...
     async def cancel_order(self, order_id: str, *, market_ticker: str | None = None) -> object: ...
     async def cancel_all_resting_orders(self) -> object: ...
+    async def get_orderbook(self, ticker: str, *, depth: int = 0) -> object: ...
     async def get_positions(self) -> list[object]: ...
     async def list_orders(self, *, ticker: str | None = None, status: str | None = None) -> list[object]: ...
 
@@ -139,6 +141,7 @@ async def run_demo_check(
     *,
     wait_for_settlement: bool = False,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> DemoCheckReport:
     """``clock`` defaults to the real UTC clock, sampled fresh at each step (discovery, then later the
     settlement check) rather than once at the top -- the same injectable-clock pattern recorder.py and
@@ -166,8 +169,8 @@ async def run_demo_check(
         return DemoCheckReport(market.ticker, results)  # every order below would fail the same way; say it once
 
     backend = DemoExecutionBackend(client, market.ticker)
-    results.append(await _check_resting_order_and_cancel(client, backend, "yes"))
-    results.append(await _check_resting_order_and_cancel(client, backend, "no"))
+    results.append(await _check_resting_order_and_cancel(client, backend, "yes", market, sleep))
+    results.append(await _check_resting_order_and_cancel(client, backend, "no", market, sleep))
     fillable_result, observed_fills = await _check_fillable_order_and_position(client, backend, market)
     results.append(fillable_result)
     if wait_for_settlement:
@@ -178,7 +181,7 @@ async def run_demo_check(
     results.append(await _check_insufficient_balance_rejected(client, market, balance))
     results.append(await _check_closed_market_rejected(client, series_ticker))
     results.append(await _check_survives_a_request_burst(client))
-    results.append(await _check_crash_restart_reconciliation(client, market))
+    results.append(await _check_crash_restart_reconciliation(client, market, sleep))
     results.append(await _sweep_leftover_orders(client))
 
     fidelity = FidelityReport([compare_fill_to_paper_fee_model(fill) for fill in observed_fills])
@@ -209,14 +212,46 @@ def collateral_preflight(balance: Balance, market: Market) -> CheckResult:
     return CheckResult(name, True, f"${on_shard:,.2f} is on exchange shard {index}")
 
 
-async def _check_resting_order_and_cancel(client: DemoCheckClient, backend: DemoExecutionBackend, side: Side) -> CheckResult:
-    """A tiny, deliberately unfillable order (deep off the current market) then a cancel. Run once per side
-    because Kalshi's V2 endpoint only speaks YES: a NO order is sent as an ask on YES at ``1 - price``, and
-    reading the order back is what proves that mapping did what was intended. If the order comes back as the
-    wrong outcome or at the wrong price, this FAILS: trading on a wrong side mapping would be the worst bug
-    this whole phase could ship."""
+async def _book_size(client: DemoCheckClient, ticker: str, side: Side, price: Decimal) -> Decimal | None:
+    """Contracts resting on ``side`` at exactly ``price`` in the PUBLIC order book (which needs no order reads and
+    was the one view that always worked), or None if the book could not be read."""
+    try:
+        book = await client.get_orderbook(ticker)  # type: ignore[attr-defined]
+    except KalshiError:
+        return None
+    levels = book.yes_bids if side == "yes" else book.no_bids
+    return sum((level.size for level in levels if level.price == price), Decimal(0))
+
+
+async def _read_back(client: DemoCheckClient, order_id: str, sleep: Callable[[float], Awaitable[None]], *, attempts: int = 4):
+    """Read an order back, retrying a few times in case the exchange is just slow to index it."""
+    error: KalshiError | None = None
+    for attempt in range(attempts):
+        if attempt:
+            await sleep(0.75)
+        try:
+            return await client.get_order(order_id), None  # type: ignore[return-value]
+        except KalshiError as exc:
+            error = exc
+    return None, error
+
+
+async def _check_resting_order_and_cancel(
+    client: DemoCheckClient, backend: DemoExecutionBackend, side: Side, market: Market,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> CheckResult:
+    """A tiny order deep off the current market, read back, then cancelled. Run once per side because Kalshi's V2
+    endpoint only speaks YES: a NO order is sent as an ask on YES at ``1 - price``, so this is where the side
+    mapping is proven. The proof is the order read back (right side, right price). If the exchange will not read
+    the order back (the old single-order endpoint returned 404 for V2 orders on a real demo account), the PUBLIC
+    order book is the fallback: our one contract must appear at that price on the intended side and not the other.
+    If neither can confirm the side, this FAILS: trading on a wrong side mapping is the worst bug this phase
+    could ship."""
     name = f"resting {side.upper()} order + cancel"
     price = Decimal("0.01")
+    other: Side = "no" if side == "yes" else "yes"
+    own_before = await _book_size(client, market.ticker, side, price)
+    other_before = await _book_size(client, market.ticker, other, price)
     try:
         order_id = await backend.place_resting_order(side, price, Decimal(1))
     except KalshiError as exc:
@@ -224,12 +259,11 @@ async def _check_resting_order_and_cancel(client: DemoCheckClient, backend: Demo
 
     # From here an order EXISTS on the exchange. Whatever the read-back does, it is cancelled below: an earlier
     # version returned on a failed read and left the order resting on the account.
-    read_error: KalshiError | None = None
-    placed = None
-    try:
-        placed = await client.get_order(order_id)
-    except KalshiError as exc:
-        read_error = exc
+    placed, read_error = await _read_back(client, order_id, sleep)
+    own_after = other_after = None
+    if placed is None:
+        own_after = await _book_size(client, market.ticker, side, price)
+        other_after = await _book_size(client, market.ticker, other, price)
     cancel_error: KalshiError | None = None
     try:
         await backend.cancel_order(order_id)
@@ -237,8 +271,22 @@ async def _check_resting_order_and_cancel(client: DemoCheckClient, backend: Demo
         cancel_error = exc
     cancel_note = f"; cancel FAILED ({cancel_error}), it may still be resting" if cancel_error else "; cancelled"
 
-    if read_error is not None:
-        return CheckResult(name, False, f"order {order_id} was accepted but could not be read back ({read_error}){cancel_note}")
+    if placed is None:
+        gone = "the exchange would not read the order back (" + str(read_error) + ")"
+        if None in (own_before, other_before, own_after, other_after):
+            return CheckResult(name, False, f"order {order_id} was accepted but {gone}, and the order book could not be read either{cancel_note}")
+        own_delta, other_delta = own_after - own_before, other_after - other_before
+        if own_delta >= 1 and other_delta < 1:
+            note = f"read-back unavailable ({read_error}); verified through the public order book instead: +{own_delta} contract on {side.upper()} at {price}, none on {other.upper()}"
+            return CheckResult(name, cancel_error is None, f"order {order_id}: {note}{cancel_note}")
+        if other_delta >= 1 and own_delta < 1:
+            return CheckResult(
+                name, False,
+                f"asked for {side.upper()} at {price} but the order book shows it on {other.upper()}: the side mapping in "
+                f"kalshi_client.create_order is WRONG; do not trade until fixed{cancel_note}",
+            )
+        return CheckResult(name, False, f"order {order_id} was accepted but {gone}, and it did not show in the order book either "
+                                        f"(change at {side.upper()} {price}: {own_delta}){cancel_note}")
     if placed.is_done:
         return CheckResult(name, False, f"order {order_id} was already done ({placed.status}) right after placing it{cancel_note}")
     if placed.side != side or (placed.price is not None and placed.price != price):
@@ -281,9 +329,18 @@ async def _check_fillable_order_and_position(
         fills = await backend.place_taker_order("yes", Decimal(1))
         if not fills:
             return CheckResult(name, False, "market order returned no fills (demo book may be empty right now)"), []
-        positions = await client.get_positions()
+        try:
+            positions = await client.get_positions()
+        except KalshiError as exc:
+            return CheckResult(name, None, f"{len(fills)} fill(s), but the positions endpoint failed: {exc}"), fills
         has_position = any(p.ticker == market.ticker and p.count > 0 for p in positions)
-        return CheckResult(name, has_position, f"{len(fills)} fill(s); position present: {has_position}"), fills
+        if not has_position:
+            return CheckResult(
+                name, None,
+                f"{len(fills)} fill(s) reported by the exchange, but no position for this market is visible yet: "
+                "inconclusive (the positions read may lag or be blind to this shard; check the demo Portfolio)",
+            ), fills
+        return CheckResult(name, True, f"{len(fills)} fill(s); position present"), fills
     except KalshiError as exc:
         return CheckResult(name, False, str(exc)), []
 
@@ -355,22 +412,42 @@ async def _check_survives_a_request_burst(client: DemoCheckClient) -> CheckResul
     return CheckResult(name, True, "5 rapid balance checks all succeeded (see test_client.py for 429 backoff coverage)")
 
 
-async def _check_crash_restart_reconciliation(client: DemoCheckClient, market: Market) -> CheckResult:
-    """Places an order and deliberately does NOT cancel it -- simulating a crash -- then builds a fresh
-    DemoExecutionBackend (a "new process") and confirms reconcile() finds and cancels it."""
+async def _check_crash_restart_reconciliation(
+    client: DemoCheckClient, market: Market, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+) -> CheckResult:
+    """Places an order and deliberately does NOT cancel it (a crash), then builds a fresh DemoExecutionBackend (a
+    "new process") and confirms reconcile() cleans it up. The order list can be blind to V2 orders, so success is
+    either "the list found it and cancelled it" or "the read-free cancel-all cleared it": the latter is proven by
+    the public order book returning to what it was."""
     name = "crash-and-restart reconciliation"
+    price = Decimal("0.01")
     try:
+        before = await _book_size(client, market.ticker, "yes", price)
         stray_backend = DemoExecutionBackend(client, market.ticker)
-        stray_order_id = await stray_backend.place_resting_order("yes", Decimal("0.01"), Decimal(1))
+        stray_order_id = await stray_backend.place_resting_order("yes", price, Decimal(1))
 
         fresh_backend = DemoExecutionBackend(client, market.ticker)
         report = await fresh_backend.reconcile()
 
-        if stray_order_id not in report.cancelled_order_ids:
-            return CheckResult(name, False, f"order {stray_order_id} was left orphaned after reconcile()")
-        order = await client.get_order(stray_order_id)
-        if not order.is_done:
-            return CheckResult(name, False, f"order {stray_order_id} reported cancelled but still shows {order.status}")
-        return CheckResult(name, True, f"a fresh backend found and cancelled orphaned order {stray_order_id}")
+        found = stray_order_id in report.cancelled_order_ids
+        if found:
+            try:
+                order = await client.get_order(stray_order_id)
+            except KalshiError:
+                order = None  # reads can be blind: verify through the public order book below instead
+            if order is not None:
+                if not order.is_done:
+                    return CheckResult(name, False, f"order {stray_order_id} reported cancelled but still shows {order.status}")
+                return CheckResult(name, True, f"a fresh backend found and cancelled orphaned order {stray_order_id}")
+        elif report.sweep_error is not None:
+            return CheckResult(name, False, f"order {stray_order_id} was left orphaned: the order list did not show it and the "
+                                            f"cancel-all sweep failed ({report.sweep_error})")
+        await sleep(0.75)
+        after = await _book_size(client, market.ticker, "yes", price)
+        if before is not None and after is not None and after <= before:
+            how = ("found and cancelled by the order list, and confirmed" if found
+                   else "not in the order list (it cannot see V2 orders here), but reconcile's cancel-all sweep cleared it:")
+            return CheckResult(name, True, f"order {stray_order_id} was {how} the public order book is back to {after} at {price}")
+        return CheckResult(name, False, f"order {stray_order_id} was left orphaned after reconcile() (order book at {price}: {before} before, {after} after)")
     except KalshiError as exc:
         return CheckResult(name, False, str(exc))
