@@ -328,3 +328,39 @@ class TestAuditFixes:
     def test_low_threshold_cannot_claim_evidence(self, tmp_path):
         report = run_lab(seeded(tmp_path, ['yes'] * 10), BotConfig(), {}, min_train_trades=1)
         assert 'Exploratory' in report.verdict or 'No combination' in report.verdict
+
+class TestConfidenceFilters:
+    def test_persistence_and_min_p_side_are_parsed_and_range_checked(self):
+        assert parse_values("persist_steps", "1, 5, 30") == [1, 5, 30]
+        assert parse_values("min_p_side", "none, 0.5") == [None, Decimal("0.5")]
+        for key, raw in (("persist_steps", "0"), ("persist_steps", "1000"), ("min_p_side", "1.2"), ("min_p_side", "0")):
+            with pytest.raises(LabError):
+                parse_values(key, raw)
+
+    def test_persistence_of_one_changes_nothing_and_a_long_requirement_blocks_every_entry(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 3)
+        assert len(replay(data, filters=EntryFilters(persist_steps=1)).trades) == 3
+        blocked = replay(data, filters=EntryFilters(persist_steps=10_000))
+        assert blocked.trades == [] and blocked.filter_counts["persistence"] > 0
+
+    def test_persistence_needs_that_many_consecutive_wanted_snapshots(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 3)
+        base = replay(data, filters=EntryFilters(persist_steps=1))
+        slower = replay(data, filters=EntryFilters(persist_steps=3))
+        assert len(slower.trades) <= len(base.trades)
+        assert slower.filter_counts["persistence"] >= 2  # the first two snapshots of each streak were refused
+        assert all(a.entry_ts <= b.entry_ts for a, b in zip(sorted(base.trades, key=lambda t: t.ticker),
+                                                          sorted(slower.trades, key=lambda t: t.ticker)))  # never earlier
+
+    def test_min_p_side_refuses_a_side_the_model_does_not_favour(self, tmp_path):
+        data = seeded(tmp_path, ["yes"] * 3)
+        assert len(replay(data, filters=EntryFilters(min_p_side=Decimal("0.01"))).trades) == 3
+        strict = replay(data, filters=EntryFilters(min_p_side=Decimal("0.999")))
+        assert strict.trades == [] and strict.filter_counts["low_confidence"] > 0
+
+    def test_the_lab_sweeps_the_new_keys_and_describes_them(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        report = run_lab(data, BotConfig(), {"persist_steps": [1, 3], "min_p_side": [None, Decimal("0.5")]}, min_train_trades=3)
+        assert report.combinations == 4
+        text = render_lab_report(report)
+        assert "persist_steps" in text or "min_p_side" in text or "(defaults)" in text

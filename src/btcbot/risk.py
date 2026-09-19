@@ -58,6 +58,24 @@ class RiskManager:
         self._daily_reset_date = None
         self._max_size_since_loss: Decimal | None = None
         self._last_order_size: Decimal | None = None
+        self._account_usd: Decimal | None = None
+
+    def set_account_value(self, usd: Decimal) -> None:
+        """Tell the manager what the account is worth now (start plus SETTLED profit and loss). Only matters when
+        ``max_open_exposure_pct`` / ``daily_loss_limit_pct`` are configured."""
+        self._account_usd = usd
+
+    def _max_open_exposure(self) -> Decimal:
+        pct = self._limits.max_open_exposure_pct
+        if pct is not None and self._account_usd is not None:
+            return self._account_usd * pct / 100
+        return self._limits.max_open_exposure_usd
+
+    def _daily_loss_limit(self) -> Decimal:
+        pct = self._limits.daily_loss_limit_pct
+        if pct is not None and self._account_usd is not None:
+            return self._account_usd * pct / 100
+        return self._limits.daily_loss_limit_usd
 
     # ---- read-only state, useful for reporting
 
@@ -95,7 +113,7 @@ class RiskManager:
             return RiskDecision(False, "KILL file present")
         if self._paused:
             return RiskDecision(False, f"paused: {self._pause_reason}")
-        if self._daily_loss_usd >= self._limits.daily_loss_limit_usd:
+        if self._daily_loss_usd >= self._daily_loss_limit():
             return RiskDecision(False, "daily loss limit reached")
         if size <= 0:
             return RiskDecision(False, "size must be positive")
@@ -104,7 +122,7 @@ class RiskManager:
         if self._max_size_since_loss is not None and size > self._max_size_since_loss:
             return RiskDecision(False, "size increase after a loss is not allowed")
         exposure = price * size
-        if self._open_exposure_usd + exposure > self._limits.max_open_exposure_usd:
+        if self._open_exposure_usd + exposure > self._max_open_exposure():
             return RiskDecision(False, "exceeds max_open_exposure_usd")
         self._drop_trades_older_than_an_hour(now)
         if len(self._trade_times) >= self._limits.max_trades_per_hour:

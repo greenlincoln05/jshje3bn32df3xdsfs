@@ -17,6 +17,13 @@ sizing:
   contracts_per_trade: 5
   mode: fixed                  # fixed | kelly (fractional Kelly on risk.max_open_exposure_usd)
   kelly_fraction_multiplier: 0.2
+  # mode: percent  -> stake risk_pct_per_trade % of the CURRENT account per order. The account starts at
+  # account_usd and moves only with SETTLED profit and loss; after a win the next order may grow by at most
+  # max_growth_per_win_pct %, after a loss it can never grow. Pair it with the two account-relative risk limits
+  # below so the caps rise and fall with the account. (Defaults shown; percent mode is off unless you set it.)
+  account_usd: 500
+  risk_pct_per_trade: 2
+  max_growth_per_win_pct: 20
 risk:
   max_contracts_per_trade: 10
   max_open_exposure_usd: 25
