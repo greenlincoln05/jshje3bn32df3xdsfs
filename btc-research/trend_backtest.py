@@ -8,17 +8,23 @@ answers two questions from watching the market "freehand":
 2. Given a losing position, is it better to hold to settlement or cut and flip sides
    when the move against you gets bad enough and there is still time left?
 
-Important limitation: Kalshi's own historical order-book prices are not fetched here
-(that is Phase 2/4 work in the main bot). Entry price is a fixed assumption you pass
-in (default $0.60, matching the "60 cents a piece" scenario), and the in-window
-contract-price path used for the exit comparison is *modeled*, not observed: it
-reuses the spec's v1 fair-probability approximation (Phi(d) with realized EWMA
-volatility) driven by the real BTC/USD price path from Coinbase. Treat results as a
-sanity check on the exit logic, not a profitability claim -- CLAUDE.md is explicit
-that no profitability claim is valid without recorded, out-of-sample Kalshi results.
+Important limitation: the in-window contract-price path used for the exit comparison is
+*modeled*, not observed: it reuses the spec's v1 fair-probability approximation (Phi(d) with
+realized EWMA volatility) driven by the real BTC/USD price path from Coinbase, because Kalshi
+has no historical order-book endpoint to backtest real fills against (see
+record_live_orderbook.py to start capturing that going forward). Entry price is a fixed
+assumption you pass in (default $0.60, matching the "60 cents a piece" scenario).
+
+Pass --kalshi-csv (from fetch_kalshi_settlements.py) to replace the Coinbase-derived strike and
+win/loss outcome with Kalshi's own recorded floor_strike/expiration_value/result for any window
+where that ground truth is available -- Coinbase is then only used for the trend signal and
+volatility, not for deciding who actually won. Treat results as a sanity check on the exit
+logic, not a profitability claim -- CLAUDE.md is explicit that no profitability claim is valid
+without recorded, out-of-sample Kalshi results.
 
 Usage:
-    python btc-research/trend_backtest.py --csv btc-research/data/btc_1m.csv
+    python btc-research/trend_backtest.py --csv btc-research/data/btc_1m.csv \
+        --kalshi-csv btc-research/data/kalshi_settlements.csv
 """
 from __future__ import annotations
 
@@ -48,6 +54,22 @@ def load_candles(csv_path: Path) -> list[Candle]:
             rows.append(Candle(ts=ts, close=float(row["close"])))
     rows.sort(key=lambda c: c.ts)
     return rows
+
+
+def load_kalshi_ground_truth(csv_path: Path) -> dict[datetime, tuple[float, bool]]:
+    """Real (strike, settled_yes) per window, keyed by open_time truncated to the minute.
+
+    From fetch_kalshi_settlements.py. Rows missing floor_strike/expiration_value (settlement
+    still pending, or a field Kalshi hasn't backfilled) are skipped rather than guessed at.
+    """
+    ground_truth: dict[datetime, tuple[float, bool]] = {}
+    with csv_path.open() as f:
+        for row in csv.DictReader(f):
+            if not row["floor_strike"] or not row["result"]:
+                continue
+            open_time = datetime.fromisoformat(row["open_time"]).astimezone(timezone.utc).replace(second=0, microsecond=0)
+            ground_truth[open_time] = (float(row["floor_strike"]), row["result"] == "yes")
+    return ground_truth
 
 
 def phi(x: float) -> float:
@@ -122,20 +144,25 @@ def simulate_window(
     min_minutes_to_flip: float,
     vol_span: int,
     contracts: float,
+    ground_truth: dict[datetime, tuple[float, bool]] | None = None,
 ) -> TradeResult | None:
     window_close = window_open.fromtimestamp(window_open.timestamp() + WINDOW_MIN * 60, tz=timezone.utc)
     t_enter = window_open.fromtimestamp(window_open.timestamp() + entry_minute * 60, tz=timezone.utc)
 
-    strike = closes_by_ts.get(window_open)
-    settle_price = closes_by_ts.get(window_close)
-    if strike is None or settle_price is None:
-        return None
+    real = ground_truth.get(window_open) if ground_truth else None
+    if real is not None:
+        strike, settled_yes = real
+    else:
+        strike = closes_by_ts.get(window_open)
+        settle_price = closes_by_ts.get(window_close)
+        if strike is None or settle_price is None:
+            return None
+        settled_yes = settle_price >= strike
 
     side = trend_signal(closes_by_ts, t_enter)
     if side is None:
         return None
 
-    settled_yes = settle_price >= strike
     settled_side_won = settled_yes if side == "yes" else not settled_yes
     hold_pnl = (1.0 if settled_side_won else 0.0) - entry_price
     hold_pnl -= fee(contracts, entry_price)
@@ -177,6 +204,10 @@ def run(args: argparse.Namespace) -> None:
         print("no data")
         return
 
+    ground_truth = load_kalshi_ground_truth(args.kalshi_csv) if args.kalshi_csv else None
+    if ground_truth is not None:
+        print(f"using {len(ground_truth)} real Kalshi-settled windows as ground truth (from {args.kalshi_csv})")
+
     first, last = candles[0].ts, candles[-1].ts
     window_starts = []
     t = first.replace(minute=(first.minute // WINDOW_MIN) * WINDOW_MIN, second=0, microsecond=0)
@@ -191,6 +222,7 @@ def run(args: argparse.Namespace) -> None:
             simulate_window(
                 closes_by_ts, w, args.entry_minute, args.entry_price,
                 args.flip_threshold, args.min_minutes_to_flip, args.vol_span, args.contracts,
+                ground_truth,
             )
             for w in window_starts
         ) if r is not None
@@ -225,6 +257,10 @@ def run(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, default=Path("btc-research/data/btc_1m.csv"))
+    parser.add_argument(
+        "--kalshi-csv", type=Path, default=None,
+        help="from fetch_kalshi_settlements.py; overrides strike/settlement with real Kalshi ground truth",
+    )
     parser.add_argument("--entry-minute", type=int, default=6, help="minutes into the window to enter (default: 9 min left)")
     parser.add_argument("--entry-price", type=float, default=0.60)
     parser.add_argument("--flip-threshold", type=float, default=0.20, help="flip when model-implied p(your side) drops to this")

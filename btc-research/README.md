@@ -27,23 +27,49 @@ and follow the leader" approach has real signal, and to compare exit rules on a 
 ## Files
 
 - `fetch_trend_data.py` -- pulls 1-minute BTC-USD candles from Coinbase's public REST API
-  (same source the spec already names for the Phase 2 spot feed) and writes a CSV.
-- `trend_backtest.py` -- given that CSV, checks 15/30/1h/24h trend agreement at a configurable
-  entry point in each 15-minute window, and compares two exits on the resulting trade:
+  (same source the spec already names for the Phase 2 spot feed) and writes a CSV. Used for the
+  trend signal and the modeled volatility, not for settlement truth.
+- `fetch_kalshi_settlements.py` -- pulls **real** KXBTC15M settlement history straight from
+  Kalshi's public API: `floor_strike`, `expiration_value` and `result` for every settled window.
+  No credentials needed (same as `btcbot discover`); it reuses `btcbot.kalshi_client.KalshiClient`
+  so pagination, retries and Decimal-safe parsing come for free. This is the "live Kalshi data"
+  piece: it replaces the Coinbase-close approximation of who won each window with Kalshi's own
+  recorded outcome.
+- `record_live_orderbook.py` -- polls the currently *open* market's orderbook every few seconds
+  and appends top-of-book prices to a CSV, going forward only. Kalshi has no historical
+  order-book endpoint, so a real (not modeled) in-window contract-price path can only be captured
+  live; run this continuously for a while to build one up. Read-only, no credentials, places no
+  orders -- a much smaller, research-only cousin of the Phase 2 recorder in the main spec.
+- `trend_backtest.py` -- given a Coinbase CSV (and optionally a Kalshi settlements CSV), checks
+  15/30/1h/24h trend agreement at a configurable entry point in each 15-minute window, and
+  compares two exits on the resulting trade:
   - **hold**: hold to settlement no matter what (the spec's own default exit)
   - **flip**: cut the losing side and take the other one if the model-implied probability of your
     side drops to a threshold and there's still enough time left, priced with the same v1
-    fair-probability model from the spec (not a real observed Kalshi price -- there is no recorded
-    Kalshi order-book history to backtest against yet, so this is a modeled approximation of the
-    contract price path, not a measured one)
-- `test_trend_backtest.py` -- offline unit tests (synthetic price series, no network).
+    fair-probability model from the spec (modeled, not an observed Kalshi price, until
+    `record_live_orderbook.py` has accumulated enough real in-window price history to backtest
+    against instead)
+- `test_trend_backtest.py`, `test_fetch_kalshi_settlements.py` -- offline unit tests (synthetic
+  price series / `httpx.MockTransport` against a real settled-market payload shape, no network).
 
 ## Usage
 
 ```
+# Trend signal + modeled exit pricing, from Coinbase
 python btc-research/fetch_trend_data.py --hours 48 --out btc-research/data/btc_1m.csv
-python btc-research/trend_backtest.py --csv btc-research/data/btc_1m.csv
-pytest btc-research/test_trend_backtest.py
+
+# Real Kalshi settlement ground truth (who actually won each window)
+python btc-research/fetch_kalshi_settlements.py --out btc-research/data/kalshi_settlements.csv
+
+# Backtest against real settlements where available, Coinbase-derived elsewhere
+python btc-research/trend_backtest.py \
+    --csv btc-research/data/btc_1m.csv \
+    --kalshi-csv btc-research/data/kalshi_settlements.csv
+
+# Start building a real in-window price history for future exit backtests (run for a while)
+python btc-research/record_live_orderbook.py --out btc-research/data/orderbook_live.csv
+
+pytest btc-research/
 ```
 
 ## Reading the output
@@ -53,5 +79,5 @@ looks good on the data it was tuned against doesn't get reported as if it worked
 none of this is a profitability claim -- it needs Kalshi's own recorded order-book history and
 fees (Phase 2 and Phase 4 of the main bot) before any number here means real money. What it can
 tell you now: whether multi-timeframe trend agreement predicts the settlement direction better
-than a coin flip on real BTC data, and whether flipping sides on an adverse move would have beaten
-holding, on the entry price and thresholds you pass in.
+than a coin flip on Kalshi's own recorded outcomes, and whether flipping sides on an adverse move
+would have beaten holding, on the entry price and thresholds you pass in.

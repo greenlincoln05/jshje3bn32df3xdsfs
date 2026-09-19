@@ -1,0 +1,33 @@
+{
+  "cursor": "",
+  "markets": [
+    {
+      "ticker": "KXBTC15M-26SEP180000-00",
+      "event_ticker": "KXBTC15M-26SEP180000",
+      "status": "finalized",
+      "title": "BTC price up in next 15 mins?",
+      "open_time": "2026-09-18T00:00:00Z",
+      "close_time": "2026-09-18T00:15:00Z",
+      "floor_strike": 80000.12,
+      "strike_type": "greater_or_equal",
+      "expiration_value": "80125.50",
+      "result": "yes",
+      "volume_fp": "1000.00",
+      "open_interest_fp": "500.00"
+    },
+    {
+      "ticker": "KXBTC15M-26SEP180015-15",
+      "event_ticker": "KXBTC15M-26SEP180015",
+      "status": "finalized",
+      "title": "BTC price up in next 15 mins?",
+      "open_time": "2026-09-18T00:15:00Z",
+      "close_time": "2026-09-18T00:30:00Z",
+      "floor_strike": 80125.50,
+      "strike_type": "greater_or_equal",
+      "expiration_value": "79980.00",
+      "result": "no",
+      "volume_fp": "1200.00",
+      "open_interest_fp": "600.00"
+    }
+  ]
+}
