@@ -520,3 +520,51 @@ class TestFillsReportedOnlyByTheCreateAck:
         client.get_positions = none_visible
         report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
         assert result_named(report, "fillable order + position").passed is None
+
+
+class TestCancelVerificationWhenTheOrderEndpointLags:
+    """Real demo account: after a cancel that had worked, GET /portfolio/orders/{id} still said "resting"."""
+
+    def stale(self, client, *, forever):
+        from dataclasses import replace as _replace
+
+        original, seen = client.get_order, {}
+
+        async def get_order(order_id):
+            order = await original(order_id)
+            if order.is_done:
+                seen[order_id] = seen.get(order_id, 0) + 1
+                if forever or seen[order_id] <= 2:
+                    return _replace(order, status="resting")
+            return order
+
+        client.get_order = get_order
+
+    async def test_a_briefly_stale_read_is_retried_until_it_shows_cancelled(self):
+        client = FakeClient()
+        self.stale(client, forever=False)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        row = result_named(report, "resting YES order + cancel")
+        assert row.passed is True and "then canceled" in row.detail
+
+    async def test_a_permanently_stale_read_is_settled_by_the_order_book(self):
+        client = FakeClient()
+        self.stale(client, forever=True)
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        for side in ("YES", "NO"):
+            row = result_named(report, f"resting {side} order + cancel")
+            assert row.passed is True and "order endpoint lags the exchange" in row.detail
+
+    async def test_a_cancel_that_did_not_happen_still_fails_when_the_book_agrees(self):
+        client = FakeClient()
+        client.cancel_actually_works = False
+        report = await run_demo_check(client, SERIES, clock=lambda: T0, sleep=instant)
+        row = result_named(report, "resting YES order + cancel")
+        assert row.passed is False and "still shows resting after cancel" in row.detail and "order book still shows it" in row.detail
+
+
+class TestFidelitySummaryShowsTheNumbers:
+    def test_each_fill_prints_the_real_fee_next_to_the_formulas(self):
+        fill = Fill(side="yes", price=Decimal("0.50"), size=Decimal(1), fee=Decimal("0.02"), maker=False, ts=T0)
+        text = FidelityReport([compare_fill_to_paper_fee_model(fill)]).summary
+        assert "taker YES 1 @ 0.50: real fee $0.02 vs taker formula $" in text

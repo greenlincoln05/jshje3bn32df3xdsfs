@@ -119,6 +119,12 @@ class FidelityReport:
                 "still unconfirmed (demo-check's own resting-order check is deliberately unfillable; a "
                 "maker fill from a future paper-adjacent run would settle this)"
             )
+        for c in self.comparisons:
+            lines.append(
+                f"{'maker' if c.is_maker else 'taker'} {c.side.upper()} {c.size} @ {c.price}: real fee ${c.real_fee_usd} vs "
+                f"taker formula ${c.predicted_taker_fee_usd} (maker formula: ${c.predicted_maker_fee_usd_if_free} free, "
+                f"${c.predicted_maker_fee_usd_at_quarter} at 0.25)"
+            )
         return "; ".join(lines)
 
 
@@ -236,6 +242,22 @@ async def _read_back(client: DemoCheckClient, order_id: str, sleep: Callable[[fl
     return None, error
 
 
+async def _read_until_done(client: DemoCheckClient, order_id: str, sleep: Callable[[float], Awaitable[None]], *, attempts: int = 4):
+    """Read an order until it reports done (cancelled/executed), retrying while it still says resting."""
+    order, error = None, None
+    for attempt in range(attempts):
+        if attempt:
+            await sleep(0.75)
+        try:
+            order, error = await client.get_order(order_id), None  # type: ignore[assignment]
+        except KalshiError as exc:
+            error = exc
+            continue
+        if order.is_done:
+            break
+    return order, error
+
+
 async def _check_resting_order_and_cancel(
     client: DemoCheckClient, backend: DemoExecutionBackend, side: Side, market: Market,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -297,13 +319,23 @@ async def _check_resting_order_and_cancel(
         )
     if cancel_error is not None:
         return CheckResult(name, False, f"order {order_id} read back correctly but{cancel_note}")
-    try:
-        cancelled = await client.get_order(order_id)
-    except KalshiError as exc:
-        return CheckResult(name, False, f"order {order_id} read back correctly and cancelled, but the post-cancel read failed: {exc}")
-    if not cancelled.is_done:
-        return CheckResult(name, False, f"order {order_id} still shows {cancelled.status} after cancel")
-    return CheckResult(name, True, f"order {order_id}: {side.upper()} at {price} read back correctly, then {cancelled.status}")
+    cancelled, cancel_read_error = await _read_until_done(client, order_id, sleep)
+    if cancelled is not None and cancelled.is_done:
+        return CheckResult(name, True, f"order {order_id}: {side.upper()} at {price} read back correctly, then {cancelled.status}")
+    # The order endpoint can lag the exchange (it 404d, then showed "resting" after a cancel that had worked). Before
+    # calling that a failed cancel, look at the PUBLIC order book: if our contract is gone from it, the cancel worked.
+    own_now = await _book_size(client, market.ticker, side, price)
+    if own_now is not None and own_before is not None and own_now <= own_before:
+        seen = f"still shows {cancelled.status}" if cancelled is not None else f"could not be read ({cancel_read_error})"
+        return CheckResult(
+            name, True,
+            f"order {order_id}: {side.upper()} at {price} read back correctly; after the cancel the order endpoint {seen}, but the "
+            f"public order book is back to {own_now} at {price}, so the cancel took effect (the order endpoint lags the exchange)",
+        )
+    if cancelled is None:
+        return CheckResult(name, False, f"order {order_id} read back correctly and cancelled, but the post-cancel read failed: {cancel_read_error}")
+    return CheckResult(name, False, f"order {order_id} still shows {cancelled.status} after cancel"
+                                    + ("" if own_now is None else f", and the order book still shows it (level {own_now} vs {own_before} before)"))
 
 
 async def _sweep_leftover_orders(client: DemoCheckClient) -> CheckResult:
