@@ -8,6 +8,7 @@ from trend_backtest import (
     WINDOW_MIN,
     ewma_sigma,
     fee,
+    load_kalshi_ground_truth,
     model_price,
     simulate_window,
     trend_signal,
@@ -82,6 +83,43 @@ def test_simulate_window_hold_wins_when_trend_confirms():
     assert result.settled_yes is True
     # Won at $0.60 entry: payout 1.0 minus entry minus a small fee.
     assert result.hold_pnl > 0.35
+
+
+def test_load_kalshi_ground_truth_skips_unsettled_rows(tmp_path):
+    csv_path = tmp_path / "settlements.csv"
+    csv_path.write_text(
+        "ticker,open_time,close_time,floor_strike,expiration_value,result\n"
+        "a,2026-09-18T00:00:00+00:00,2026-09-18T00:15:00+00:00,80000.12,80125.50,yes\n"
+        "b,2026-09-18T00:15:00+00:00,2026-09-18T00:30:00+00:00,,,\n"
+    )
+    ground_truth = load_kalshi_ground_truth(csv_path)
+    assert len(ground_truth) == 1
+    (strike, settled_yes), = ground_truth.values()
+    assert strike == 80000.12
+    assert settled_yes is True
+
+
+def test_simulate_window_uses_real_kalshi_ground_truth_over_coinbase_close():
+    # Coinbase data alone would settle this "no" (close < open), but real Kalshi ground truth
+    # says "yes" -- the real settlement must win.
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    closes = _make_uptrend_series(hours=24, start=start, start_price=50_000.0, drift_per_min=0.0003)
+    window_open = start + timedelta(hours=24)
+    window_close = window_open + timedelta(minutes=WINDOW_MIN)
+    closes[window_close] = closes[window_open] - 1.0  # would settle "no" on Coinbase data alone
+
+    ground_truth = {window_open: (closes[window_open], True)}  # real Kalshi result: "yes"
+
+    result = simulate_window(
+        closes, window_open,
+        entry_minute=6, entry_price=0.60,
+        flip_threshold=0.20, min_minutes_to_flip=2.0,
+        vol_span=15, contracts=1.0,
+        ground_truth=ground_truth,
+    )
+
+    assert result is not None
+    assert result.settled_yes is True
 
 
 def test_simulate_window_none_without_strike_or_settlement():
