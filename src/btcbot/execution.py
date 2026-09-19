@@ -9,10 +9,11 @@ cannot become a live backend just by pointing it at a different `KalshiEnv`).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
+from btcbot.kalshi_client import KalshiError
 from btcbot.models import KalshiFill, KalshiOrder, OrderBook, Position, Side
 from btcbot.paper_broker import Fill, PaperBroker
 
@@ -69,6 +70,7 @@ class ReconciliationReport:
 
     cancelled_order_ids: list[str]
     open_positions: list[Position]
+    sweep_error: str | None = None  # the cancel-all safety net's failure, if it failed
 
 
 class DemoExecutionBackend:
@@ -110,9 +112,16 @@ class DemoExecutionBackend:
         for order in open_orders:
             await self._client.cancel_order(order.order_id, market_ticker=order.ticker)
             cancelled.append(order.order_id)
+        # The order list can miss orders (it did on a real demo account), so also cancel everything by the
+        # read-free cancel-all call. A leftover resting order is exactly the "rogue order" to avoid.
+        sweep_error: str | None = None
+        try:
+            await self._client.cancel_all_resting_orders()
+        except KalshiError as exc:
+            sweep_error = str(exc)
         await self._prime()
         positions = [position for position in await self._client.get_positions() if position.count > 0]
-        return ReconciliationReport(cancelled_order_ids=cancelled, open_positions=positions)
+        return ReconciliationReport(cancelled_order_ids=cancelled, open_positions=positions, sweep_error=sweep_error)
 
     async def place_resting_order(self, side: Side, price: Decimal, size: Decimal) -> str:
         if not self._primed:
@@ -128,7 +137,16 @@ class DemoExecutionBackend:
             await self._prime()
         order = await self._client.create_order(self._ticker, side, count=size)  # no price -> marketable IOC
         fills = await self._client.list_fills(ticker=self._ticker, order_id=order.order_id)
-        return [self._to_fill(f) for f in fills if self._mark_seen(f)]
+        result = [self._to_fill(f) for f in fills if self._mark_seen(f)]
+        acked = getattr(order, "fill_count", None) or Decimal(0)
+        price = getattr(order, "average_fill_price", None)
+        if not result and acked > 0 and price:
+            # The fill list can lag or be blind to V2 orders (seen on a real demo account), but the create
+            # response itself reports what filled. ``average_fee_paid`` is read as per contract; the fidelity
+            # report compares it with the fee formula, so a wrong reading shows up there.
+            fee = (getattr(order, "average_fee_paid", None) or Decimal(0)) * acked
+            result = [Fill(side=side, price=price, size=acked, fee=fee, maker=False, ts=datetime.now(timezone.utc))]
+        return result
 
     async def poll_fills(self) -> list[Fill]:
         """Call once per polled snapshot (the same cadence :meth:`PaperExecutionBackend.sync_market` is fed

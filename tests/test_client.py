@@ -707,3 +707,92 @@ class TestShardBalancesAndAllocation:
                 with pytest.raises(ValueError):
                     await demo.set_target_balance_allocation(bad)
         assert demo_script.requests == []
+
+
+class TestOrderAuditLog:
+    """The bot's own ledger of every write it asked Kalshi to do, to check the account's order history against."""
+
+    def logged_client(self, script, rsa_key, env=KalshiEnv.DEMO):
+        records: list[dict] = []
+        client, _ = make_client(script, env=env, auth=KalshiAuth("test-key", rsa_key), write_log=records.append)
+        return client, records
+
+    async def test_a_create_records_the_request_then_the_ack(self, rsa_key):
+        client, records = self.logged_client(Script(ok(CREATE_ACK)), rsa_key)
+        async with client:
+            await client.create_order(TICKER, "no", count=Decimal("5"), price=Decimal("0.68"), client_order_id="cid-9")
+        assert [r["event"] for r in records] == ["create_order", "create_order_ack"]
+        request, ack = records
+        assert request["env"] == "demo" and request["ticker"] == TICKER and request["side"] == "no"
+        assert request["book_side"] == "ask" and request["price"] == "0.3200" and request["count"] == "5.00"
+        assert request["client_order_id"] == "cid-9" and ack["order_id"] == "ord-1" and "ts" in request
+
+    async def test_a_rejected_order_is_logged_as_failed_so_it_is_never_a_mystery(self, rsa_key):
+        client, records = self.logged_client(Script(status(400, {"code": "bad", "message": "no"})), rsa_key)
+        async with client:
+            with pytest.raises(KalshiAPIError):
+                await client.create_order(TICKER, "yes", count=Decimal("1"), price=Decimal("0.5"))
+        assert [r["event"] for r in records] == ["create_order", "create_order_failed"]
+
+    async def test_an_accepted_order_with_an_unreadable_ack_is_logged_because_it_may_exist(self, rsa_key):
+        client, records = self.logged_client(Script(ok({"unexpected": True})), rsa_key)
+        async with client:
+            with pytest.raises(ParseError):
+                await client.create_order(TICKER, "yes", count=Decimal("1"), price=Decimal("0.5"))
+        assert records[-1]["event"] == "create_order_unreadable_ack"
+
+    async def test_cancel_cancel_all_and_allocation_are_logged_too(self, rsa_key):
+        client, records = self.logged_client(Script(ok(CANCEL_ACK)), rsa_key)
+        async with client:
+            await client.cancel_order("ord-1", market_ticker=TICKER)
+            await client.cancel_all_resting_orders()
+            await client.set_target_balance_allocation({2: 100})
+        assert [r["event"] for r in records] == [
+            "cancel_order", "cancel_order_ack", "cancel_all_resting_orders", "cancel_all_resting_orders_ack",
+            "set_target_balance_allocation",
+        ]
+
+    async def test_cancel_all_is_a_delete_on_the_v2_path_and_demo_only(self, rsa_key):
+        script = Script(ok({}))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            await client.cancel_all_resting_orders()
+        assert script.requests[0].method == "DELETE" and script.requests[0].url.path == "/trade-api/v2/portfolio/events/orders"
+
+        prod_script = Script(ok({}))
+        prod, records = self.logged_client(prod_script, rsa_key, env=KalshiEnv.PROD)
+        async with prod:
+            with pytest.raises(KalshiWriteNotAllowedError):
+                await prod.cancel_all_resting_orders()
+        assert prod_script.requests == [] and records == []  # refused before anything was sent or logged
+
+    async def test_a_broken_log_never_stops_an_order(self, rsa_key):
+        def broken(_record):
+            raise OSError("disk full")
+
+        client, _ = make_client(Script(ok(CREATE_ACK)), env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key), write_log=broken)
+        async with client:
+            ack = await client.create_order(TICKER, "yes", count=Decimal("1"), price=Decimal("0.5"))
+        assert ack.order_id == "ord-1"
+
+
+class TestEmptyBodyOnlyWhereKalshiSendsNone:
+    async def test_cancel_all_accepts_an_empty_success_body(self, rsa_key):
+        script = Script(lambda: httpx.Response(200, content=b""))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            assert await client.cancel_all_resting_orders() == {}
+
+    async def test_cancel_all_still_rejects_a_garbage_body(self, rsa_key):
+        script = Script(lambda: httpx.Response(200, content=b"<html>oops</html>"))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            with pytest.raises(KalshiError, match="not valid JSON"):
+                await client.cancel_all_resting_orders()
+
+    async def test_other_endpoints_still_reject_an_empty_body(self, rsa_key):
+        script = Script(lambda: httpx.Response(200, content=b""))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            with pytest.raises(KalshiError, match="not valid JSON"):
+                await client.get_balance()
