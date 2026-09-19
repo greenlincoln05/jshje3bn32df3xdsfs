@@ -224,7 +224,7 @@ def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
             "SELECT status, strike, open_time, close_time, volume, open_interest FROM market_state "
             "WHERE ticker=? ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
         book_row = conn.execute(
-            "SELECT poll_ts, book_json FROM orderbook_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
+            "SELECT poll_ts, book_json, latency_ms FROM orderbook_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
             (ticker,)).fetchone()
         book = json.loads(book_row[1]) if book_row else {"yes": [], "no": []}
         mids = conn.execute(
@@ -232,9 +232,13 @@ def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
             (ticker,)).fetchall()
         first_ts = mids[0][0] if mids else None
         spot = conn.execute(
-            "SELECT receive_ts, price FROM spot_ticks WHERE receive_ts>=? ORDER BY id",
-            (first_ts or "",)).fetchall() if first_ts else []
-        latest_spot = conn.execute("SELECT price, receive_ts FROM spot_ticks ORDER BY id DESC LIMIT 1").fetchone()
+            "SELECT receive_ts, price FROM spot_ticks WHERE receive_ts>=? AND receive_ts<=? ORDER BY receive_ts",
+            (first_ts or "", meta[3] if meta else book_row[0])).fetchall() if first_ts else []
+        latest_spot = conn.execute(
+            "SELECT price, receive_ts FROM spot_ticks WHERE receive_ts>=? AND receive_ts<=? "
+            "ORDER BY receive_ts DESC LIMIT 1",
+            (first_ts or "", meta[3] if meta else book_row[0]),
+        ).fetchone()
         settlement = conn.execute(
             "SELECT result, settled_avg FROM settlements WHERE ticker=?", (ticker,)).fetchone()
         all_trades = _safe_trades(conn)
@@ -256,6 +260,7 @@ def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
         "open_time": meta[2] if meta else None, "close_time": meta[3] if meta else None,
         "volume": meta[4] if meta else None, "open_interest": meta[5] if meta else None,
         "book": book, "book_ts": book_row[0] if book_row else None,
+        "book_latency_ms": book_row[2] if book_row else None,
         "mid_series": _downsample([[r[0], r[1], r[2]] for r in mids], 400),
         "spot_series": _downsample([[r[0], r[1]] for r in spot], 400),
         "spot": latest_spot[0] if latest_spot else None, "spot_ts": latest_spot[1] if latest_spot else None,
@@ -727,7 +732,8 @@ INDEX_HTML = r"""<!doctype html>
     <div class="stats">
       <span>Vol <b id="st-vol">--</b></span><span>Open int <b id="st-oi">--</b></span>
       <span>Spread <b id="st-spread">--</b></span><span>Time left <b id="st-left">--</b></span>
-      <span>Last book <b id="st-ts">--</b></span><span>Data age <b id="st-age">--</b></span>
+      <span>Last book <b id="st-ts">--</b></span><span>Book age <b id="st-age">--</b></span>
+      <span>Spot age <b id="st-spot-age">--</b></span><span>Book request <b id="st-latency">--</b></span>
     </div>
     <div class="chartwrap"><canvas id="mid-chart" height="190"></canvas></div>
     <div class="cols">
@@ -859,7 +865,7 @@ const cents = (p) => (p === null || p === undefined || p === "" ? "--" : Number(
 const num = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
 async function getJson(url) {
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
@@ -982,11 +988,17 @@ function renderBook() {
 }
 
 function updateAge() {
-  const el = $("st-age");
-  if (!el || !market || !market.book_ts) return;
-  const age = (Date.now() - new Date(market.book_ts).getTime()) / 1000;
-  el.textContent = age < 60 ? age.toFixed(1) + "s" : "stale (" + Math.round(age / 60) + "m)";
-  el.className = age < 3 ? "green" : age < 10 ? "orange" : "red";
+  if (!market) return;
+  const ageOf = (ts) => ts ? Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000) : Infinity;
+  const bookAge = ageOf(market.book_ts), spotAge = ageOf(market.spot_ts);
+  for (const [id, age] of [["st-age", bookAge], ["st-spot-age", spotAge]]) {
+    $(id).textContent = Number.isFinite(age) ? age.toFixed(1) + "s" : "missing";
+    $(id).className = age < 3 ? "green" : "red";
+  }
+  const tl = timeLeft(), fresh = bookAge < 3 && spotAge < 3;
+  $("st-left").textContent = tl.text;
+  $("hdr-badge").textContent = !tl.live ? "CLOSED" : fresh ? "LIVE" : "STALE";
+  $("hdr-badge").className = "badge " + (tl.live && fresh ? "live" : "closed");
 }
 
 function timeLeft() {
@@ -1005,8 +1017,8 @@ async function refreshMarket() {
     note.className = "note"; note.textContent = "";
     const sel = $("ticker-select"), chosen = sel.value;
     sel.innerHTML = '<option value="">Latest window (follows automatically)</option>' +
-      market.windows.map((w) => `<option value="${esc(w.ticker)}">${esc(windowLabel(w))}</option>`).join("");
-    sel.value = market.windows.some((w) => w.ticker === chosen) ? chosen : "";
+      (market.windows || []).map((w) => `<option value="${esc(w.ticker)}">${esc(windowLabel(w))}</option>`).join("");
+    sel.value = (market.windows || []).some((w) => w.ticker === chosen) ? chosen : "";
     if (!market.ticker) { note.textContent = "This database has no order-book snapshots yet."; return; }
     const strike = market.strike ? Number(market.strike) : null;
     $("hdr-title").textContent = "BTC 15 min" + (strike ? " · $" + num(strike) + " target" : "");
@@ -1018,6 +1030,7 @@ async function refreshMarket() {
     $("st-oi").textContent = market.open_interest ? num(market.open_interest) : "--";
     $("st-left").textContent = tl.text;
     updateAge();
+    $("st-latency").textContent = market.book_latency_ms == null ? "--" : market.book_latency_ms.toFixed(0) + " ms";
     $("st-ts").textContent = market.book_ts ? new Date(market.book_ts).toLocaleTimeString() : "--";
     $("f-exp").textContent = market.close_time ? new Date(market.close_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--";
     $("f-strike").textContent = strike ? "$" + num(strike) : "--";
@@ -1284,7 +1297,7 @@ window.addEventListener("resize", () => { if (tab === "market" || tab === "monit
   buildLabForm(dbList);
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
-  setInterval(() => { if (tab === "market" || tab === "monitor") refreshTab(); }, 1000);
+  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor")) refreshTab(); }, 500);
   setInterval(updateAge, 200);
 })();
 </script>
