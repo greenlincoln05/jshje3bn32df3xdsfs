@@ -16,6 +16,10 @@ Phase 4:
 Phase 5:
   paper       run the paper strategy against live public data in real time (no real orders)
 
+Phase 6:
+  demo-check  place and cancel real (fake-money) orders against Kalshi's demo environment to validate
+              order/cancel/fill handling; never targets prod (see kalshi_client.py's demo-only write gate)
+
 Not a phase (a monitoring tool):
   dashboard   local web UI for backtests, live paper PnL/trades, and local Kalshi settings
 """
@@ -36,6 +40,7 @@ from pathlib import Path
 
 from btcbot.backtest import BacktestError, BacktestReport, run_backtest
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
+from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.lab import DEFAULT_GRID, AccountSettings, LabError, load_lab_data, parse_values, render_lab_report, run_lab
 from btcbot.live_paper import LivePaperTrader
@@ -179,6 +184,18 @@ def render_backtest_reports(reports: Sequence[BacktestReport]) -> str:
     return "\n\n".join(blocks)
 
 
+def render_demo_check_report(report: DemoCheckReport) -> str:
+    lines = [f"Demo check against {report.ticker}" if report.ticker else "Demo check"]
+    for result in report.results:
+        marker = "PASS" if result.passed else "SKIP" if result.passed is None else "FAIL"
+        lines.append(f"[{marker}] {result.name}: {result.detail}")
+    lines.append("")
+    lines.append(f"Fidelity (paper fee model vs real demo fills): {report.fidelity.summary}")
+    lines.append("")
+    lines.append("Overall: OK" if report.ok else "Overall: FAILED -- see the FAIL row(s) above")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- commands
 
 
@@ -237,6 +254,24 @@ async def _cmd_auth_check(args: argparse.Namespace) -> int:
     print(f"OK: the {env.value} environment accepted the signed request.")
     print(f"    available balance ${balance.available:,.2f}; portfolio value ${balance.portfolio_value:,.2f}")
     return 0
+
+
+async def _cmd_demo_check(args: argparse.Namespace) -> int:
+    settings = KalshiSettings()
+    if settings.key_id is None or settings.private_key_path is None:
+        raise ConfigError("KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (see .env.example)")
+    auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
+    config = load_config(args.config)
+    series_ticker = args.series or config.series_ticker
+    print(
+        f"Running demo-check against {series_ticker} on the demo environment (fake money; places and cancels "
+        "real demo orders). This never touches prod -- see kalshi_client.py's demo-only write gate.",
+        flush=True,
+    )
+    async with KalshiClient(KalshiEnv.DEMO, auth=auth) as client:  # hardcoded: demo-check never targets prod
+        report = await run_demo_check(client, series_ticker, wait_for_settlement=args.wait_for_settlement)
+    print(render_demo_check_report(report))
+    return 0 if report.ok else 1
 
 
 async def _cmd_record(args: argparse.Namespace) -> int:
@@ -548,8 +583,8 @@ async def _cmd_dashboard(args: argparse.Namespace) -> int:
     print(
         f"Dashboard at http://127.0.0.1:{port} (binds to 127.0.0.1 only -- not reachable from other machines).\n"
         f"Data dir: {args.data_dir}  Settings file: {args.env_file}  Backtest config: {args.config}\n"
-        "No order-placing code exists in this repo yet, so nothing here can place, cancel, or modify an "
-        "order. Ctrl+C to stop.",
+        "This dashboard has no path to Kalshi's order endpoints, so nothing here can place, cancel, or "
+        "modify an order (even the demo-only ones Phase 6 added elsewhere in this repo). Ctrl+C to stop.",
         flush=True,
     )
     try:
@@ -676,6 +711,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     paper.add_argument("--maker-fee-multiplier", default="0", help="a non-negative number (default: 0)")
     paper.set_defaults(handler=_cmd_paper)
+
+    demo_check = commands.add_parser(
+        "demo-check",
+        help="place and cancel real (fake-money) orders against Kalshi's demo environment (Phase 6)",
+    )
+    demo_check.add_argument("--series", help="override series_ticker from config.yaml")
+    demo_check.add_argument(
+        "--wait-for-settlement", action="store_true",
+        help="also check settlement, but only if the current window is already closed (default: skip that row)",
+    )
+    demo_check.set_defaults(handler=_cmd_demo_check)
 
     dashboard = commands.add_parser(
         "dashboard", help="local web UI: backtests, live paper PnL/trades, and local Kalshi settings"

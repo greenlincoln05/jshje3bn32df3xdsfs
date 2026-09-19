@@ -3,7 +3,7 @@
 This is for running the bot's commands against the real internet, **on your own machine**. A Claude Code
 remote session cannot do this: its network policy denies outbound access to `external-api.kalshi.com`
 directly (confirmed via the proxy status endpoint as a 403 policy denial, not a transient failure), so
-everything built so far (Phases 2-5) has only ever been validated offline, against fakes and fixtures. This
+everything built so far (Phases 2-6) has only ever been validated offline, against fakes and fixtures. This
 doc is the checklist for actually pointing it at the network.
 
 Check the README's Status table first for which phase is current; this doc assumes at least Phase 2
@@ -178,16 +178,51 @@ btcbot auth-check
 Expected: `OK: the demo environment accepted the signed request.` plus your balance. Demo and production
 keys are separate: a demo key needs `KALSHI_ENV=demo` (the default), a production key needs `--env prod`.
 
-`auth-check` makes exactly one authenticated call (`GET /portfolio/balance`) and places no orders -- there is
-no order-placing code anywhere in this repo yet; see CLAUDE.md's gates on that.
+`auth-check` makes exactly one authenticated call (`GET /portfolio/balance`) and places no orders.
+
+## 7. `demo-check` (Phase 6 -- needs your own demo credentials, places real orders)
+
+This is the first command in this repo that places and cancels real orders -- fake money only, always
+against the demo environment, never `--env prod` (there is no such flag for this command; the client itself
+refuses to sign `create_order`/`cancel_order` against anything but demo). **No Claude Code session has ever
+run this**, for the same reason none uses or stores a key: this is entirely yours to run.
+
+1. Complete step 6 above first (a demo key in your local `.env`).
+2. Confirm there's an open `KXBTC15M` window (`btcbot discover`) -- `demo-check` needs one to trade against.
+3. Run:
+
+```powershell
+btcbot demo-check
+```
+
+Expected: one `[PASS]`/`[FAIL]`/`[SKIP]` line per check (auth + balance, market discovery, a resting order
+placed then cancelled, a market order that fills plus a position check, three rejection tests, a small
+request burst, a crash-and-restart reconciliation test), a fidelity line comparing the one real fill's fee
+against `paper_broker.py`'s fee formula, and an overall OK/FAILED line. Exit code is nonzero if anything
+failed -- a `[SKIP]` does not fail the run.
+
+- Add `--wait-for-settlement` to also check that the traded window actually settled, but only if it has
+  already closed by the time that check runs; otherwise it's skipped, not blocked on -- this command doesn't
+  wait out a window on your behalf.
+- **The order/fill/position payload shapes `kalshi_client.py` sends and parses are this project's own
+  best-effort reading of Kalshi's API, not verified against live docs or a real response** (unlike every
+  read endpoint, checked against live data on 2026-09-18/19 -- see "Verified Kalshi API facts"). A `[FAIL]`
+  here may mean the checklist found a real problem, or it may mean a field name needs correcting against
+  Kalshi's actual current docs or the real error message you got back. Either way, that real error message
+  contains no secrets and is safe to share back for a fix.
+- If anything fails with an order left open, `demo-check`'s own reconciliation check aside, you can always
+  cancel stray demo orders by hand from the Kalshi web UI -- it's fake money, but tidy up anyway.
 
 ## Safety reminders
 
-- Paper is the only mode with any strategy logic. There is no live or demo order-placing code until Phase 6,
-  and CLAUDE.md requires the owner's explicit approval before that phase starts.
+- Paper is the only mode with any strategy logic that's actually run for real so far. Phase 6 added real
+  (demo-only) order-placing code; there is still no *live* order-placing code anywhere in this repo, and
+  CLAUDE.md requires the owner's explicit approval, plus all four gates in spec section 7, before that
+  changes.
 - `data/`, `.env`, `*.pem`, `*.key`, and `KILL` are all gitignored. Run `git status` before committing if
   you've been testing in this same checkout, so nothing from a live run ends up in a commit by accident.
 - No martingale or size-doubling exists anywhere in this codebase, by design (`risk.py` enforces it).
 - `btcbot dashboard` binds to `127.0.0.1` only. Its Settings tab writes straight to your local `.env` --
   fine to use instead of editing the file by hand -- but don't run it with `--port` forwarded or exposed to
   another machine, since anyone who can reach it could read the masked settings status or overwrite `.env`.
+  The dashboard itself still has no path to `kalshi_client.py`'s order endpoints, Phase 6 or not.

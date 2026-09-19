@@ -17,10 +17,12 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | 3 | Fair-probability model + calibration report | **built and tested; no real calibration report yet (no captured data)** |
 | 4 | Backtest + queue-aware paper broker | **built and tested; no real backtest result yet (no captured data)** |
 | 5 | Live paper run, several days | **built and tested; no real live run yet (needs real network access)** |
-| 6 | Demo-environment order/cancel/fill validation | not started |
+| 6 | Demo-environment order/cancel/fill validation | **built and tested; no real demo-check run yet (needs a demo key on the owner's machine)** |
 | 7 | Live, optional, only if phases 4-6 show positive edge after fees | not started |
 
-Phase 1 is read-only: the client has no order-placing methods at all.
+Phase 1 shipped a read-only client with no order-placing methods at all; Phase 6 added
+`create_order`/`cancel_order`, hard-gated to Kalshi's demo environment only (see the Phase 6 write-up below
+and CLAUDE.md) -- there is still no live order-placing code anywhere in this repo.
 
 The [repository review and overnight-plan assessment](docs/review-and-overnight-plan.md)
 records phase 1 bug fixes and phase 2 requirements for measuring latency and data quality.
@@ -66,7 +68,7 @@ loss limit, a consecutive-loss pause needing manual `resume()`, the KILL-file ch
 enforced "size cannot increase after a loss" gate, not just an absence of a feature that would do that),
 `strategy.py` (edge = p_side - price - expected_fee for YES/NO, resting orders only, hold to settlement),
 and `execution.py` (the interface spec section 3 asks be shared by paper and live -- only the paper backend
-exists; no order-placing code against Kalshi itself exists anywhere in this repo). `backtest.py` replays a
+exists yet; a demo backend arrived in Phase 6, see below, and live still does not exist). `backtest.py` replays a
 recorder database through all four end to end, on one simulated clock where volatility carries continuously
 across window boundaries the way it would live, and reports PnL, win rate, max drawdown, trades/day, and an
 explicit "beats trade-nothing after fees?" line. `btcbot backtest` runs all four
@@ -104,13 +106,60 @@ to leave a multi-hour or multi-day process running unattended anyway. Running it
 days" the spec asks for, has to happen on the owner's own machine -- see
 [docs/running-live.md](docs/running-live.md).
 
+**Phase 6, as built:** its own prerequisite (real `record`/`paper` data collected and reviewed) was
+explicitly waived by the owner for writing and offline-testing this phase's code, so this is unreviewed
+against real trading results the same way Phases 2-5 were when first built -- see the "not started until
+you say so" framing below and in `docs/btc15m-bot-spec.md` section 8.
+
+- **6a** (`kalshi_client.py`): `create_order`, `cancel_order`, `get_order`, `list_orders`, `list_fills`,
+  `get_positions`. Every order carries a client-generated `client_order_id` (a fresh UUID unless one is
+  passed in) so an application-level retry can't double-place. `create_order`/`cancel_order` -- the only two
+  calls that can change real-world state -- carry a hard assertion refusing to sign against anything but
+  `KalshiEnv.DEMO` (`KalshiWriteNotAllowedError`); the other four are read-only and, like `get_balance`,
+  allowed against either environment. **The order/fill/position payload shapes here are this project's own
+  best-effort reading of Kalshi's API, not verified against live docs or a real response** -- unlike every
+  read endpoint from Phase 1, writing this client happened without network access to this sandbox. A shape
+  mismatch fails loudly (a 400/422 from Kalshi's demo API), never silently, precisely because nothing here
+  can touch real money; the owner's first real `demo-check` run is what actually confirms or corrects it.
+- **6b** (`execution.py`): `DemoExecutionBackend` implements the existing `ExecutionBackend` protocol
+  unchanged (place_resting_order/cancel_order/place_taker_order), so strategy code cannot tell it isn't
+  paper. Fills come from polling `list_fills`, deduplicated by trade id. `reconcile()` cancels every open
+  order the account holds (a freshly started process has no legitimate ones yet, so any it finds are by
+  definition leftovers from a previous crash) and reports open positions without touching them (this bot
+  doesn't exit early; spec: hold to settlement by default).
+- **6c** (`btcbot demo-check`, new `demo_check.py`): runs the plan's exact checklist -- auth-check + balance,
+  market discovery, a deliberately unfillable resting order then a cancel, a tiny market order expected to
+  fill then a position check, an optional settlement check (skipped unless the current window has already
+  closed), three rejection tests (an off-grid price, an order costing far more than the account balance, an
+  order against an already-settled market -- each one **failing** this check if Kalshi does *not* reject it,
+  since an unrejected dangerous order is the actual failure mode being tested for), a small burst of balance
+  calls (the 429 backoff math itself is exercised offline in `test_client.py`, not re-tested against a real
+  account), and a crash-and-restart reconciliation test (places an order, deliberately doesn't cancel it,
+  then builds a fresh `DemoExecutionBackend` and confirms `reconcile()` finds and cancels it). One report row
+  per check; exit code is nonzero if anything failed (a skip does not fail the run).
+- **6d** (fidelity report, also in `demo_check.py`): compares real fills captured during a `demo-check` run
+  against what `paper_broker.py`'s fee formula would have charged for the same trade -- this is what would
+  settle whether makers pay a fee under plain `quadratic` (see "Verified Kalshi API facts"). Narrower than
+  the full plan (latency and fill-rate need order-book history captured alongside the real fills, which this
+  one-shot script doesn't do): fee only, from whatever fill(s) the run's own checklist happens to produce.
+- 47 new offline tests (`test_client.py`, `test_execution.py`, `test_demo_check.py`, `test_cli.py`), all
+  against `httpx.MockTransport`/hand-written fakes -- no network, no real key, matching every prior phase.
+
+**No real demo-check run exists yet.** Beyond this session's usual network-policy denial, `btcbot demo-check`
+specifically needs the owner's own demo API key, which by CLAUDE.md's own rule no Claude Code session may
+ever use or store -- this is not a limitation of this particular sandbox, it is permanent. Running it for
+real, on the owner's own machine with their own key, is what `docs/running-live.md` now walks through.
+
 ### A note on API keys
 
 No Kalshi API key has been used by any Claude session working on this repo, demo or production. A key that
 has been pasted into a chat (this one or another assistant's) should be treated as exposed and revoked/rotated,
 regardless of whether it targets demo or prod — the practice that keeps this safe is a fresh key that goes
 straight into a local `.env` (directly, or via `btcbot dashboard`'s Settings tab, which only ever writes to
-that same local file) and is never pasted into a conversation.
+that same local file) and is never pasted into a conversation. This applies with extra force to
+`btcbot demo-check` (Phase 6): unlike `auth-check`'s single read-only balance call, it places and cancels
+real orders with whatever key it's given, so that key has to be the owner's own, entered locally, and run
+by the owner -- never a Claude Code session, on this or any future phase.
 
 ## Setup
 
@@ -137,6 +186,7 @@ btcbot record --env prod --hours 9    # poll public market data + Coinbase spot 
 btcbot paper --env prod --hours 9     # trade the paper strategy against live public data; no real orders
 btcbot calibrate --db data/recorder-....sqlite   # Brier score + reliability table from logged predictions
 btcbot backtest --db data/recorder-....sqlite    # replay through strategy + risk + paper broker; PnL etc.
+btcbot demo-check                     # place/cancel real (fake-money) demo orders; validates order handling
 btcbot dashboard                      # local web UI: monitor backtests, live paper PnL/trades, edit .env
 ```
 
@@ -168,6 +218,14 @@ windows. Until then, `calibrate` only has something to report on synthetic test 
 combinations of queue assumption (`optimistic`/`pessimistic`) and maker-fee multiplier (`0`/`0.25`) and
 prints one report per combination, since neither is confirmed (see "Verified Kalshi API facts" and
 `paper_broker.py`'s module docstring) -- `--queue` and `--maker-fee-multiplier` narrow it to one.
+
+`demo-check` (Phase 6) is different from every command above: it needs your own demo `KALSHI_KEY_ID` /
+`KALSHI_PRIVATE_KEY_PATH` (same setup as `auth-check`) and it places and cancels real orders -- fake money
+only, always against the demo environment, never `--env prod` (there is no such flag for this command).
+It runs the checklist from `docs/btc15m-bot-spec.md` section 8 end to end and prints one PASS/FAIL/SKIP row
+per check, plus a fidelity comparison of the one real fill's fee against `paper_broker.py`'s fee formula.
+Exit code is nonzero if anything failed. **No Claude Code session has ever run this for real** -- see
+CLAUDE.md and [docs/running-live.md](docs/running-live.md) for why, and for how to run it yourself.
 
 Example (prices vary):
 
@@ -201,8 +259,10 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
   `docs/running-live.md` already tells you to edit by hand, nothing more. It never sends a key anywhere
   except from your own browser to this localhost server, which only ever writes it to that file, and it
   always masks the key id on read. **This cannot place, cancel, or modify a Kalshi order, in demo or in
-  prod:** there is no order-placing code anywhere in this repo yet (CLAUDE.md's Phase 6 gate) -- entering a
-  key here only lets you run `auth-check` yourself with it, exactly as if you'd edited `.env` directly.
+  prod:** this dashboard has no path to `kalshi_client.py`'s order endpoints at all -- entering a key here
+  only lets you run `auth-check` or `demo-check` yourself with it, exactly as if you'd edited `.env`
+  directly and typed the command. (Phase 6 did add real, demo-only order-placing code elsewhere in this
+  repo -- see below -- but this dashboard was never wired to it and stays that way.)
 
 As always: a key pasted into a chat with any assistant is exposed and should be reissued, never reused --
 type it into the dashboard's Settings tab (or `.env` directly) instead, on your own machine.
@@ -213,7 +273,7 @@ type it into the dashboard's Settings tab (or `.env` directly) instead, on your 
 |------|--------|-------|--------|
 | `record` | prod market data, read-only | none | Phase 2: **built** (REST polling; no key) |
 | `paper` (default) | prod data, simulated fills | none | Phase 4/5: **built** (`backtest` offline, `paper` live); no real live run yet |
-| `demo` | Kalshi demo environment | fake | Phase 6 |
+| `demo` | Kalshi demo environment | fake | Phase 6: **built** (`demo-check`); no real demo-check run yet -- needs the owner's own demo key |
 | `live` | Kalshi prod | real | Phase 7: needs `mode: live`, `--i-understand-real-money`, `KALSHI_ENV=prod` and a typed confirmation |
 
 - The client defaults to the **demo** environment. Production is opt-in per command (`--env prod`) or `KALSHI_ENV=prod`.
@@ -234,19 +294,20 @@ docs/
   btc15m-bot-spec.md        the original build spec: source of truth for scope and phases
 src/btcbot/
   config.py                 BotConfig (config.yaml) and KalshiSettings (env vars / .env)
-  models.py                 Market, Series, OrderBook, Balance: Decimal-only views of API payloads
-  kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff
+  models.py                 Market, Series, OrderBook, Balance, KalshiOrder/KalshiFill/Position (Phase 6): Decimal-only views of API payloads
+  kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff; Phase 6 write endpoints (demo-only)
   market_discovery.py       find the open KXBTC15M market: series -> open markets (see the discovery note below)
-  cli.py                    discover, auth-check, record, calibrate, backtest, paper, dashboard
+  cli.py                    discover, auth-check, record, calibrate, backtest, paper, demo-check, dashboard
   spot_feed.py              Phase 2: Coinbase public WebSocket ticker -> rolling buffer, staleness, REST fallback
   recorder.py               Phase 2: order books, market state, spot ticks and settlements -> SQLite
   model.py                  Phase 3: v1 fair-probability model, EWMA volatility, prediction logging, calibration
   strategy.py               Phase 4: edge = p_side - price - fee for YES/NO; resting orders only
   risk.py                   Phase 4: every limit in spec section 5, kill switch, size-no-increase-after-a-loss
-  execution.py              Phase 4: the paper/live-shared order interface -- only the paper backend exists
+  execution.py              Phase 4: paper/demo order interface -- PaperExecutionBackend + DemoExecutionBackend (Phase 6)
   paper_broker.py           Phase 4: fees, tick grid, queue-position fill simulation
   backtest.py               Phase 4: replay a recorder database through all of the above; PnL/win-rate/etc.
   live_paper.py             Phase 5: drives the same stack live via recorder.py's hooks; reuses backtest's report
+  demo_check.py             Phase 6: `btcbot demo-check`'s checklist + the paper-vs-demo-fill fidelity report
   webui.py                  not a phase: local dashboard (backtests, live paper PnL/trades, .env settings)
 tests/
   fixtures/                 real public API payloads and an OpenSSL signing vector
@@ -257,14 +318,17 @@ tests/
   test_execution.py, test_backtest.py                    Phase 4, offline (synthetic fixtures + hypothesis)
   test_live_paper.py                                     Phase 5, offline (fake spot buffer + hand-built snapshots)
   test_webui.py                                           dashboard, offline (real HTTP calls to 127.0.0.1 only)
+  test_demo_check.py                                     Phase 6, offline (fake KalshiClient; test_client.py covers the new write endpoints directly)
 ```
 
-`config.py` and `models.py` are additions to the layout in the build spec. Kalshi's own WebSocket (order-book
-deltas) is not implemented: it needs an API key even for public channels (see "Verified Kalshi API facts"
-below), and no key has been provisioned through a secure channel, so `recorder.py` polls REST instead;
-`spot_feed.py`'s WebSocket client is Coinbase's separate, unauthenticated public ticker feed. No order-placing
-code against Kalshi exists anywhere in this repo -- `execution.py`'s paper backend only ever calls
-`paper_broker.py`.
+`config.py`, `models.py` and `demo_check.py` are additions to the layout in the build spec. Kalshi's own
+WebSocket (order-book deltas) is not implemented: it needs an API key even for public channels (see
+"Verified Kalshi API facts" below), and no key has been provisioned through a secure channel, so
+`recorder.py` polls REST instead; `spot_feed.py`'s WebSocket client is Coinbase's separate, unauthenticated
+public ticker feed. **No live order-placing code against Kalshi exists anywhere in this repo.** Phase 6 did
+add real order-placing code (`kalshi_client.py`'s `create_order`/`cancel_order`, driven by
+`execution.py`'s `DemoExecutionBackend`), but it is hard-gated to Kalshi's demo environment only -- see
+CLAUDE.md and the Phase 6 write-up above. `paper_broker.py` itself still never talks to Kalshi at all.
 
 ## Verified Kalshi API facts
 

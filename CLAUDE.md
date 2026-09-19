@@ -6,28 +6,34 @@ truth for scope and phases; the README has the phase status and a dated table of
 ## Working rules
 - Build one phase at a time. When a phase is done, stop and report (passing tests, a short summary, the commands to run
   it, open questions) and wait for the owner's explicit go-ahead before starting the next one.
-- Paper trading is the default, and live trading must be impossible to enable by accident (all four gates in spec
-  section 7). There is no order-placing code yet; do not add any before the owner approves Phase 6.
+- Paper trading is the default, and **live** trading must be impossible to enable by accident (all four gates in spec
+  section 7). Phase 6 added real order-placing code, but it only ever runs against Kalshi's **demo**
+  environment: `kalshi_client.py`'s `create_order`/`cancel_order` carry a hard assertion refusing to sign
+  against anything but `KalshiEnv.DEMO`, and nothing points a live backend at prod, because no live backend
+  exists at all. Do not add one, or loosen that assertion, before the owner approves Phase 7.
 - No martingale, doubling or any size increase after a loss. No secrets in the repo (`.env*`, `*.pem`, `*.key`, key-like `.txt` files and `secrets/` are
   gitignored). No profitability claims without recorded out-of-sample results. No Robinhood scraping and no unofficial
   data sources.
 - No placeholder modules remain: `spot_feed`/`recorder` (Phase 2), `model` (Phase 3),
-  `strategy`/`risk`/`execution`/`paper_broker`/`backtest` (Phase 4), and `live_paper` (Phase 5) are all
-  implemented. The next new module a phase adds should hold only a docstring until that phase actually
-  replaces it, same as these did.
+  `strategy`/`risk`/`execution`/`paper_broker`/`backtest` (Phase 4), `live_paper` (Phase 5), and
+  `demo_check` (Phase 6) are all implemented. The next new module a phase adds should hold only a docstring
+  until that phase actually replaces it, same as these did.
 - No API key, demo or production, gets used or written to a repo file by a Claude Code session. A key pasted
   into any chat is treated as exposed; the fix is to revoke/reissue it, never to use it. Phase 2's recorder
   uses public, unauthenticated endpoints only for this reason (Kalshi's order-book WebSocket needs a key even
-  for public data). `btcbot paper` (Phase 5) is the same: public data only, no key. Phase 6 needs a demo key
-  for real order placement, so the same rule means `btcbot demo-check`'s validation run against the owner's
-  own demo credentials is the owner's to execute, not a Claude Code session's -- Claude writes the script (as
-  it wrote `auth-check`), the owner runs it. Phase 6 itself also has a prerequisite beyond the owner's
-  go-ahead: real `record`/`paper` data collected and reviewed on the owner's own machine (see
-  `docs/btc15m-bot-spec.md` section 8 and `docs/running-live.md`) -- phases 2-5 having only synthetic-fixture
-  validation is not sufficient grounds to start it.
-- `execution.py` only has a paper backend, and `paper_broker.py` never talks to Kalshi. `live_paper.py`
-  (Phase 5) only ever drives that same paper backend. There is still no order-placing code against Kalshi
-  anywhere in this repo; do not add any before the owner approves Phase 6.
+  for public data). `btcbot paper` (Phase 5) is the same: public data only, no key. `btcbot demo-check`
+  (Phase 6c) is different -- it needs a demo key to place real (fake-money) test orders -- so the same rule
+  means no Claude Code session has ever run it against real credentials, or ever will: Claude wrote the
+  script and its offline tests (a fake client standing in for `KalshiClient`, per `tests/test_demo_check.py`),
+  and running it for real, with a real demo key that goes straight into the owner's own `.env` and never into
+  a chat, is entirely the owner's to do on their own machine. Phase 6's build itself skipped its own
+  prerequisite (real `record`/`paper` data collected and reviewed) at the owner's explicit direction --
+  writing and offline-testing the code did not need it -- but that data, plus an actual `demo-check` run,
+  still has to happen before trusting any of this or considering Phase 7.
+- `execution.py` has a paper backend and a demo backend (Phase 6, `DemoExecutionBackend`). `paper_broker.py`
+  never talks to Kalshi; `DemoExecutionBackend` only ever calls `kalshi_client.py`'s demo-gated write
+  methods. There is still no *live* order-placing code and no live backend anywhere in this repo; do not add
+  one before the owner approves Phase 7 (all four gates, spec section 7).
 - `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
   and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
@@ -58,6 +64,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Backtest a recorder database: `.venv/Scripts/btcbot.exe backtest --db data/recorder-....sqlite`
 - BRTI + order-book stream, READ-ONLY, needs YOUR key in `.env` (run by the owner): `.venv/Scripts/btcbot.exe stream --env prod --hours 9`
 - Strategy lab on recorded data (offline): `.venv/Scripts/btcbot.exe lab --grid min_edge=0.02,0.04 --grid max_price=none,0.6`
+- Demo-only order validation, needs a demo key (Phase 6, owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe demo-check`
 - Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own
   environment cannot reach Kalshi/Coinbase; that has to happen on the owner's machine).
