@@ -6,6 +6,9 @@ Phase 1 commands, both read-only:
 
 Phase 2:
   record      poll public market data + a Coinbase spot feed into a SQLite database (no credentials needed)
+
+Phase 3:
+  calibrate   Brier score + reliability table from predictions logged into a recorder database
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import sqlite3
 import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -24,6 +28,7 @@ from pathlib import Path
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.market_discovery import find_current_market
+from btcbot.model import CalibrationSummary, compute_calibration_report
 from btcbot.models import Market, OrderBook, ParseError, Series, Side
 from btcbot.recorder import Recorder, RecorderSummary
 from btcbot.spot_feed import CoinbaseSpotFeed, SpotBuffer
@@ -114,6 +119,23 @@ def render_recorder_summary(summary: RecorderSummary) -> str:
     ]
     if summary.unresolved_settlements:
         lines.append(f"Unresolved settlements (never saw 'finalized'): {', '.join(summary.unresolved_settlements)}")
+    return "\n".join(lines)
+
+
+def render_calibration_report(report: Sequence[CalibrationSummary]) -> str:
+    lines = []
+    for summary in report:
+        if summary.n == 0:
+            lines.append(f"{summary.label:<6s}: no resolved predictions logged")
+            continue
+        lines.append(f"{summary.label:<6s}: n={summary.n:,}  brier score={summary.brier_score:.4f} (0 is perfect)")
+        for row in summary.reliability:
+            if row.count == 0:
+                continue
+            lines.append(
+                f"  p in [{row.bin_low:.2f}, {row.bin_high:.2f})  n={row.count:>5,}  "
+                f"mean predicted={row.mean_predicted:.3f}  observed rate={row.observed_rate:.3f}"
+            )
     return "\n".join(lines)
 
 
@@ -213,6 +235,26 @@ async def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_calibrate(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        print(f"error: no such database: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(str(db_path))
+    try:
+        report = compute_calibration_report(conn, bins=args.bins)
+    except sqlite3.OperationalError as exc:
+        print(f"error: {db_path} does not look like a recorder database with logged predictions: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    if all(summary.n == 0 for summary in report):
+        print(f"No resolved predictions found in {db_path} yet: nothing to score.")
+        return 0
+    print(render_calibration_report(report))
+    return 0
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -247,6 +289,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)"
     )
     record.set_defaults(handler=_cmd_record)
+
+    calibrate = commands.add_parser(
+        "calibrate", help="Brier score + reliability table from predictions logged into a recorder database"
+    )
+    calibrate.add_argument("--db", required=True, help="path to a recorder SQLite database with logged predictions")
+    calibrate.add_argument("--bins", type=int, default=10, help="number of reliability bins (default: 10)")
+    calibrate.set_defaults(handler=_cmd_calibrate)
     return parser
 
 
@@ -262,6 +311,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not math.isfinite(args.poll_interval) or args.poll_interval <= 0:
             print("error: --poll-interval must be finite and greater than 0", file=sys.stderr)
             return 2
+    if args.command == "calibrate" and args.bins <= 0:
+        print("error: --bins must be greater than 0", file=sys.stderr)
+        return 2
     for stream in (sys.stdout, sys.stderr):  # a non-ASCII title must not crash a Windows console
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
