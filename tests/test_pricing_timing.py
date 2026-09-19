@@ -87,3 +87,33 @@ async def test_final_minute_without_settlement_average_does_not_open_order():
     await trader.on_orderbook_snapshot(make_market(TICKER,close_time=T0+timedelta(seconds=45)),make_book(),T0)
     assert trader._resting_order_id is None
     trader.close()
+
+
+def test_unannounced_settlement_does_not_release_exposure(tmp_path):
+    conn=make_db(tmp_path)
+    first_close=seed_fillable_window(conn,TICKER,start_ts=T0)
+    second='KXBTC15M-SECOND'
+    second_close=seed_fillable_window(conn,second,start_ts=first_close+timedelta(seconds=1))
+    insert_settlement(conn,TICKER,'yes',strike=80000,close_time=first_close)
+    conn.execute('UPDATE settlements SET finalized_poll_ts=? WHERE ticker=?',((first_close+timedelta(seconds=20)).isoformat(),TICKER))
+    insert_settlement(conn,second,'yes',strike=80000,close_time=second_close)
+    # A first-window fill uses $1.20. Its announced settlement is later than all
+    # second-window entry attempts; releasing it at rollover admits a bad order.
+    config=BotConfig(risk={'max_open_exposure_usd':Decimal('2')})
+    report=run_backtest(conn,config)
+    assert report.trades==1
+    assert report.wins==1
+    assert report.total_pnl_usd==Decimal('2.80')
+    conn.close()
+
+
+def test_missing_settlement_retains_exposure_during_next_window(tmp_path):
+    conn=make_db(tmp_path)
+    first_close=seed_fillable_window(conn,TICKER,start_ts=T0)
+    second='KXBTC15M-SECOND'
+    second_close=seed_fillable_window(conn,second,start_ts=first_close+timedelta(seconds=1))
+    insert_settlement(conn,second,'yes',strike=80000,close_time=second_close)
+    report=run_backtest(conn,BotConfig(risk={'max_open_exposure_usd':Decimal('2')}))
+    assert report.trades==1 and report.unresolved==1
+    assert report.total_pnl_usd==0
+    conn.close()

@@ -4,8 +4,8 @@ docs/btc15m-bot-spec.md section 8.4.
 Replays recorder.py's SQLite tables in one global, chronological pass: order-book snapshots drive
 strategy/risk/broker decisions window by window, while a single EWMA volatility estimate carries across
 window boundaries from the spot-tick stream, exactly as it would in a live run. A window's still-open
-resting order is cancelled and its still-open position is settled (or, with no settlement row yet, left
-unresolved and excluded from PnL, not scored as a loss) the moment the next window's ticker appears.
+resting order is cancelled when the next ticker appears. Filled exposure remains reserved until
+the recorded settlement announcement arrives; missing announcements remain unresolved, not losses.
 
 Every report is a sensitivity result, not a claim: it names its queue assumption (see paper_broker.py's
 module docstring for why one is needed) and its maker-fee-multiplier assumption, and always states its
@@ -132,7 +132,12 @@ def run_backtest(
     if not snapshots:
         raise BacktestError("no order-book snapshots to replay")
     windows = load_windows(conn)
-    settlements = load_settlements(conn)
+    settlements = {
+        ticker: (result, parse_time(available))
+        for ticker, result, available in conn.execute(
+            "SELECT ticker,result,finalized_poll_ts FROM settlements WHERE result IN ('yes','no')"
+        )
+    }
     spot_ticks = load_spot_ticks(conn)
 
     broker = PaperBroker(maker_fee_multiplier=maker_fee_multiplier, queue_assumption=queue_assumption)
@@ -147,6 +152,22 @@ def run_backtest(
     position: TradeRecord | None = None
     trades: list[TradeRecord] = []
     windows_traded: set[str] = set()
+    pending: dict[str, TradeRecord] = {}
+
+    def resolve_available(now: datetime) -> None:
+        # Account for outcomes only when the recorder actually learned them.
+        for ticker in sorted(list(pending), key=lambda t: settlements[t][1] if t in settlements else now):
+            known = settlements.get(ticker)
+            if known is None or known[1] > now:
+                continue
+            result, available = known
+            held = pending.pop(ticker)
+            exposure = held.entry_price * held.size
+            pnl = settle(held.side, held.size, result) - exposure - held.fee_paid
+            trades.append(replace(held, result=result, pnl_usd=pnl))
+            risk.record_trade_closed(
+                TradeOutcome(ts=available, size=held.size, pnl_usd=pnl), exposure_released_usd=exposure
+            )
 
     def finalize_window(ticker: str, ts: datetime) -> None:
         nonlocal resting_order_id, position
@@ -159,18 +180,7 @@ def run_backtest(
                 risk.release_exposure(unfilled * order.price)
             resting_order_id = None
         if position is not None:
-            result = settlements.get(ticker)
-            exposure = position.entry_price * position.size
-            if result is None:
-                trades.append(position)
-                risk.release_exposure(exposure)
-            else:
-                payout = settle(position.side, position.size, result)
-                pnl = payout - exposure - position.fee_paid
-                trades.append(replace(position, result=result, pnl_usd=pnl))
-                risk.record_trade_closed(
-                    TradeOutcome(ts=ts, size=position.size, pnl_usd=pnl), exposure_released_usd=exposure
-                )
+            pending[ticker] = position
             position = None
 
     for snap in snapshots:
@@ -187,6 +197,8 @@ def run_backtest(
             if current_ticker is not None:
                 finalize_window(current_ticker, snap.poll_ts)
             current_ticker = snap.ticker
+
+        resolve_available(snap.poll_ts)
 
         if snap.ticker not in windows:
             continue  # strike not yet known for this ticker
@@ -254,13 +266,18 @@ def run_backtest(
 
     if current_ticker is not None:
         finalize_window(current_ticker, snapshots[-1].poll_ts)
+    # Outcomes observed after the last book can score the final report, but must
+    # never influence earlier entries, risk limits, or released buying power.
+    report_end = max([snapshots[-1].poll_ts, *(available for _, available in settlements.values())])
+    resolve_available(report_end)
+    trades.extend(pending.values())
 
     return build_report(
         trades,
         windows_seen=len({s.ticker for s in snapshots}),
         windows_traded=windows_traded,
         first_ts=snapshots[0].poll_ts,
-        last_ts=snapshots[-1].poll_ts,
+        last_ts=report_end,
         queue_assumption=queue_assumption,
         maker_fee_multiplier=maker_fee_multiplier,
     )

@@ -24,7 +24,7 @@ def replay(path,root):
     source=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True)
     db=sqlite3.connect(':memory:');source.backup(db);source.close()
     config=load_config('config.yaml')
-    output={'at':datetime.now(timezone.utc).isoformat(),'database':str(path),'research_only':True,
+    output={'replay_version':'settlement-availability-v2','at':datetime.now(timezone.utc).isoformat(),'database':str(path),'research_only':True,
             'counts':{},'model_replays':[],'trend_candidates':{}}
     for table in ('orderbook_snapshots','spot_ticks','settlements'):
         output['counts'][table]=db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0]

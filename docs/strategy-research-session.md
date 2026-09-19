@@ -65,4 +65,11 @@ Choose a NEW `test-run-N` directory for each pytest run. Pytest removes an exist
 3. Add unit/regression checks for any substantive new fix. Preserve frozen candidates and retain prior reports rather than silently replacing failed variants.
 4. At completion, report actual PnL, fees, drawdown, entries/exits and unresolved trades, plus data quality. Twelve or so fresh windows cannot establish profitability. A no-trade or negative result is valid evidence.
 
-The user explicitly requested milestone commits. Commit each completed, validated milestone on codex/strategy-research, keeping raw capture data and unfinished experiments out of commits. Pricing fixes and research tools are separate milestones. No push or PR has been made; commits are local.
+The user explicitly requested milestone commits. Commit each completed, validated milestone on codex/strategy-research, keeping raw capture data and unfinished experiments out of commits. Pricing fixes and research tools are separate milestones. Milestones are pushed to origin/codex/strategy-research and draft PR #9 is open: https://github.com/greenlincoln05/jshje3bn32df3xdsfs/pull/9. Push subsequent validated milestones to the same branch; do not merge without authorization.
+
+
+## 16:33 UTC follow-up milestone
+
+Capture and replay healthy; two settled windows. The pre-fix optimistic maker scenario reported +$1.762356 with maker multiplier 0.25, while pessimistic queues filled nothing. Six frozen trend candidates had no completed trades. This is not evidence of executable profits. Coinbase receive/source age over 9,590 observations ranged from -0.003524 to 0.292727 seconds; no ticks exceeded the three-second threshold in this sample.
+
+Recorded settlement announcements arrived 10.76 and 14.03 seconds after close. Fixed offline replay's early release of filled exposure: positions now remain pending until finalized_poll_ts; missing settlements retain exposure. Outcomes recorded after the last book may score final reports but cannot affect preceding entries or risk decisions. Added regressions covering delayed and missing announcements with tight exposure caps. 447 tests pass. Replay reports now carry replay_version=settlement-availability-v2; older unversioned history is retained. The watcher must be restarted after this milestone; the original capture continues uninterrupted.
