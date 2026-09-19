@@ -274,3 +274,52 @@ class TestRiskIntegration:
             )
         assert trader._resting_order_id is None and trader._position is None
         trader.close()
+
+
+class TestSettlementArrivingBeforeTheNextWindow:
+    """Regression: on a real prod run, windows 2 and 3 filled but were never logged, because Kalshi finalized them
+    (17:30:13, 17:45:07) before the next window's first snapshot (17:30:23, 17:45:15) reached the trader."""
+
+    async def test_a_settlement_that_beats_the_rollover_still_resolves_the_trade(self, tmp_path):
+        conn = sqlite3.connect(":memory:")
+        trader, buffer = make_trader(conn)
+        market = await fill_a_window(trader, buffer)
+        assert trader._position is not None and market.ticker not in trader._pending_settlements
+
+        settled = make_market(market.ticker, status="finalized", raw_extra={"result": "yes", "expiration_value": "80500"})
+        await trader.on_settlement(settled)  # arrives with no next-window snapshot yet
+
+        assert len(trader.trades) == 1 and trader._position is None
+        assert trader.trades[0].result == "yes"
+        assert trader.trades[0].pnl_usd == Decimal("4") * (Decimal(1) - Decimal("0.30"))
+        assert trader._resting_order_id is None  # the closed market's unfilled remainder was cancelled
+        assert trader.risk.open_exposure_usd == Decimal("0")  # capital released, so later windows can still trade
+        assert conn.execute("SELECT COUNT(*) FROM trades WHERE result IS NOT NULL").fetchone()[0] == 1
+        trader.close()
+
+    async def test_a_loss_that_beats_the_rollover_still_counts_toward_the_loss_streak(self, tmp_path):
+        conn = sqlite3.connect(":memory:")
+        trader, buffer = make_trader(conn)
+        market = await fill_a_window(trader, buffer)
+        await trader.on_settlement(make_market(market.ticker, status="finalized", raw_extra={"result": "no"}))
+        assert trader.trades[0].pnl_usd < 0 and trader.risk.consecutive_losses == 1
+        trader.close()
+
+    async def test_it_is_not_resolved_twice_when_the_rollover_comes_later(self, tmp_path):
+        conn = sqlite3.connect(":memory:")
+        trader, buffer = make_trader(conn)
+        market = await fill_a_window(trader, buffer)
+        await trader.on_settlement(make_market(market.ticker, status="finalized", raw_extra={"result": "yes"}))
+        next_market = make_market("KXBTC15M-26SEP190015-15", close_time=T0 + timedelta(seconds=1500))
+        await trader.on_orderbook_snapshot(next_market, make_book(), T0 + timedelta(seconds=600))
+        await trader.shutdown(T0 + timedelta(seconds=700))
+        assert len(trader.trades) == 1 and trader.unresolved_count == 0
+        trader.close()
+
+    async def test_a_settlement_for_a_different_ticker_leaves_the_position_alone(self, tmp_path):
+        conn = sqlite3.connect(":memory:")
+        trader, buffer = make_trader(conn)
+        await fill_a_window(trader, buffer)
+        await trader.on_settlement(make_market("KXBTC15M-OTHER-00", status="finalized", raw_extra={"result": "yes"}))
+        assert trader._position is not None and trader.trades == []
+        trader.close()

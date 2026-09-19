@@ -153,10 +153,20 @@ class LivePaperTrader:
             await self._cancel_resting()
 
     async def on_settlement(self, market: Market) -> None:
+        result = market.raw.get("result") or None
         pending = self._pending_settlements.get(market.ticker)
         if pending is None:
+            # Settlement can arrive BEFORE this trader has seen the next window's first snapshot: a 10-25 s gap
+            # between windows is normal, and Kalshi often finalizes within ~10 s. The position is then still the
+            # current one, not yet "pending", and used to be ignored here -- never resolved, never scored, and
+            # its exposure never released (so after a few such windows the risk cap would block all new orders).
+            position = self._position
+            if position is not None and position.ticker == market.ticker and result in ("yes", "no"):
+                self._position = None
+                if self._resting_order_id is not None:
+                    await self._cancel_resting()  # the market is closed: the unfilled remainder is dead
+                self._resolve(position, result, market.close_time)
             return
-        result = market.raw.get("result") or None
         if result not in ("yes", "no"):
             return  # defensive: a "finalized" market should always carry one of these; leave it pending
             # rather than popping and silently dropping a real position -- shutdown() reports it unresolved.
