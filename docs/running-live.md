@@ -172,6 +172,15 @@ is how far the backtest's fill assumptions are from a real exchange. The demo bo
 synthetic, so read it as plumbing and fee validation, not as what prod fills would look like and not as evidence
 of an edge. Create a `KILL` file to stop it; it cancels its open orders on the way out.
 
+**Nothing should be left resting, and every order is on record.** Every order, cancel and allocation the bot sends to
+Kalshi is appended to `data\\order-audit.jsonl` (one JSON line each: time, environment, ticker, side, price,
+count, `client_order_id`, and the exchange's `order_id` or its error). Compare it with the account's Orders /
+History tab: any order on the account that is not in that file did not come from this bot. `demo-check` and
+`demo` end by (or start by) cancelling everything resting on the demo account with Kalshi's read-free cancel-all
+call, because reading an order back can fail even when the order exists. If a run is killed hard, the next start
+cleans up. Only three commands can place a demo order: `demo-check`, `demo-probe` and `demo`. The dashboard and
+every other command cannot.
+
 ## 5. Dashboard (optional, no credentials, no network needed)
 
 ```powershell

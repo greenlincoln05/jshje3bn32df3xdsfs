@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import sqlite3
@@ -272,7 +273,7 @@ async def _cmd_demo_check(args: argparse.Namespace) -> int:
         "real demo orders). This never touches prod -- see kalshi_client.py's demo-only write gate.",
         flush=True,
     )
-    async with KalshiClient(KalshiEnv.DEMO, auth=auth) as client:  # hardcoded: demo-check never targets prod
+    async with KalshiClient(KalshiEnv.DEMO, auth=auth, write_log=order_audit_log()) as client:  # hardcoded: demo-check never targets prod
         report = await run_demo_check(client, series_ticker, wait_for_settlement=args.wait_for_settlement)
     print(render_demo_check_report(report))
     return 0 if report.ok else 1
@@ -469,6 +470,21 @@ async def _cmd_lab(args: argparse.Namespace) -> int:
     return 0
 
 
+ORDER_AUDIT_FILE = Path("data") / "order-audit.jsonl"
+
+
+def order_audit_log(path: Path = ORDER_AUDIT_FILE):
+    """Append-only JSON-lines ledger of every write the bot sends to Kalshi (orders, cancels, allocations): the
+    bot's own record to check the account's order history against."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(record: dict) -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, default=str, separators=(",", ":")) + "\n")
+
+    return write
+
+
 CRYPTO_EXCHANGE_INDEX = 2  # docs.kalshi.com "Exchange Sharding": crypto (KXBTC...) markets trade on shard 2
 
 
@@ -491,7 +507,7 @@ async def _cmd_demo_allocate(args: argparse.Namespace) -> int:
     if settings.key_id is None or settings.private_key_path is None:
         raise ConfigError("KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (a DEMO key)")
     auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
-    async with KalshiClient(KalshiEnv.DEMO, auth=auth) as client:
+    async with KalshiClient(KalshiEnv.DEMO, auth=auth, write_log=order_audit_log()) as client:
         market = await find_current_market(client, series_ticker)
         shard = market.exchange_index if market is not None else None
         if shard is None:
@@ -524,7 +540,7 @@ async def _cmd_demo_probe(args: argparse.Namespace) -> int:
     if settings.key_id is None or settings.private_key_path is None:
         raise ConfigError("KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (a DEMO key)")
     auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
-    async with KalshiClient(KalshiEnv.DEMO, auth=auth) as client:
+    async with KalshiClient(KalshiEnv.DEMO, auth=auth, write_log=order_audit_log()) as client:
         return await run_probe(client, args.series or config.series_ticker)
 
 
@@ -548,7 +564,7 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
     db_path = data_dir / f"demo-{series_ticker}-{env.value}-{timestamp}.sqlite"
     maker_fee_multiplier = Decimal(args.maker_fee_multiplier)
 
-    async with KalshiClient(env, auth=auth) as client:  # signs only the calls that need it; market data stays public
+    async with KalshiClient(env, auth=auth, write_log=order_audit_log()) as client:  # signs only the calls that need it; market data stays public
         balance = await client.get_balance()  # proves the demo key works before anything is placed
         market_now = await find_current_market(client, series_ticker)
         if market_now is not None:

@@ -101,6 +101,7 @@ class FakeKalshiClient:
         self.fills_to_return: list[KalshiFill] = []
         self.fills_on_create: list[KalshiFill] = []  # what a just-placed marketable order would immediately fill
         self.calls: list[str] = []
+        self.sweep_error = None
         self._ids = itertools.count(1)
 
     @property
@@ -120,6 +121,12 @@ class FakeKalshiClient:
         self.calls.append("cancel")
         self.cancelled.append((order_id, market_ticker))
         return make_order(order_id, status="canceled")
+
+    async def cancel_all_resting_orders(self):
+        self.calls.append("cancel_all")
+        if self.sweep_error is not None:
+            raise self.sweep_error
+        return {}
 
     async def list_orders(self, *, ticker=None, status=None):
         return self.orders_to_return
@@ -257,3 +264,18 @@ class TestDemoExecutionBackendReconciliation:
         backend = DemoExecutionBackend(client, TICKER)
         report = await backend.reconcile()
         assert report.cancelled_order_ids == [] and report.open_positions == []
+
+
+class TestReconcileSweepsWithoutReading:
+    async def test_it_calls_cancel_all_even_when_the_order_list_shows_nothing(self):
+        client = FakeKalshiClient()  # list_orders returns [] -- the order list missing orders, as on the real demo account
+        report = await DemoExecutionBackend(client, TICKER).reconcile()
+        assert "cancel_all" in client.calls and report.sweep_error is None
+
+    async def test_a_failed_sweep_is_reported_not_raised(self):
+        from btcbot.kalshi_client import KalshiConnectionError
+
+        client = FakeKalshiClient()
+        client.sweep_error = KalshiConnectionError("down")
+        report = await DemoExecutionBackend(client, TICKER).reconcile()
+        assert report.sweep_error and "down" in report.sweep_error

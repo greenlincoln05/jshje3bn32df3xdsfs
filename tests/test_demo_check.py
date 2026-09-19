@@ -36,6 +36,9 @@ class FakeClient:
         self.reject_insufficient_balance = True
         self.reject_closed_market = True
         self.cancel_actually_works = True
+        self.get_order_raises: Exception | None = None  # e.g. Kalshi answering 404 for an order it just accepted
+        self.sweep_raises: Exception | None = None
+        self.sweeps = 0
         self.wrong_side_mapping = False  # Kalshi records a NO order as YES (a broken side mapping)
         self.orders: dict[str, KalshiOrder] = {}
         self.fills: dict[str, list[KalshiFill]] = {}
@@ -90,7 +93,19 @@ class FakeClient:
         return self.orders[order_id]
 
     async def get_order(self, order_id):
+        if self.get_order_raises is not None:
+            raise self.get_order_raises
         return self.orders[order_id]
+
+    async def cancel_all_resting_orders(self):
+        self.sweeps += 1
+        if self.sweep_raises is not None:
+            raise self.sweep_raises
+        if self.cancel_actually_works:  # a broken exchange cancel is broken for cancel-all too
+            for order_id, order in list(self.orders.items()):
+                if not order.is_done:
+                    self.orders[order_id] = replace(order, status="canceled", remaining_count=Decimal(0))
+        return {}
 
     async def list_orders(self, *, ticker=None, status=None):
         return [o for o in self.orders.values() if ticker is None or o.ticker == ticker]
@@ -345,3 +360,43 @@ class TestShardCollateralPreflight:
         report = await run_demo_check(FakeClient(), SERIES, clock=lambda: T0)  # no exchange_index, no breakdown
         assert result_named(report, "collateral on the market's exchange shard").passed is None
         assert report.ok is True
+
+
+class TestNothingIsLeftRestingOnTheAccount:
+    """Regression: on the owner's real demo account, a failed read-back made demo-check return BEFORE its cancel
+    step, leaving resting orders on the account ('rogue' orders, in the owner's words)."""
+
+    async def test_an_order_that_cannot_be_read_back_is_still_cancelled(self):
+        from btcbot.kalshi_client import KalshiAPIError
+
+        client = FakeClient()
+        client.get_order_raises = KalshiAPIError(404, "not found", code="not_found")
+
+        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+
+        for side in ("YES", "NO"):
+            row = result_named(report, f"resting {side} order + cancel")
+            assert row.passed is False and "could not be read back" in row.detail and row.detail.endswith("; cancelled")
+        assert all(o.is_done for o in client.orders.values() if o.price == Decimal("0.01"))  # none left resting
+
+    async def test_a_failed_cancel_is_reported_not_hidden(self):
+        client = FakeClient()
+        client.cancel_actually_works = False
+        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        assert "cancel FAILED" in "\n".join(r.detail for r in report.results) or result_named(report, "resting YES order + cancel").passed is False
+
+    async def test_the_last_row_sweeps_every_resting_order_and_passes(self):
+        client = FakeClient()
+        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        last = report.results[-1]
+        assert last.name == "cleanup: cancel any resting demo orders" and last.passed is True
+        assert client.sweeps >= 1 and all(o.is_done for o in client.orders.values())  # reconcile sweeps once too
+
+    async def test_a_sweep_that_fails_is_a_loud_failure_with_manual_instructions(self):
+        from btcbot.kalshi_client import KalshiConnectionError
+
+        client = FakeClient()
+        client.sweep_raises = KalshiConnectionError("down")
+        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        last = report.results[-1]
+        assert last.passed is False and "Orders tab" in last.detail and report.ok is False

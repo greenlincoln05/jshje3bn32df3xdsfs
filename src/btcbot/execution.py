@@ -13,6 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
+from btcbot.kalshi_client import KalshiError
 from btcbot.models import KalshiFill, KalshiOrder, OrderBook, Position, Side
 from btcbot.paper_broker import Fill, PaperBroker
 
@@ -69,6 +70,7 @@ class ReconciliationReport:
 
     cancelled_order_ids: list[str]
     open_positions: list[Position]
+    sweep_error: str | None = None  # the cancel-all safety net's failure, if it failed
 
 
 class DemoExecutionBackend:
@@ -110,9 +112,16 @@ class DemoExecutionBackend:
         for order in open_orders:
             await self._client.cancel_order(order.order_id, market_ticker=order.ticker)
             cancelled.append(order.order_id)
+        # The order list can miss orders (it did on a real demo account), so also cancel everything by the
+        # read-free cancel-all call. A leftover resting order is exactly the "rogue order" to avoid.
+        sweep_error: str | None = None
+        try:
+            await self._client.cancel_all_resting_orders()
+        except KalshiError as exc:
+            sweep_error = str(exc)
         await self._prime()
         positions = [position for position in await self._client.get_positions() if position.count > 0]
-        return ReconciliationReport(cancelled_order_ids=cancelled, open_positions=positions)
+        return ReconciliationReport(cancelled_order_ids=cancelled, open_positions=positions, sweep_error=sweep_error)
 
     async def place_resting_order(self, side: Side, price: Decimal, size: Decimal) -> str:
         if not self._primed:

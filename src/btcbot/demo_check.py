@@ -49,6 +49,7 @@ class DemoCheckClient(Protocol):
         self, ticker: str, side: str, *, count: Decimal, price: Decimal | None = None, client_order_id: str | None = None
     ) -> object: ...
     async def cancel_order(self, order_id: str, *, market_ticker: str | None = None) -> object: ...
+    async def cancel_all_resting_orders(self) -> object: ...
     async def get_positions(self) -> list[object]: ...
     async def list_orders(self, *, ticker: str | None = None, status: str | None = None) -> list[object]: ...
 
@@ -178,6 +179,7 @@ async def run_demo_check(
     results.append(await _check_closed_market_rejected(client, series_ticker))
     results.append(await _check_survives_a_request_burst(client))
     results.append(await _check_crash_restart_reconciliation(client, market))
+    results.append(await _sweep_leftover_orders(client))
 
     fidelity = FidelityReport([compare_fill_to_paper_fee_model(fill) for fill in observed_fills])
     return DemoCheckReport(market.ticker, results, fidelity)
@@ -217,23 +219,54 @@ async def _check_resting_order_and_cancel(client: DemoCheckClient, backend: Demo
     price = Decimal("0.01")
     try:
         order_id = await backend.place_resting_order(side, price, Decimal(1))
-        placed = await client.get_order(order_id)
-        if placed.is_done:
-            return CheckResult(name, False, f"order {order_id} was already done ({placed.status}) right after placing it")
-        if placed.side != side or (placed.price is not None and placed.price != price):
-            await backend.cancel_order(order_id)
-            return CheckResult(
-                name, False,
-                f"asked for {side.upper()} at {price} but Kalshi recorded {placed.side.upper()} at {placed.price}: "
-                "the side/price mapping in kalshi_client.create_order is WRONG; do not trade until fixed",
-            )
-        await backend.cancel_order(order_id)
-        cancelled = await client.get_order(order_id)
-        if not cancelled.is_done:
-            return CheckResult(name, False, f"order {order_id} still shows {cancelled.status} after cancel")
-        return CheckResult(name, True, f"order {order_id}: {side.upper()} at {price} read back correctly, then {cancelled.status}")
     except KalshiError as exc:
         return CheckResult(name, False, str(exc))
+
+    # From here an order EXISTS on the exchange. Whatever the read-back does, it is cancelled below: an earlier
+    # version returned on a failed read and left the order resting on the account.
+    read_error: KalshiError | None = None
+    placed = None
+    try:
+        placed = await client.get_order(order_id)
+    except KalshiError as exc:
+        read_error = exc
+    cancel_error: KalshiError | None = None
+    try:
+        await backend.cancel_order(order_id)
+    except KalshiError as exc:
+        cancel_error = exc
+    cancel_note = f"; cancel FAILED ({cancel_error}), it may still be resting" if cancel_error else "; cancelled"
+
+    if read_error is not None:
+        return CheckResult(name, False, f"order {order_id} was accepted but could not be read back ({read_error}){cancel_note}")
+    if placed.is_done:
+        return CheckResult(name, False, f"order {order_id} was already done ({placed.status}) right after placing it{cancel_note}")
+    if placed.side != side or (placed.price is not None and placed.price != price):
+        return CheckResult(
+            name, False,
+            f"asked for {side.upper()} at {price} but Kalshi recorded {placed.side.upper()} at {placed.price}: "
+            f"the side/price mapping in kalshi_client.create_order is WRONG; do not trade until fixed{cancel_note}",
+        )
+    if cancel_error is not None:
+        return CheckResult(name, False, f"order {order_id} read back correctly but{cancel_note}")
+    try:
+        cancelled = await client.get_order(order_id)
+    except KalshiError as exc:
+        return CheckResult(name, False, f"order {order_id} read back correctly and cancelled, but the post-cancel read failed: {exc}")
+    if not cancelled.is_done:
+        return CheckResult(name, False, f"order {order_id} still shows {cancelled.status} after cancel")
+    return CheckResult(name, True, f"order {order_id}: {side.upper()} at {price} read back correctly, then {cancelled.status}")
+
+
+async def _sweep_leftover_orders(client: DemoCheckClient) -> CheckResult:
+    """Last row, always: cancel EVERYTHING still resting on the demo account. Needs no reads, so it works when
+    an order could not be looked up, and it clears leftovers from earlier failed runs."""
+    name = "cleanup: cancel any resting demo orders"
+    try:
+        await client.cancel_all_resting_orders()
+    except KalshiError as exc:
+        return CheckResult(name, False, f"could not sweep: {exc}. Cancel resting orders by hand in the demo Orders tab.")
+    return CheckResult(name, True, "cancelled every resting demo order (including leftovers from earlier runs)")
 
 
 async def _check_fillable_order_and_position(

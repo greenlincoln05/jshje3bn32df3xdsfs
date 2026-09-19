@@ -35,6 +35,10 @@ class FakeProbeClient:
     async def list_markets(self, *, series_ticker, status=None):
         return [self._market]
 
+    async def cancel_all_resting_orders(self):
+        self.sweeps = getattr(self, "sweeps", 0) + 1
+        return {}
+
     async def get_orderbook(self, ticker, *, depth=0):
         return OrderBook(ticker, (PriceLevel(Decimal("0.01"), Decimal(2)), PriceLevel(Decimal("0.6"), Decimal(9))),
                          (PriceLevel(Decimal("0.02"), Decimal(5)),))

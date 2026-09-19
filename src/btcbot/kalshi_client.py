@@ -24,6 +24,7 @@ import random
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -217,8 +218,10 @@ class KalshiClient:
         backoff_cap: float = 8.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: random.Random | None = None,
+        write_log: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.env = env
+        self._write_log = write_log
         self._auth = auth
         self._max_retries = max_retries
         self._backoff_base = backoff_base
@@ -396,18 +399,65 @@ class KalshiClient:
         }
         if not marketable and post_only:
             body["post_only"] = True
-        data = await self._request("POST", _ORDERS_V2, authenticated=True, json_body=body)
-        return OrderAck.from_api(data)
+        self._audit("create_order", ticker=ticker, side=side, book_side=book_side, count=body["count"],
+                    price=body["price"], time_in_force=body["time_in_force"], client_order_id=body["client_order_id"])
+        try:
+            data = await self._request("POST", _ORDERS_V2, authenticated=True, json_body=body)
+        except KalshiError as exc:
+            self._audit("create_order_failed", client_order_id=body["client_order_id"], error=str(exc)[:300])
+            raise
+        try:
+            ack = OrderAck.from_api(data)
+        except ParseError as exc:
+            # The exchange answered 2xx: the order may well exist even though its id could not be read.
+            self._audit("create_order_unreadable_ack", client_order_id=body["client_order_id"], error=str(exc), raw=str(data)[:300])
+            raise
+        self._audit("create_order_ack", client_order_id=body["client_order_id"], order_id=ack.order_id,
+                    fill_count=str(ack.fill_count), remaining_count=str(ack.remaining_count))
+        return ack
 
     async def cancel_order(self, order_id: str, *, market_ticker: str | None = None) -> CancelAck:
         """``market_ticker`` is needed for Kalshi's auto-routing: an order id alone cannot identify the
         exchange shard (docs: DELETE /portfolio/events/orders/{order_id})."""
         self._require_demo("cancel_order")
         params = {"market_ticker": market_ticker} if market_ticker else None
-        data = await self._request(
-            "DELETE", f"{_ORDERS_V2}/{quote(order_id, safe='')}", params=params, authenticated=True
-        )
-        return CancelAck.from_api(data)
+        self._audit("cancel_order", order_id=order_id, ticker=market_ticker)
+        try:
+            data = await self._request(
+                "DELETE", f"{_ORDERS_V2}/{quote(order_id, safe='')}", params=params, authenticated=True
+            )
+            ack = CancelAck.from_api(data)
+        except (KalshiError, ParseError) as exc:
+            self._audit("cancel_order_failed", order_id=order_id, error=str(exc)[:300])
+            raise
+        self._audit("cancel_order_ack", order_id=order_id, reduced_by=str(ack.reduced_by))
+        return ack
+
+    async def cancel_all_resting_orders(self) -> dict[str, Any]:
+        """Cancel every resting order on the account (``DELETE /portfolio/events/orders``). Needs no reads, so
+        it works even when an order cannot be looked up, which is exactly when it is needed: it is the safety
+        net that stops a failed check leaving orders behind. Demo-only like every write."""
+        self._require_demo("cancel_all_resting_orders")
+        self._audit("cancel_all_resting_orders")
+        try:
+            data = await self._request("DELETE", _ORDERS_V2, authenticated=True)
+        except KalshiError as exc:
+            self._audit("cancel_all_resting_orders_failed", error=str(exc)[:300])
+            raise
+        self._audit("cancel_all_resting_orders_ack", response=str(data)[:300])
+        return data
+
+    def _audit(self, event: str, **fields: Any) -> None:
+        """One JSON-serialisable record per write action, handed to ``write_log`` (the CLI appends it to
+        ``data/order-audit.jsonl``). This is the bot's own ledger of everything it asked Kalshi to do, so the
+        account's order history can be checked against it. Never blocks trading: a logging failure is only
+        a warning."""
+        if self._write_log is None:
+            return
+        try:
+            self._write_log({"ts": datetime.now(timezone.utc).isoformat(), "env": self.env.value, "event": event, **fields})
+        except Exception as exc:  # noqa: BLE001 -- an audit-log problem must never take an order path down
+            log.warning("order audit log failed: %s", exc)
 
     async def probe_get(
         self, endpoint: str, params: Mapping[str, str] | None = None, *, authenticated: bool = True
@@ -435,6 +485,7 @@ class KalshiClient:
         if any(i < 0 or not 0 <= p <= 100 for i, p in percent_by_exchange.items()):
             raise ValueError("exchange_index must be >= 0 and each percent between 0 and 100")
         body = {"allocations": [{"exchange_index": i, "percent": p} for i, p in sorted(percent_by_exchange.items())]}
+        self._audit("set_target_balance_allocation", allocations=body["allocations"])
         await self._request("POST", "/portfolio/target_balance_allocation", authenticated=True, json_body=body)
 
     def _require_demo(self, action: str) -> None:
