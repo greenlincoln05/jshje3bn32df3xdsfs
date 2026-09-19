@@ -21,7 +21,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from btcbot.model import EwmaVolatility, ModelState, log_return, predict
+from btcbot.model import TimedVolatility, ModelState, predict
 from btcbot.models import OrderBook, ParseError, PriceLevel, Side, parse_time
 from btcbot.paper_broker import PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
@@ -137,10 +137,11 @@ def run_backtest(
 
     broker = PaperBroker(maker_fee_multiplier=maker_fee_multiplier, queue_assumption=queue_assumption)
     risk = RiskManager(config.risk, kill_file=_NO_KILL_FILE, clock=lambda: snapshots[0].poll_ts)
-    vol = EwmaVolatility(config.vol_window_sec)
+    vol = TimedVolatility(config.vol_window_sec)
 
     spot_idx = 0
     last_spot_price: Decimal | None = None
+    last_spot_ts: datetime | None = None
     current_ticker: str | None = None
     resting_order_id: str | None = None
     position: TradeRecord | None = None
@@ -175,9 +176,9 @@ def run_backtest(
     for snap in snapshots:
         while spot_idx < len(spot_ticks) and spot_ticks[spot_idx][0] <= snap.poll_ts:
             ts, price = spot_ticks[spot_idx]
-            if last_spot_price is not None:
-                vol.update(log_return(last_spot_price, price))
+            vol.update(price, ts)
             last_spot_price = price
+            last_spot_ts = ts
             spot_idx += 1
         if last_spot_price is None:
             continue  # no spot data yet: cannot price anything
@@ -191,7 +192,7 @@ def run_backtest(
             continue  # strike not yet known for this ticker
         strike, close_time = windows[snap.ticker]
         tau_sec = (close_time - snap.poll_ts).total_seconds()
-        if tau_sec < 0:
+        if tau_sec <= 0:
             continue  # a stray snapshot polled after close
 
         state = ModelState(
@@ -223,7 +224,7 @@ def run_backtest(
             book=snap.book,
             tau_sec=tau_sec,
             p_yes=p_blend,
-            spot_is_stale=False,
+            spot_is_stale=(snap.poll_ts - last_spot_ts).total_seconds() > 3 or not vol.ready or tau_sec <= 60,
             min_edge=config.min_edge,
             min_depth=config.min_depth,
             max_spread=config.max_spread,

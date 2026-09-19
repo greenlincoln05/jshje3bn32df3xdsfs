@@ -423,6 +423,11 @@ class Recorder:
                     request_started = self._clock()
                     book = await self._client.get_orderbook(market.ticker)
                     poll_ts = self._clock()
+                    if not market.is_open_at(poll_ts):
+                        pending_settlement.add(market.ticker)
+                        self._log("info", "expired_book", f"discarded post-close book for {market.ticker}")
+                        await self._finalize_pending(pending_settlement, stats)
+                        continue
                     self._record_orderbook(market.ticker, book, request_started=request_started, poll_ts=poll_ts)
                     stats.orderbook_polls += 1
                     stats.errors = 0

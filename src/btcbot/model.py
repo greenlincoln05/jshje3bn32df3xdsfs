@@ -135,18 +135,66 @@ class EwmaVolatility:
     def alpha(self) -> float:
         return 2.0 / (self.span_sec + 1.0)
 
-    def update(self, log_return: float) -> None:
-        squared = log_return * log_return
+    def update(self, log_return: float, *, elapsed_sec: float = 1.0) -> None:
+        if not math.isfinite(elapsed_sec) or elapsed_sec <= 0:
+            raise ValueError("elapsed_sec must be positive and finite")
+        squared = log_return * log_return / elapsed_sec
         if not self._seen:
             self._variance = squared
             self._seen = True
         else:
-            a = self.alpha
+            a = 1.0 - (1.0 - self.alpha) ** elapsed_sec
             self._variance = a * squared + (1.0 - a) * self._variance
 
     @property
     def sigma(self) -> float:
         return math.sqrt(self._variance)
+
+
+class TimedVolatility:
+    """Per-second EWMA from completed receive-time buckets, not individual trades.
+
+    Only the last price received in each second is used. A later second closes the
+    previous bucket; future ticks cannot revise it. Gaps over three seconds reset
+    the warmup rather than treating an outage as a low-volatility market.
+    """
+
+    def __init__(self, span_sec: float, warmup_sec: int = 60):
+        self.span_sec = span_sec
+        self.warmup_sec = warmup_sec
+        self._vol = EwmaVolatility(span_sec)
+        self._bucket: int | None = None
+        self._price: Decimal | None = None
+        self._previous: tuple[int, Decimal] | None = None
+        self._elapsed = 0
+
+    def update(self, price: Decimal, ts: datetime) -> None:
+        if not price.is_finite() or price <= 0:
+            raise ValueError("price must be positive and finite")
+        second = math.floor(ts.timestamp())
+        if self._bucket is not None and second < self._bucket:
+            return
+        if self._bucket is not None and second > self._bucket:
+            if second - self._bucket > 3:
+                self._vol = EwmaVolatility(self.span_sec)
+                self._previous = None
+                self._elapsed = 0
+            else:
+                if self._previous is not None:
+                    prev_second, prev_price = self._previous
+                    elapsed = self._bucket - prev_second
+                    self._vol.update(log_return(prev_price, self._price), elapsed_sec=elapsed)
+                    self._elapsed += elapsed
+                self._previous = (self._bucket, self._price)
+        self._bucket, self._price = second, price
+
+    @property
+    def sigma(self) -> float:
+        return self._vol.sigma
+
+    @property
+    def ready(self) -> bool:
+        return self._elapsed >= self.warmup_sec
 
 
 def log_return(previous: Decimal, current: Decimal) -> float:

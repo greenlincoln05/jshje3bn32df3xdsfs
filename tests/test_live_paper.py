@@ -48,12 +48,18 @@ def make_trader(conn, *, config=None, buffer=None, **kwargs):
 
 def feed_fresh_spot(trader, buffer, price=Decimal("80000"), *, ts=T0):
     """Give the buffer a fresh (non-stale) tick and the trader an EWMA history for it."""
-    trader.on_spot_tick(price)
+    if not trader._vol.ready:
+        for i in range(62, 0, -1):
+            trader.on_spot_tick(price, ts - timedelta(seconds=i))
+    trader.on_spot_tick(price, ts)
     buffer.add(SpotTick(price=price, source="test", source_ts=None, receive_ts=ts, monotonic_ts=time.monotonic()))
 
 
 def feed_stale_spot(trader, buffer, price=Decimal("80000"), *, ts=T0):
-    trader.on_spot_tick(price)
+    if not trader._vol.ready:
+        for i in range(62, 0, -1):
+            trader.on_spot_tick(price, ts - timedelta(seconds=i))
+    trader.on_spot_tick(price, ts)
     buffer.add(SpotTick(price=price, source="test", source_ts=None, receive_ts=ts, monotonic_ts=time.monotonic() - 100))
 
 
