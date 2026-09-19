@@ -270,3 +270,61 @@ class TestEquivalentSettings:
                          min_train_trades=3)
         assert len(report.rows) == 1 and report.rows[0].equivalent == 2
         assert "identical results" in render_lab_report(report)
+
+class TestAuditFixes:
+    def test_demo_files_rejected_before_merge(self, tmp_path):
+        from btcbot.lab import load_lab_data
+        with pytest.raises(LabError, match='demo/synthetic'):
+            load_lab_data([tmp_path / 'paper-prod.sqlite', tmp_path / 'demo-X-demo.sqlite'])
+
+    def test_aligned4_requires_all_history(self, tmp_path):
+        data = seeded(tmp_path, ['yes'])
+        result = replay(data, filters=EntryFilters(trend_mode='aligned4'))
+        assert not result.trades
+        assert result.filter_counts['trend'] > 0
+
+    def test_aligned4_uses_four_causal_lookbacks(self, tmp_path, monkeypatch):
+        from btcbot.backtest import SpotSeries
+        calls = []
+        def move(self, ts, lookback):
+            calls.append(lookback)
+            return Decimal(10)
+        monkeypatch.setattr(SpotSeries, 'move', move)
+        data = seeded(tmp_path, ['yes'])
+        result = replay(data, filters=EntryFilters(trend_mode='aligned4'))
+        assert result.trades
+        assert set(calls) == {900, 1800, 3600, 86400}
+        monkeypatch.setattr(SpotSeries, 'move', lambda self, ts, lookback: Decimal(-1) if lookback == 86400 else Decimal(10))
+        assert not replay(data, filters=EntryFilters(trend_mode='aligned4')).trades
+
+    def test_spot_move_rejects_stale_current_tick(self):
+        from btcbot.backtest import SpotSeries
+        series = SpotSeries([(T0, Decimal(100)), (T0 + timedelta(seconds=50), Decimal(110))])
+        assert series.move(T0 + timedelta(seconds=60), 60) is None
+
+    @pytest.mark.parametrize('balance', [100, 500, 1000, 5000])
+    def test_minimum_premium_scales_and_rounds_up(self, tmp_path, monkeypatch, balance):
+        from btcbot.paper_broker import PaperBroker
+        from btcbot.lab import _filters_for, _config_for
+        placed = []
+        original = PaperBroker.place_resting_order
+        def record(self, side, price, size, **kwargs):
+            placed.append(dict(price=price, size=size))
+            return original(self, side, price, size, **kwargs)
+        monkeypatch.setattr(PaperBroker, 'place_resting_order', record)
+        account = AccountSettings(account_usd=Decimal(balance))
+        params = LabParams.from_config(BotConfig())
+        filters = _filters_for(params, account)
+        replay(seeded(tmp_path, ['yes']), _config_for(BotConfig(), params, account), filters=filters)
+        assert placed
+        premium = placed[0]['size'] * placed[0]['price']
+        assert Decimal(balance) * Decimal('.05') <= premium < Decimal(balance) * Decimal('.05') + placed[0]['price']
+
+    def test_minimum_cannot_overdraw_account(self, tmp_path):
+        result = replay(seeded(tmp_path, ['yes']), filters=EntryFilters(account_usd=Decimal(1), min_stake_usd=Decimal(5)))
+        assert not result.trades
+        assert result.filter_counts['too_small'] > 0
+
+    def test_low_threshold_cannot_claim_evidence(self, tmp_path):
+        report = run_lab(seeded(tmp_path, ['yes'] * 10), BotConfig(), {}, min_train_trades=1)
+        assert 'Exploratory' in report.verdict or 'No combination' in report.verdict

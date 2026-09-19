@@ -20,7 +20,7 @@ from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import TYPE_CHECKING
 
 from btcbot.model import TimedVolatility, ModelState, predict
@@ -282,7 +282,7 @@ class SpotSeries:
         now = ts.timestamp()
         hi = bisect_right(self._t, now) - 1
         lo = bisect_right(self._t, now - lookback_sec) - 1
-        if hi < 0 or lo < 0 or (now - lookback_sec) - self._t[lo] > 5:
+        if hi < 0 or lo < 0 or now - self._t[hi] > 5 or (now - lookback_sec) - self._t[lo] > 5:
             return None
         return self._p[hi] - self._p[lo]
 
@@ -353,6 +353,7 @@ class EntryFilters:
     trend_min_move_usd: Decimal = Decimal(0)
     account_usd: Decimal | None = None
     risk_pct_per_trade: Decimal | None = None
+    min_stake_usd: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,7 +385,7 @@ def replay_prepared(
     position: TradeRecord | None = None
     trades: list[TradeRecord] = []
     windows_traded: set[str] = set()
-    counts = {"price_band": 0, "trend": 0, "too_small": 0, "risk_blocked": 0}
+    counts = {"price_band": 0, "trend": 0, "trend_missing_history": 0, "too_small": 0, "risk_blocked": 0}
     bankroll = filters.account_usd if filters is not None else None
     equity: list[tuple[datetime, Decimal]] = []
 
@@ -427,20 +428,27 @@ def replay_prepared(
             counts["price_band"] += 1
             return None
         if filters.trend_mode != "off":
-            move = prepared.spot_series.move(ts, filters.trend_lookback_sec)
-            toward_yes = move is not None and move >= filters.trend_min_move_usd
-            toward_no = move is not None and move <= -filters.trend_min_move_usd
+            lookbacks = (900, 1800, 3600, 86400) if filters.trend_mode == "aligned4" else (filters.trend_lookback_sec,)
+            moves = [prepared.spot_series.move(ts, lookback) for lookback in lookbacks]
+            if any(move is None for move in moves):
+                counts["trend_missing_history"] += 1
+            toward_yes = all(move is not None and move > 0 and move >= filters.trend_min_move_usd for move in moves)
+            toward_no = all(move is not None and move < 0 and move <= -filters.trend_min_move_usd for move in moves)
             wanted = toward_yes if decision.side == "yes" else toward_no
             if filters.trend_mode == "against":
                 wanted = toward_no if decision.side == "yes" else toward_yes
             if not wanted:
                 counts["trend"] += 1
                 return None
-        if bankroll is not None and filters.risk_pct_per_trade is not None:
+        if bankroll is not None:
             cash = bankroll - risk.open_exposure_usd
-            contracts = int((max(cash, Decimal(0)) * filters.risk_pct_per_trade) / price)
+            contracts = int((max(cash, Decimal(0)) * filters.risk_pct_per_trade) / price) if filters.risk_pct_per_trade is not None else int(decision.size)
+            minimum = int((filters.min_stake_usd / price).to_integral_value(rounding=ROUND_CEILING))
+            contracts = max(contracts, minimum)
             contracts = min(contracts, config.risk.max_contracts_per_trade)
-            if contracts < 1:
+            # Reserve a conservative per-contract fee buffer for possible partial fills.
+            fee_buffer = Decimal("0.07") * price * (1 - price) * maker_fee_multiplier + Decimal("0.01")
+            if contracts < max(1, minimum) or Decimal(contracts) * (price + fee_buffer) > cash:
                 counts["too_small"] += 1
                 return None
             return replace(decision, size=Decimal(contracts))
