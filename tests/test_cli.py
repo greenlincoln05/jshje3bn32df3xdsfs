@@ -441,3 +441,18 @@ class TestBacktestEndToEnd:
     def test_rejects_a_negative_maker_fee_multiplier(self, tmp_path, capsys):
         assert cli.main(["backtest", "--db", "whatever", "--maker-fee-multiplier", "-1"]) == 2
         assert "--maker-fee-multiplier" in capsys.readouterr().err
+
+
+class TestDemoAllocation:
+    def test_the_markets_shard_gets_the_percent_and_the_rest_stays_on_shard_zero(self):
+        assert cli.allocation_for(2, 100) == {2: 100}
+        assert cli.allocation_for(2, 60) == {2: 60, 0: 40}
+        assert cli.allocation_for(0, 50) == {0: 100}
+        assert cli.allocation_for(None, 100) == {2: 100}  # unreported shard: assume crypto's
+
+    def test_a_percent_outside_1_to_100_is_refused(self):
+        import pytest
+
+        for bad in (0, 101, -5):
+            with pytest.raises(ValueError):
+                cli.allocation_for(2, bad)

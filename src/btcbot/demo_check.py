@@ -159,6 +159,11 @@ async def run_demo_check(
         return DemoCheckReport(None, results)
     results.append(CheckResult("market discovery", True, market.ticker))
 
+    collateral = collateral_preflight(balance, market)
+    results.append(collateral)
+    if collateral.passed is False:
+        return DemoCheckReport(market.ticker, results)  # every order below would fail the same way; say it once
+
     backend = DemoExecutionBackend(client, market.ticker)
     results.append(await _check_resting_order_and_cancel(client, backend, "yes"))
     results.append(await _check_resting_order_and_cancel(client, backend, "no"))
@@ -179,6 +184,27 @@ async def run_demo_check(
 
 
 # --------------------------------------------------------------------------- individual checks
+
+
+def collateral_preflight(balance: Balance, market: Market) -> CheckResult:
+    """Kalshi splits an account's balance across exchange shards and crypto markets trade on their own (index 2).
+    An order there is rejected with ``insufficient_shard_balance`` unless collateral has been allocated to that
+    shard, however much money the account has in total. Checked up front so one clear row replaces a wall of
+    identical order failures."""
+    name = "collateral on the market's exchange shard"
+    index = market.exchange_index
+    if index is None or not balance.by_exchange:
+        return CheckResult(name, None, "skipped: Kalshi did not report an exchange shard or a per-shard balance")
+    on_shard = balance.by_exchange.get(index, Decimal(0))
+    if on_shard <= 0:
+        held = ", ".join(f"shard {i}: ${v:,.2f}" for i, v in sorted(balance.by_exchange.items())) or "none"
+        return CheckResult(
+            name, False,
+            f"${on_shard:,.2f} is allocated to exchange shard {index}, where {market.ticker} trades (your balance is "
+            f"{held}). Orders will be rejected with insufficient_shard_balance. Run `btcbot demo-allocate` once, wait "
+            "~10 s for Kalshi to move the funds, and re-run.",
+        )
+    return CheckResult(name, True, f"${on_shard:,.2f} is on exchange shard {index}")
 
 
 async def _check_resting_order_and_cancel(client: DemoCheckClient, backend: DemoExecutionBackend, side: Side) -> CheckResult:

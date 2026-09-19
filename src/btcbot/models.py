@@ -168,6 +168,19 @@ class Market:
     def is_open_at(self, now: datetime) -> bool:
         return self.status == "active" and self.open_time <= now < self.close_time
 
+    @property
+    def exchange_index(self) -> int | None:
+        """Which Kalshi exchange shard trades this market (docs: "Exchange Sharding"; crypto is shard 2). Orders
+        for it are only accepted if collateral has been allocated to THAT shard. None if the payload has no
+        such field (older payloads, or a fixture)."""
+        raw = self.raw.get("exchange_index")
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
     def seconds_to_close(self, now: datetime) -> float:
         return (self.close_time - now).total_seconds()
 
@@ -373,8 +386,9 @@ class Position:
 
 @dataclass(frozen=True)
 class Balance:
-    available: Decimal  # dollars
+    available: Decimal  # dollars, across every exchange shard
     portfolio_value: Decimal  # dollars
+    by_exchange: dict[int, Decimal] = field(default_factory=dict)  # dollars per exchange shard; empty if not reported
 
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> Self:
@@ -382,4 +396,13 @@ class Balance:
         if available is None:  # older payloads carried integer cents only
             available = _require_decimal(require(payload, "balance", "balance"), "balance") / 100
         portfolio_cents = _require_decimal(payload.get("portfolio_value", 0), "portfolio_value")
-        return cls(available=available, portfolio_value=portfolio_cents / 100)
+        by_exchange: dict[int, Decimal] = {}
+        breakdown = payload.get("balance_breakdown")  # omitted for subaccount-restricted keys
+        if isinstance(breakdown, list):
+            for entry in breakdown:
+                if not isinstance(entry, Mapping):
+                    continue
+                index, amount = entry.get("exchange_index"), to_decimal(entry.get("balance"), "balance_breakdown balance")
+                if isinstance(index, int) and not isinstance(index, bool) and amount is not None:
+                    by_exchange[index] = amount
+        return cls(available=available, portfolio_value=portfolio_cents / 100, by_exchange=by_exchange)

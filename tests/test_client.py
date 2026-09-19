@@ -654,3 +654,56 @@ class TestCreateAndCancelOrderV2:
         async with client:
             with pytest.raises(ParseError):
                 await client.create_order(TICKER, "yes", count=Decimal("1"), price=Decimal("0.5"))
+
+
+class TestShardBalancesAndAllocation:
+    async def test_balance_breakdown_is_parsed_per_exchange_shard(self, rsa_key):
+        payload = {"balance": 10000, "balance_dollars": "100.00", "portfolio_value": 0,
+                   "balance_breakdown": [{"exchange_index": 0, "balance": "100.00"}, {"exchange_index": 2, "balance": "0.00"}]}
+        script = Script(ok(payload))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            balance = await client.get_balance()
+        assert balance.available == Decimal("100.00") and balance.by_exchange == {0: Decimal("100.00"), 2: Decimal("0.00")}
+
+    async def test_a_balance_without_a_breakdown_is_still_fine(self, rsa_key):
+        script = Script(ok({"balance": 5000, "portfolio_value": 0}))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            assert (await client.get_balance()).by_exchange == {}
+
+    async def test_market_exchange_index_is_read_from_the_market_payload(self, load_fixture):
+        from btcbot.models import Market
+
+        payload = {**load_fixture("market_active.json")["market"], "exchange_index": 2}
+        assert Market.from_api(payload).exchange_index == 2
+        assert Market.from_api({**payload, "exchange_index": None}).exchange_index is None
+        assert Market.from_api({k: v for k, v in payload.items() if k != "exchange_index"}).exchange_index is None
+
+    async def test_set_target_balance_allocation_posts_the_documented_body(self, rsa_key):
+        script = Script(ok({}))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            await client.set_target_balance_allocation({2: 100})
+            await client.set_target_balance_allocation({2: 60, 0: 40})
+        assert script.requests[0].url.path == "/trade-api/v2/portfolio/target_balance_allocation"
+        assert json.loads(script.requests[0].content) == {"allocations": [{"exchange_index": 2, "percent": 100}]}
+        assert json.loads(script.requests[1].content) == {
+            "allocations": [{"exchange_index": 0, "percent": 40}, {"exchange_index": 2, "percent": 60}]
+        }
+
+    async def test_allocation_is_demo_only_and_must_total_100(self, rsa_key):
+        prod_script = Script(ok({}))
+        prod, _ = make_client(prod_script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with prod:
+            with pytest.raises(KalshiWriteNotAllowedError):
+                await prod.set_target_balance_allocation({2: 100})
+        assert prod_script.requests == []
+
+        demo_script = Script(ok({}))
+        demo, _ = make_client(demo_script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with demo:
+            for bad in ({2: 50}, {2: 120, 0: -20}):
+                with pytest.raises(ValueError):
+                    await demo.set_target_balance_allocation(bad)
+        assert demo_script.requests == []
