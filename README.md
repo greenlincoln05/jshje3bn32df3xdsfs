@@ -13,7 +13,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | Phase | What | State |
 |------:|------|-------|
 | 1 | Skeleton, Kalshi client (RSA-PSS signing), market discovery | **done** |
-| 2 | Spot feed + recorder (24h+ of order books, spot ticks, settlements) | not started |
+| 2 | Spot feed + recorder (24h+ of order books, spot ticks, settlements) | **built and tested; no real capture run yet** |
 | 3 | Fair-probability model + calibration report | not started |
 | 4 | Backtest + queue-aware paper broker | not started |
 | 5 | Live paper run, several days | not started |
@@ -26,6 +26,30 @@ The [repository review and overnight-plan assessment](docs/review-and-overnight-
 records phase 1 bug fixes and phase 2 requirements for measuring latency and data quality.
 Market listing follows pagination; discovery re-checks time after network calls and refuses
 to display a quote fetched across market close.
+
+**Phase 2, as built:** `spot_feed.py` streams Coinbase's public `ticker` channel for BTC-USD into a rolling
+buffer with staleness detection and a REST fallback; `recorder.py` polls Kalshi's public REST endpoints
+(order book, market list/state, settlement follow-up) into SQLite, with a KILL-file switch, a free-disk
+floor, a database size cap, and a repeated-failure stop, none of which restart themselves. `btcbot record`
+wires the two together. All 46 new tests are offline (fakes for the WebSocket and the Kalshi client; no
+network). Two things are still open, both flagged in the review above rather than worked around:
+
+- **REST-only, not authenticated capture.** Kalshi's order-book-delta WebSocket needs an API key even for
+  public data, and no key has been provisioned through a secure channel (see "A note on API keys" below), so
+  this is the "coarse" mode the review describes, not full order-flow. Anything computed from this data
+  should say so.
+- **No real multi-hour run yet.** This session runs in an ephemeral remote container that can be reclaimed
+  between turns, so it is not a place to leave a 9- or 24-hour background recorder running unattended.
+  `btcbot record` has been smoke-tested against the live public API for a short, bounded window (see below)
+  to confirm the wiring works end to end; an actual multi-hour capture needs to run somewhere that stays up,
+  most likely the owner's own machine.
+
+### A note on API keys
+
+No Kalshi API key has been used by any Claude session working on this repo, demo or production. A key that
+has been pasted into a chat (this one or another assistant's) should be treated as exposed and revoked/rotated,
+regardless of whether it targets demo or prod — the practice that keeps this safe is a fresh key that goes
+straight into a local `.env` and is never pasted into a conversation.
 
 ## Setup
 
@@ -45,12 +69,18 @@ btcbot discover --env prod            # strike, close time and top of book for t
 btcbot discover --env prod --watch 5  # one line every 5 s; the ticker rolls over every 15 minutes
 btcbot discover                       # same, against KALSHI_ENV (default: demo)
 btcbot auth-check                     # one signed GET /portfolio/balance: proves your key and signing work
+btcbot record --env prod --hours 9    # poll public market data + Coinbase spot ticks into ./data/*.sqlite
 ```
 
 `discover` needs no credentials because Kalshi's market data is public. `auth-check` needs `KALSHI_KEY_ID` and
 `KALSHI_PRIVATE_KEY_PATH` (copy `.env.example` to `.env`; on Windows write the key path unquoted or with forward
 slashes, because a quoted `"C:\temp\..."` turns `\t` into a tab). Demo and production keys are separate and only work
 in the environment they were created in. `discover` exits 1 when no market is open (between windows).
+
+`record` also needs no credentials: it polls the same public endpoints plus Coinbase's public WebSocket ticker.
+Create a file named `KILL` (or pass `--kill-file`) to stop it early; it also stops itself on a time limit, low
+free disk space, a database size cap, or too many consecutive request failures, and none of those restart on
+their own. It writes one timestamped SQLite file per run under `--data-dir` (default `./data`, gitignored).
 
 Example (prices vary):
 
@@ -70,7 +100,7 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
 
 | Mode | Target | Money | Status |
 |------|--------|-------|--------|
-| `record` | prod market data, read-only | none | Phase 2 |
+| `record` | prod market data, read-only | none | Phase 2: **built** (REST polling; no key) |
 | `paper` (default) | prod data, simulated fills | none | Phase 4-5 |
 | `demo` | Kalshi demo environment | fake | Phase 6 |
 | `live` | Kalshi prod | real | Phase 7: needs `mode: live`, `--i-understand-real-money`, `KALSHI_ENV=prod` and a typed confirmation |
@@ -96,9 +126,9 @@ src/btcbot/
   models.py                 Market, Series, OrderBook, Balance: Decimal-only views of API payloads
   kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff
   market_discovery.py       find the open KXBTC15M market: series -> open markets (see the discovery note below)
-  cli.py                    discover, auth-check
-  spot_feed.py              placeholder, Phase 2: Coinbase spot feed
-  recorder.py               placeholder, Phase 2: order books, spot ticks and settlements to disk
+  cli.py                    discover, auth-check, record
+  spot_feed.py              Phase 2: Coinbase public WebSocket ticker -> rolling buffer, staleness, REST fallback
+  recorder.py               Phase 2: order books, market state, spot ticks and settlements -> SQLite
   model.py                  placeholder, Phase 3: fair-probability model
   strategy.py               placeholder, Phase 4: edge and entry/exit decisions
   risk.py                   placeholder, Phase 4: limits, kill switch, PnL tracking
@@ -108,12 +138,15 @@ src/btcbot/
 tests/
   fixtures/                 real public API payloads and an OpenSSL signing vector
   test_signing.py, test_client.py, test_config.py, test_models.py, test_market_discovery.py, test_cli.py
+  test_spot_feed.py, test_recorder.py                    Phase 2, offline (fake WebSocket + fake Kalshi client)
   test_model.py, test_risk.py, test_paper_broker.py     placeholders for Phases 3 and 4
 ```
 
 Placeholder modules hold only a docstring saying what the build spec asks of them; they contain no behaviour and are
-filled in by their phase. `config.py` and `models.py` are additions to the layout in the build spec, and the WebSocket
-client will live in `kalshi_client.py` when Phase 2 adds it.
+filled in by their phase. `config.py` and `models.py` are additions to the layout in the build spec. Kalshi's own
+WebSocket (order-book deltas) is not implemented: it needs an API key even for public channels (see "Verified Kalshi
+API facts" below), and no key has been provisioned through a secure channel, so `recorder.py` polls REST instead;
+`spot_feed.py`'s WebSocket client is Coinbase's separate, unauthenticated public ticker feed.
 
 ## Verified Kalshi API facts
 

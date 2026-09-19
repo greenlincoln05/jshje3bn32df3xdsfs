@@ -3,23 +3,30 @@
 Phase 1 commands, both read-only:
   discover    print the open KXBTC15M market: strike, close time, and top of book (no credentials needed)
   auth-check  make one signed GET /portfolio/balance call to prove your API key and signing work
+
+Phase 2:
+  record      poll public market data + a Coinbase spot feed into a SQLite database (no credentials needed)
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import math
 import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.market_discovery import find_current_market
 from btcbot.models import Market, OrderBook, ParseError, Series, Side
+from btcbot.recorder import Recorder, RecorderSummary
+from btcbot.spot_feed import CoinbaseSpotFeed, SpotBuffer
 
 # --------------------------------------------------------------------------- formatting
 
@@ -93,6 +100,23 @@ def render_watch_line(market: Market, book: OrderBook, now: datetime) -> str:
     )
 
 
+def render_recorder_summary(summary: RecorderSummary) -> str:
+    elapsed = (summary.stopped_at - summary.started_at).total_seconds()
+    lines = [
+        f"Stopped     : {summary.stop_reason} ({summary.stop_detail})",
+        f"Ran         : {fmt_time(summary.started_at)} to {fmt_time(summary.stopped_at)} ({elapsed:,.0f}s)",
+        f"Order books : {summary.orderbook_polls:,} polls",
+        f"Market state: {summary.market_state_changes:,} rows",
+        f"Spot ticks  : {summary.spot_ticks:,}",
+        f"Settlements : {summary.settlements:,}",
+        f"Rollover gaps: {summary.rollover_gaps:,}",
+        f"Errors      : {summary.errors:,}",
+    ]
+    if summary.unresolved_settlements:
+        lines.append(f"Unresolved settlements (never saw 'finalized'): {', '.join(summary.unresolved_settlements)}")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- commands
 
 
@@ -153,6 +177,42 @@ async def _cmd_auth_check(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_record(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    series_ticker = args.series or config.series_ticker
+    env = KalshiEnv(args.env) if args.env else KalshiSettings().env
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    db_path = data_dir / f"recorder-{series_ticker}-{env.value}-{timestamp}.sqlite"
+
+    async with KalshiClient(env) as client:  # public data only: no auth, per Phase 2 scope
+        recorder = Recorder(
+            client,
+            series_ticker=series_ticker,
+            db_path=db_path,
+            kill_file=args.kill_file,
+            poll_interval_sec=args.poll_interval,
+        )
+        spot_feed = CoinbaseSpotFeed(SpotBuffer(), on_tick=recorder.record_spot_tick)
+        spot_task = asyncio.ensure_future(spot_feed.run_forever())
+        print(
+            f"Recording {series_ticker} ({env.value}, public data only) to {db_path}\n"
+            f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early.",
+            flush=True,
+        )
+        try:
+            summary = await recorder.run(duration_sec=args.hours * 3600)
+        finally:
+            spot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await spot_task
+            await spot_feed.aclose()
+            recorder.close()
+    print(render_recorder_summary(summary))
+    return 0
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -174,6 +234,19 @@ def build_parser() -> argparse.ArgumentParser:
     auth_check = commands.add_parser("auth-check", help="verify API key + signing with one signed balance request")
     auth_check.add_argument("--env", choices=envs, help="Kalshi environment (default: KALSHI_ENV, else demo)")
     auth_check.set_defaults(handler=_cmd_auth_check)
+
+    record = commands.add_parser(
+        "record", help="poll public market data + a Coinbase spot feed into SQLite (no credentials needed)"
+    )
+    record.add_argument("--env", choices=envs, help="Kalshi environment (default: KALSHI_ENV, else demo)")
+    record.add_argument("--series", help="override series_ticker from config.yaml")
+    record.add_argument("--hours", type=float, default=9.0, help="stop after this many hours (default: 9)")
+    record.add_argument("--data-dir", default="data", help="directory for the SQLite database (default: ./data)")
+    record.add_argument("--kill-file", default="KILL", help="creating this file stops recording (default: ./KILL)")
+    record.add_argument(
+        "--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)"
+    )
+    record.set_defaults(handler=_cmd_record)
     return parser
 
 
@@ -182,6 +255,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "discover" and args.watch is not None and (not math.isfinite(args.watch) or args.watch <= 0):
         print("error: --watch must be finite and greater than 0", file=sys.stderr)
         return 2
+    if args.command == "record":
+        if not math.isfinite(args.hours) or args.hours <= 0:
+            print("error: --hours must be finite and greater than 0", file=sys.stderr)
+            return 2
+        if not math.isfinite(args.poll_interval) or args.poll_interval <= 0:
+            print("error: --poll-interval must be finite and greater than 0", file=sys.stderr)
+            return 2
     for stream in (sys.stdout, sys.stderr):  # a non-ASCII title must not crash a Windows console
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:

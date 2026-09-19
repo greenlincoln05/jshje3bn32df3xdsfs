@@ -118,6 +118,17 @@ def install_mock_api(monkeypatch, handler):
     monkeypatch.setattr(cli, "KalshiClient", lambda env, **kw: real_client(env, transport=httpx.MockTransport(handler), **kw))
 
 
+def install_fake_spot_feed(monkeypatch):
+    """record always starts a background spot feed; give it a connector that fails instantly instead of
+    letting it reach the real network in a test."""
+    real_feed_cls = cli.CoinbaseSpotFeed
+
+    async def refuse(url):
+        raise OSError("no network access in tests")
+
+    monkeypatch.setattr(cli, "CoinbaseSpotFeed", lambda buffer, **kw: real_feed_cls(buffer, connect=refuse, **kw))
+
+
 class TestDiscoverEndToEnd:
     def test_prints_the_open_market_found_by_walking_series_markets_orderbook(self, monkeypatch, capsys, load_fixture):
         now = datetime.now(UTC)
@@ -182,6 +193,45 @@ class TestDiscoverEndToEnd:
 
         assert cli.main(["--config", CONFIG, "discover", "--env", "prod"]) == 1
         assert "nope" in capsys.readouterr().err
+
+
+class TestRecordEndToEnd:
+    def test_stops_via_kill_file_and_prints_a_summary(self, monkeypatch, tmp_path, capsys):
+        install_mock_api(monkeypatch, lambda request: httpx.Response(200, json={"markets": []}))
+        install_fake_spot_feed(monkeypatch)
+        kill_file = tmp_path / "KILL"
+        kill_file.write_text("stop")
+        data_dir = tmp_path / "data"
+
+        exit_code = cli.main(
+            [
+                "--config",
+                CONFIG,
+                "record",
+                "--env",
+                "prod",
+                "--data-dir",
+                str(data_dir),
+                "--kill-file",
+                str(kill_file),
+                "--hours",
+                "1",
+            ]
+        )
+
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "Recording KXBTC15M (prod, public data only)" in out
+        assert "Stopped     : kill_file" in out
+        assert list(data_dir.glob("recorder-*.sqlite"))
+
+    def test_rejects_a_non_positive_hours(self, capsys):
+        assert cli.main(["record", "--hours", "0"]) == 2
+        assert "--hours" in capsys.readouterr().err
+
+    def test_rejects_a_non_positive_poll_interval(self, capsys):
+        assert cli.main(["record", "--poll-interval", "0"]) == 2
+        assert "--poll-interval" in capsys.readouterr().err
 
 
 class TestWatch:
