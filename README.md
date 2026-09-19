@@ -77,6 +77,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
+Testing against the real network (Kalshi, Coinbase) has to happen on your own machine, not in a Claude Code
+remote session -- see [docs/running-live.md](docs/running-live.md) for the checklist.
+
 ## Commands
 
 ```powershell
