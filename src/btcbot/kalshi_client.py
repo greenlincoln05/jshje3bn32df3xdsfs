@@ -409,6 +409,20 @@ class KalshiClient:
         )
         return CancelAck.from_api(data)
 
+    async def probe_get(
+        self, endpoint: str, params: Mapping[str, str] | None = None, *, authenticated: bool = True
+    ) -> tuple[int, str]:
+        """A raw GET for diagnostics (``btcbot demo-probe``): the status code and body text, whatever they are.
+        Unlike every other method it does not retry, parse, or raise on an HTTP error, because its whole job is
+        to show exactly what Kalshi said. Read-only."""
+        path = f"{API_PREFIX}{endpoint}"
+        headers = self._auth_headers("GET", path) if authenticated else None
+        try:
+            response = await self._http.request("GET", path, params=params, headers=headers)
+        except httpx.TransportError as exc:
+            raise KalshiConnectionError(f"GET {path}: {type(exc).__name__}: {exc}") from exc
+        return response.status_code, response.text
+
     async def set_target_balance_allocation(self, percent_by_exchange: Mapping[int, int]) -> None:
         """Opt in to (or change) Kalshi's automatic collateral rebalancing across exchange shards: every ~10 s
         it moves the account's sweepable balance toward these percentages. Needed because crypto markets trade on

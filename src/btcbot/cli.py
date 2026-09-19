@@ -44,6 +44,7 @@ from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.lab import DEFAULT_GRID, AccountSettings, LabError, load_lab_data, parse_values, render_lab_report, run_lab
 from btcbot.demo_check import collateral_preflight
+from btcbot.demo_probe import run_probe
 from btcbot.demo_trader import DemoTrader, render_demo_report
 from btcbot.execution import DemoExecutionBackend
 from btcbot.live_paper import LivePaperTrader
@@ -516,6 +517,17 @@ async def _cmd_demo_allocate(args: argparse.Namespace) -> int:
         return 1
 
 
+async def _cmd_demo_probe(args: argparse.Namespace) -> int:
+    """Diagnostic: how does the DEMO exchange answer every way of reading an order back? Owner-run; demo only."""
+    config = load_config(args.config)
+    settings = KalshiSettings()
+    if settings.key_id is None or settings.private_key_path is None:
+        raise ConfigError("KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (a DEMO key)")
+    auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
+    async with KalshiClient(KalshiEnv.DEMO, auth=auth) as client:
+        return await run_probe(client, args.series or config.series_ticker)
+
+
 async def _cmd_demo(args: argparse.Namespace) -> int:
     """The paper trader's strategy placing REAL orders in Kalshi's DEMO environment (fake money). Needs the
     owner's own demo key in .env. Always the demo environment: the client itself also refuses to sign an order
@@ -817,6 +829,13 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)")
     demo.add_argument("--maker-fee-multiplier", default="0", help="fee multiplier for the SHADOW paper order only (default: 0)")
     demo.set_defaults(handler=_cmd_demo)
+
+    probe = commands.add_parser(
+        "demo-probe",
+        help="diagnostic: place 1-contract $0.01 demo orders, try every way to read them back, print raw responses",
+    )
+    probe.add_argument("--series", help="override series_ticker from config.yaml")
+    probe.set_defaults(handler=_cmd_demo_probe)
 
     allocate = commands.add_parser(
         "demo-allocate",
