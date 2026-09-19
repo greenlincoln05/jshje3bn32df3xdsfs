@@ -32,12 +32,13 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from btcbot.backtest import BacktestReport, TradeRecord, build_report, init_trades_schema, log_trade
+from btcbot.config import SizingMode
 from btcbot.execution import PaperExecutionBackend
 from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictions_schema, log_prediction, predict
 from btcbot.models import Market, OrderBook
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, Decision, decide
+from btcbot.strategy import Action, Decision, decide, kelly_size
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -143,7 +144,17 @@ class LivePaperTrader:
             maker_fee_multiplier=self._maker_fee_multiplier,
             has_resting_order=self._resting_order_id is not None,
             has_position=self._position is not None,
+            min_price=self._config.min_price,
+            max_price=self._config.max_price,
         )
+        if decision.action is Action.REST and decision.kelly_fraction is not None and self._config.sizing.mode is SizingMode.KELLY:
+            size = kelly_size(
+                decision.kelly_fraction, decision.price,
+                bankroll_usd=self._config.risk.max_open_exposure_usd,
+                multiplier=self._config.sizing.kelly_fraction_multiplier,
+                max_contracts=Decimal(self._config.risk.max_contracts_per_trade),
+            )
+            decision = replace(decision, size=size)
         if decision.action is Action.REST:
             approval = self._risk.check_new_order(size=decision.size, price=decision.price, now=poll_ts)
             if approval.approved:

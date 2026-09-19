@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from btcbot.config import BotConfig, ConfigError, KalshiEnv, KalshiSettings, Mode, load_config
+from btcbot.config import BotConfig, ConfigError, KalshiEnv, KalshiSettings, Mode, SizingMode, load_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,7 +25,10 @@ class TestBotConfig:
         assert (cfg.vol_window_sec, cfg.vol_method, cfg.model_blend) == (900, "ewma", 0.5)
         assert (cfg.min_edge, cfg.min_depth, cfg.max_spread) == (Decimal("0.04"), Decimal(10), Decimal("0.06"))
         assert (cfg.min_tau_sec, cfg.max_tau_sec, cfg.cancel_before_close_sec) == (30, 780, 20)
+        assert (cfg.min_price, cfg.max_price) == (Decimal("0.15"), Decimal("0.85"))
         assert cfg.sizing.contracts_per_trade == 5
+        assert cfg.sizing.mode is SizingMode.FIXED
+        assert cfg.sizing.kelly_fraction_multiplier == 0.2
         assert cfg.risk.max_contracts_per_trade == 10
         assert cfg.risk.max_open_exposure_usd == Decimal(25)
         assert cfg.risk.daily_loss_limit_usd == Decimal(20)
@@ -42,6 +45,7 @@ class TestBotConfig:
         # (str, Enum) prints as "Mode.PAPER" in f-strings on Python 3.12+; StrEnum must not.
         assert f"{Mode.PAPER}" == str(Mode.PAPER) == "paper"
         assert f"{KalshiEnv.DEMO}" == str(KalshiEnv.DEMO) == "demo"
+        assert f"{SizingMode.KELLY}" == str(SizingMode.KELLY) == "kelly"
 
     def test_yaml_floats_become_exact_decimals(self, tmp_path):
         cfg = load_config(write_yaml(tmp_path, "min_edge: 0.04\nmax_spread: 0.06\n"))
@@ -80,11 +84,26 @@ class TestBotConfig:
             "sizing:\n  contracts_per_trade: 0",
             "risk:\n  daily_loss_limit_usd: 0",
             "risk:\n  max_consecutive_losses: 0",
+            "min_price: -0.01",
+            "min_price: 1",
+            "max_price: 0",
+            "max_price: 1.01",
+            "sizing:\n  mode: yolo",
+            "sizing:\n  kelly_fraction_multiplier: 0",
+            "sizing:\n  kelly_fraction_multiplier: 1.01",
         ],
     )
     def test_out_of_range_values_are_rejected(self, tmp_path, text):
         with pytest.raises(ConfigError):
             load_config(write_yaml(tmp_path, text + "\n"))
+
+    def test_min_price_must_be_below_max_price(self, tmp_path):
+        with pytest.raises(ConfigError, match="min_price"):
+            load_config(write_yaml(tmp_path, "min_price: 0.80\nmax_price: 0.20\n"))
+
+    def test_price_band_can_be_disabled_on_either_side(self, tmp_path):
+        cfg = load_config(write_yaml(tmp_path, "min_price: null\nmax_price: null\n"))
+        assert cfg.min_price is None and cfg.max_price is None
 
     def test_min_tau_must_be_below_max_tau(self, tmp_path):
         with pytest.raises(ConfigError, match="min_tau_sec"):

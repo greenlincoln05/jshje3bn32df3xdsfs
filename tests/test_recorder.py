@@ -361,3 +361,21 @@ class TestSchemaPersistence:
         Recorder(client, series_ticker=SERIES, db_path=db_path).close()
         second = Recorder(client, series_ticker=SERIES, db_path=db_path)  # schema already exists
         second.close()
+
+@pytest.mark.asyncio
+async def test_poll_cadence_includes_request_duration(tmp_path):
+    clock = FakeClock()
+    market = make_market('A')
+    class SlowSource(FakeKalshiSource):
+        async def get_orderbook(self, ticker, **kwargs):
+            clock.now += timedelta(seconds=0.4)
+            return await super().get_orderbook(ticker, **kwargs)
+    client = SlowSource(markets=[[market]], orderbooks=[make_orderbook('A')])
+    recorder, _ = make_recorder(tmp_path, client, clock=clock, poll_interval_sec=1)
+    try:
+        await recorder.run(duration_sec=3)
+        rows = recorder._db.execute('SELECT request_started_ts FROM orderbook_snapshots ORDER BY id').fetchall()
+        assert len(rows) == 3
+        assert datetime.fromisoformat(rows[1][0]) - datetime.fromisoformat(rows[0][0]) == timedelta(seconds=1)
+    finally:
+        recorder.close()
