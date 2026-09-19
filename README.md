@@ -14,7 +14,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 |------:|------|-------|
 | 1 | Skeleton, Kalshi client (RSA-PSS signing), market discovery | **done** |
 | 2 | Spot feed + recorder (24h+ of order books, spot ticks, settlements) | **built and tested; no real capture run yet** |
-| 3 | Fair-probability model + calibration report | not started |
+| 3 | Fair-probability model + calibration report | **built and tested; no real calibration report yet (no captured data)** |
 | 4 | Backtest + queue-aware paper broker | not started |
 | 5 | Live paper run, several days | not started |
 | 6 | Demo-environment order/cancel/fill validation | not started |
@@ -38,11 +38,26 @@ network). Two things are still open, both flagged in the review above rather tha
   public data, and no key has been provisioned through a secure channel (see "A note on API keys" below), so
   this is the "coarse" mode the review describes, not full order-flow. Anything computed from this data
   should say so.
-- **No real multi-hour run yet.** This session runs in an ephemeral remote container that can be reclaimed
-  between turns, so it is not a place to leave a 9- or 24-hour background recorder running unattended.
-  `btcbot record` has been smoke-tested against the live public API for a short, bounded window (see below)
-  to confirm the wiring works end to end; an actual multi-hour capture needs to run somewhere that stays up,
-  most likely the owner's own machine.
+- **No real capture run at all yet, not even a short one.** This session runs in an ephemeral remote
+  container that can be reclaimed between turns, so it is not a place to leave a 9- or 24-hour background
+  recorder running unattended. It also turned out the container's network policy denies outbound access to
+  `external-api.kalshi.com` and Coinbase directly (a 403 policy denial, confirmed via the proxy status
+  endpoint, not a transient failure), so not even a short live smoke test was possible from here. Validation
+  for `record` is the offline test suite only; an actual capture needs to run somewhere with real network
+  access, most likely the owner's own machine.
+
+**Phase 3, as built:** `model.py` implements the v1 fair-probability model from spec section 4 (a driftless
+lognormal approximation, `Phi(ln(S/K) / (sigma * sqrt(tau_eff)))`, clamped to [0.02, 0.98], with a
+continuous, separately-derived treatment for the last 60s once part of the settlement average is already
+observed), an EWMA per-second volatility estimator, a market-mid blend, and prediction logging into the
+recorder's own SQLite database (a `predictions` table, joinable to `settlements` by ticker). `btcbot
+calibrate` computes the Brier score and a reliability table (model vs. market mid vs. blend) from a
+database's logged predictions. 51 new offline tests, including `hypothesis` property tests (boundedness,
+monotonicity in spot/strike) that caught and fixed a real floating-point overflow bug in the near-zero-tau
+edge case. As with Phase 2: **no real calibration report exists yet**, because no real recorded data exists
+yet — this is tooling, verified against synthetic fixtures, not a result. The settlement-history study some
+earlier planning docs mention is not part of the spec's own Phase 3 definition (section 8.3) and was left
+out of this phase's scope; it can be added later if wanted.
 
 ### A note on API keys
 
@@ -70,6 +85,7 @@ btcbot discover --env prod --watch 5  # one line every 5 s; the ticker rolls ove
 btcbot discover                       # same, against KALSHI_ENV (default: demo)
 btcbot auth-check                     # one signed GET /portfolio/balance: proves your key and signing work
 btcbot record --env prod --hours 9    # poll public market data + Coinbase spot ticks into ./data/*.sqlite
+btcbot calibrate --db data/recorder-....sqlite   # Brier score + reliability table from logged predictions
 ```
 
 `discover` needs no credentials because Kalshi's market data is public. `auth-check` needs `KALSHI_KEY_ID` and
@@ -81,6 +97,12 @@ in the environment they were created in. `discover` exits 1 when no market is op
 Create a file named `KILL` (or pass `--kill-file`) to stop it early; it also stops itself on a time limit, low
 free disk space, a database size cap, or too many consecutive request failures, and none of those restart on
 their own. It writes one timestamped SQLite file per run under `--data-dir` (default `./data`, gitignored).
+
+`calibrate` reads predictions a running strategy has logged (via `btcbot.model.log_prediction`) into that same
+database, joins them to `record`'s `settlements` table by ticker, and reports a Brier score and a reliability
+table for the model, the market mid, and their blend. Nothing currently logs live predictions into a real
+database (that is Phase 4's strategy loop), so today `calibrate` only has something to report on synthetic
+test data.
 
 Example (prices vary):
 
@@ -126,10 +148,10 @@ src/btcbot/
   models.py                 Market, Series, OrderBook, Balance: Decimal-only views of API payloads
   kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff
   market_discovery.py       find the open KXBTC15M market: series -> open markets (see the discovery note below)
-  cli.py                    discover, auth-check, record
+  cli.py                    discover, auth-check, record, calibrate
   spot_feed.py              Phase 2: Coinbase public WebSocket ticker -> rolling buffer, staleness, REST fallback
   recorder.py               Phase 2: order books, market state, spot ticks and settlements -> SQLite
-  model.py                  placeholder, Phase 3: fair-probability model
+  model.py                  Phase 3: v1 fair-probability model, EWMA volatility, prediction logging, calibration
   strategy.py               placeholder, Phase 4: edge and entry/exit decisions
   risk.py                   placeholder, Phase 4: limits, kill switch, PnL tracking
   execution.py              placeholder, Phase 4: one order interface for paper and live
@@ -139,7 +161,8 @@ tests/
   fixtures/                 real public API payloads and an OpenSSL signing vector
   test_signing.py, test_client.py, test_config.py, test_models.py, test_market_discovery.py, test_cli.py
   test_spot_feed.py, test_recorder.py                    Phase 2, offline (fake WebSocket + fake Kalshi client)
-  test_model.py, test_risk.py, test_paper_broker.py     placeholders for Phases 3 and 4
+  test_model.py                                          Phase 3, offline (includes hypothesis property tests)
+  test_risk.py, test_paper_broker.py                     placeholders for Phase 4
 ```
 
 Placeholder modules hold only a docstring saying what the build spec asks of them; they contain no behaviour and are

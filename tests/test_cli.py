@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -9,7 +10,9 @@ import pytest
 from btcbot import cli
 from btcbot.config import KalshiEnv
 from btcbot.kalshi_client import KalshiClient
+from btcbot.model import ModelState, Prediction, init_predictions_schema, log_prediction, predict
 from btcbot.models import Market, OrderBook, Series
+from btcbot.recorder import Recorder
 
 UTC = timezone.utc
 CONFIG = str(Path(__file__).resolve().parents[1] / "config.yaml")
@@ -262,3 +265,51 @@ class TestWatch:
         assert "error:" in lines[0] and "'ticker'" in lines[0]
         assert "error:" in lines[1] and "transient" in lines[1]
         assert any(market["ticker"] in line and "YES 0.54/0.55" in line for line in lines[2:])
+
+
+def make_calibration_db(tmp_path):
+    db_path = tmp_path / "cal.sqlite"
+    Recorder(None, series_ticker="KXBTC15M", db_path=db_path).close()
+    conn = sqlite3.connect(str(db_path))
+    init_predictions_schema(conn)
+    return db_path, conn
+
+
+class TestCalibrateEndToEnd:
+    def test_reports_a_missing_database(self, tmp_path, capsys):
+        assert cli.main(["calibrate", "--db", str(tmp_path / "nope.sqlite")]) == 1
+        assert "no such database" in capsys.readouterr().err
+
+    def test_reports_a_non_recorder_database(self, tmp_path, capsys):
+        empty_db = tmp_path / "empty.sqlite"
+        sqlite3.connect(str(empty_db)).close()
+        assert cli.main(["calibrate", "--db", str(empty_db)]) == 1
+        assert "does not look like a recorder database" in capsys.readouterr().err
+
+    def test_reports_no_resolved_predictions_yet(self, tmp_path, capsys):
+        db_path, conn = make_calibration_db(tmp_path)
+        conn.close()
+        assert cli.main(["calibrate", "--db", str(db_path)]) == 0
+        assert "nothing to score" in capsys.readouterr().out
+
+    def test_prints_a_calibration_report(self, tmp_path, capsys):
+        db_path, conn = make_calibration_db(tmp_path)
+        conn.execute(
+            """INSERT INTO settlements (ticker, event_ticker, result, settled_avg, strike, close_time, finalized_poll_ts)
+               VALUES ('T-1', 'T', 'yes', '80100', '80000', '2026-09-19T00:00:00+00:00', '2026-09-19T00:00:00+00:00')"""
+        )
+        conn.commit()
+        state = ModelState(spot=Decimal("80500"), strike=Decimal("80000"), tau_sec=300.0, sigma=0.0005)
+        p_model, p_blend = predict(state)
+        log_prediction(conn, Prediction("T-1", datetime.now(UTC), state, 0.5, p_model, p_blend))
+        conn.close()
+
+        assert cli.main(["calibrate", "--db", str(db_path)]) == 0
+        out = capsys.readouterr().out
+        assert "model " in out and "brier score" in out
+
+    def test_rejects_non_positive_bins(self, tmp_path, capsys):
+        db_path, conn = make_calibration_db(tmp_path)
+        conn.close()
+        assert cli.main(["calibrate", "--db", str(db_path), "--bins", "0"]) == 2
+        assert "--bins" in capsys.readouterr().err
