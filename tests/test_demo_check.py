@@ -36,6 +36,7 @@ class FakeClient:
         self.reject_insufficient_balance = True
         self.reject_closed_market = True
         self.cancel_actually_works = True
+        self.wrong_side_mapping = False  # Kalshi records a NO order as YES (a broken side mapping)
         self.orders: dict[str, KalshiOrder] = {}
         self.fills: dict[str, list[KalshiFill]] = {}
         self.positions: list[Position] = []
@@ -63,8 +64,9 @@ class FakeClient:
         if any(m.ticker == ticker for m in self.settled_markets) and self.reject_closed_market:
             raise KalshiAPIError(400, "market is not open")
         order_id = f"ord-{next(self._ids)}"
+        recorded_side = "yes" if self.wrong_side_mapping and side == "no" else side
         order = KalshiOrder(
-            order_id=order_id, client_order_id=client_order_id, ticker=ticker, side=side, action="buy",
+            order_id=order_id, client_order_id=client_order_id, ticker=ticker, side=recorded_side, action="buy",
             order_type="limit" if price is not None else "market", status="resting", price=price,
             initial_count=Decimal(count), remaining_count=Decimal(count), created_time=self.now,
         )
@@ -81,7 +83,7 @@ class FakeClient:
             self.positions.append(Position(ticker=ticker, side=side, count=Decimal(count), market_exposure_usd=None))
         return order
 
-    async def cancel_order(self, order_id):
+    async def cancel_order(self, order_id, *, market_ticker=None):
         order = self.orders[order_id]
         if self.cancel_actually_works:
             self.orders[order_id] = replace(order, status="canceled", remaining_count=Decimal(0))
@@ -93,7 +95,7 @@ class FakeClient:
     async def list_orders(self, *, ticker=None, status=None):
         return [o for o in self.orders.values() if ticker is None or o.ticker == ticker]
 
-    async def list_fills(self, *, ticker=None, order_id=None):
+    async def list_fills(self, *, ticker=None, order_id=None, min_ts=None):
         all_fills = [f for fills in self.fills.values() for f in fills]
         return [f for f in all_fills if order_id is None or f.order_id == order_id]
 
@@ -118,7 +120,7 @@ class TestHappyPath:
         assert "auth-check + balance" in names
         assert "market discovery" in names
         assert "crash-and-restart reconciliation" in names
-        assert result_named(report, "resting order + cancel").passed is True
+        assert result_named(report, "resting YES order + cancel").passed is True
         assert result_named(report, "fillable order + position").passed is True
         assert result_named(report, "rejection: bad tick").passed is True
         assert result_named(report, "rejection: insufficient balance").passed is True
@@ -154,7 +156,7 @@ class TestRestingOrderAndCancel:
 
         report = await run_demo_check(client, SERIES, clock=lambda: T0)
 
-        assert result_named(report, "resting order + cancel").passed is False
+        assert result_named(report, "resting YES order + cancel").passed is False
 
 
 class TestFillableOrder:
@@ -296,3 +298,22 @@ class TestRunDemoCheckPopulatesFidelity:
         report = await run_demo_check(client, SERIES, clock=lambda: T0)
         assert report.fidelity.comparisons == []
         assert "nothing to compare" in report.fidelity.summary
+
+
+class TestSideMappingIsVerifiedAgainstTheExchange:
+    async def test_both_sides_are_checked_and_pass_when_kalshi_reads_them_back_correctly(self):
+        report = await run_demo_check(FakeClient(), SERIES, clock=lambda: T0)
+        assert result_named(report, "resting YES order + cancel").passed is True
+        assert result_named(report, "resting NO order + cancel").passed is True
+        assert "read back correctly" in result_named(report, "resting NO order + cancel").detail
+
+    async def test_a_no_order_recorded_as_yes_fails_loudly_and_is_cancelled(self):
+        client = FakeClient()
+        client.wrong_side_mapping = True
+
+        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+
+        result = result_named(report, "resting NO order + cancel")
+        assert result.passed is False and "mapping" in result.detail and "WRONG" in result.detail
+        assert report.ok is False
+        assert all(order.is_done for order in client.orders.values() if order.price == Decimal("0.01"))  # nothing left resting

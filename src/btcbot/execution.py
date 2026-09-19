@@ -88,7 +88,16 @@ class DemoExecutionBackend:
     def __init__(self, client: KalshiClient, ticker: str) -> None:
         self._client = client
         self._ticker = ticker
-        self._seen_trade_ids: set[str] = set()
+        self._seen_fill_keys: set[str] = set()
+        self._primed = False
+
+    async def _prime(self) -> None:
+        """Mark every fill the account already has for this ticker as seen, WITHOUT returning it. Without
+        this, the first poll after a restart (or after ``reconcile``) would hand back the window's whole fill
+        history as if it were new, and the trader would book a position it already holds a second time."""
+        for fill in await self._client.list_fills(ticker=self._ticker):
+            self._seen_fill_keys.add(fill.dedupe_key)
+        self._primed = True
 
     async def reconcile(self) -> ReconciliationReport:
         """Call once at startup, before placing anything. A freshly started process has no legitimate
@@ -99,33 +108,43 @@ class DemoExecutionBackend:
         open_orders: list[KalshiOrder] = [order for order in await self._client.list_orders() if not order.is_done]
         cancelled: list[str] = []
         for order in open_orders:
-            await self._client.cancel_order(order.order_id)
+            await self._client.cancel_order(order.order_id, market_ticker=order.ticker)
             cancelled.append(order.order_id)
+        await self._prime()
         positions = [position for position in await self._client.get_positions() if position.count > 0]
         return ReconciliationReport(cancelled_order_ids=cancelled, open_positions=positions)
 
     async def place_resting_order(self, side: Side, price: Decimal, size: Decimal) -> str:
+        if not self._primed:
+            await self._prime()  # so a fill from BEFORE this order is never mistaken for one of its own
         order = await self._client.create_order(self._ticker, side, count=size, price=price)
         return order.order_id
 
     async def cancel_order(self, order_id: str) -> None:
-        await self._client.cancel_order(order_id)
+        await self._client.cancel_order(order_id, market_ticker=self._ticker)
 
     async def place_taker_order(self, side: Side, size: Decimal) -> list[Fill]:
-        order = await self._client.create_order(self._ticker, side, count=size)  # no price -> market order
+        if not self._primed:
+            await self._prime()
+        order = await self._client.create_order(self._ticker, side, count=size)  # no price -> marketable IOC
         fills = await self._client.list_fills(ticker=self._ticker, order_id=order.order_id)
-        return [self._to_fill(f) for f in fills if self._mark_seen(f.trade_id)]
+        return [self._to_fill(f) for f in fills if self._mark_seen(f)]
 
     async def poll_fills(self) -> list[Fill]:
         """Call once per polled snapshot (the same cadence :meth:`PaperExecutionBackend.sync_market` is fed
-        at). Returns only fills not already returned by an earlier call."""
+        at). Returns only fills not already returned by an earlier call, or present before this backend
+        started."""
+        if not self._primed:
+            await self._prime()
+            return []
         fills = await self._client.list_fills(ticker=self._ticker)
-        return [self._to_fill(f) for f in fills if self._mark_seen(f.trade_id)]
+        return [self._to_fill(f) for f in fills if self._mark_seen(f)]
 
-    def _mark_seen(self, trade_id: str) -> bool:
-        if trade_id in self._seen_trade_ids:
+    def _mark_seen(self, fill: KalshiFill) -> bool:
+        key = fill.dedupe_key
+        if key in self._seen_fill_keys:
             return False
-        self._seen_trade_ids.add(trade_id)
+        self._seen_fill_keys.add(key)
         return True
 
     @staticmethod

@@ -17,7 +17,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | 3 | Fair-probability model + calibration report | **built and tested; no real calibration report yet (no captured data)** |
 | 4 | Backtest + queue-aware paper broker | **built and tested; no real backtest result yet (no captured data)** |
 | 5 | Live paper run, several days | **built and tested; no real live run yet (needs real network access)** |
-| 6 | Demo-environment order/cancel/fill validation | **built and tested; no real demo-check run yet (needs a demo key on the owner's machine)** |
+| 6 | Demo-environment order/cancel/fill validation (`demo-check`) and demo trading (`demo`) | **built and tested offline; no real demo-check or demo run yet (needs a demo key on the owner's machine)** |
 | 7 | Live, optional, only if phases 4-6 show positive edge after fees | not started |
 
 Phase 1 shipped a read-only client with no order-placing methods at all; Phase 6 added
@@ -116,14 +116,18 @@ you say so" framing below and in `docs/btc15m-bot-spec.md` section 8.
   passed in) so an application-level retry can't double-place. `create_order`/`cancel_order` -- the only two
   calls that can change real-world state -- carry a hard assertion refusing to sign against anything but
   `KalshiEnv.DEMO` (`KalshiWriteNotAllowedError`); the other four are read-only and, like `get_balance`,
-  allowed against either environment. **The order/fill/position payload shapes here are this project's own
-  best-effort reading of Kalshi's API, not verified against live docs or a real response** -- unlike every
-  read endpoint from Phase 1, writing this client happened without network access to this sandbox. A shape
-  mismatch fails loudly (a 400/422 from Kalshi's demo API), never silently, precisely because nothing here
-  can touch real money; the owner's first real `demo-check` run is what actually confirms or corrects it.
+  allowed against either environment. **Writes use Kalshi's V2 endpoints** (`POST`/`DELETE
+  /portfolio/events/orders`; the legacy `/portfolio/orders` writes are deprecated), whose side vocabulary is
+  YES-only: buying NO at `p` is an `ask` on YES at `1 - p`. Order, fill and position field names (`outcome_side`,
+  `count_fp`, `fee_cost`, `position_fp`, ...) were read from docs.kalshi.com on 2026-09-19, **not yet proven
+  against a real response**, and required fields raise a `ParseError` instead of defaulting (an earlier version
+  defaulted a missing fee to 0, which would have made the fidelity report claim makers pay nothing). The
+  owner's first real `demo-check` run is what confirms it, and it reads a NO order back specifically to prove
+  the YES/NO mapping.
 - **6b** (`execution.py`): `DemoExecutionBackend` implements the existing `ExecutionBackend` protocol
   unchanged (place_resting_order/cancel_order/place_taker_order), so strategy code cannot tell it isn't
-  paper. Fills come from polling `list_fills`, deduplicated by trade id. `reconcile()` cancels every open
+  paper. Fills come from polling `list_fills`, deduplicated by fill id, and anything the account already held
+  before the backend started is learned first and never re-reported. `reconcile()` cancels every open
   order the account holds (a freshly started process has no legitimate ones yet, so any it finds are by
   definition leftovers from a previous crash) and reports open positions without touching them (this bot
   doesn't exit early; spec: hold to settlement by default).

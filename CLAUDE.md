@@ -34,6 +34,14 @@ truth for scope and phases; the README has the phase status and a dated table of
   never talks to Kalshi; `DemoExecutionBackend` only ever calls `kalshi_client.py`'s demo-gated write
   methods. There is still no *live* order-placing code and no live backend anywhere in this repo; do not add
   one before the owner approves Phase 7 (all four gates, spec section 7).
+- Phase 6 (`btcbot demo-check`, `btcbot demo`): order placement exists but ONLY against Kalshi's DEMO
+  environment. `KalshiClient.create_order`/`cancel_order` refuse to sign against prod
+  (`KalshiWriteNotAllowedError`), `DemoTrader` refuses a non-demo client, and both use the V2 endpoints
+  (`POST/DELETE /portfolio/events/orders`; the legacy `/portfolio/orders` writes are deprecated). Kalshi's V2
+  side is YES-only: buying NO at p is an `ask` on YES at 1 - p, and `demo-check` reads a NO order back to
+  prove it. Order/fill/position field names come from docs.kalshi.com (read 2026-09-19) and are strict: a
+  missing `fee_cost` is a ParseError, never a silent zero. A session never runs these; the owner does, with
+  their own demo key.
 - `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
   and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
@@ -65,6 +73,8 @@ truth for scope and phases; the README has the phase status and a dated table of
 - BRTI + order-book stream, READ-ONLY, needs YOUR key in `.env` (run by the owner): `.venv/Scripts/btcbot.exe stream --env prod --hours 9`
 - Strategy lab on recorded data (offline): `.venv/Scripts/btcbot.exe lab --grid min_edge=0.02,0.04 --grid max_price=none,0.6`
 - Demo-only order validation, needs a demo key (Phase 6, owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe demo-check`
+- Demo-environment order validation, needs YOUR demo key (run by the owner): `.venv/Scripts/btcbot.exe demo-check`
+- Strategy placing REAL orders on the DEMO exchange (fake money), with a paper twin of every order, needs YOUR demo key: `.venv/Scripts/btcbot.exe demo --hours 2`
 - Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own
   environment cannot reach Kalshi/Coinbase; that has to happen on the owner's machine).

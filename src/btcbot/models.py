@@ -192,27 +192,70 @@ class Series:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderAck:
+    """What ``POST /portfolio/events/orders`` (V2) returns: an acknowledgement, not the full order. Fetch
+    :class:`KalshiOrder` with ``get_order`` when the order's own fields (side, price, status) are needed."""
+
+    order_id: str
+    client_order_id: str | None
+    fill_count: Decimal
+    remaining_count: Decimal
+    average_fill_price: Decimal | None
+    average_fee_paid: Decimal | None
+
+    @classmethod
+    def from_api(cls, payload: Mapping[str, Any]) -> Self:
+        return cls(
+            order_id=require(payload, "order_id", "create-order response"),
+            client_order_id=payload.get("client_order_id"),
+            fill_count=_require_decimal(require(payload, "fill_count", "create-order response"), "fill_count"),
+            remaining_count=_require_decimal(require(payload, "remaining_count", "create-order response"), "remaining_count"),
+            average_fill_price=to_decimal(payload.get("average_fill_price"), "average_fill_price"),
+            average_fee_paid=to_decimal(payload.get("average_fee_paid"), "average_fee_paid"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CancelAck:
+    order_id: str
+    reduced_by: Decimal
+
+    @classmethod
+    def from_api(cls, payload: Mapping[str, Any]) -> Self:
+        return cls(
+            order_id=require(payload, "order_id", "cancel-order response"),
+            reduced_by=_require_decimal(require(payload, "reduced_by", "cancel-order response"), "reduced_by"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class KalshiOrder:
-    """A real order from Kalshi's portfolio endpoints (Phase 6). Distinct from
+    """A real order, from ``GET /portfolio/orders[/{id}]`` (Phase 6). Distinct from
     :class:`btcbot.paper_broker.RestingOrder`, which is simulated and never touches Kalshi.
 
-    Field names here are this project's best-effort reading of Kalshi's v2 order shape, following the same
-    ``*_dollars``/``*_fp`` conventions already verified for market data -- **unverified against live docs**,
-    since writing this client happened without network access (see CLAUDE.md). The owner's first real
-    ``btcbot demo-check`` run against demo credentials is what actually confirms or corrects this shape.
+    Field names follow docs.kalshi.com as read on 2026-09-19 (``outcome_side``, ``book_side``, ``*_fp`` counts,
+    ``*_dollars`` prices, ``status`` in resting/canceled/executed). Required fields raise
+    :class:`ParseError` rather than defaulting: a silent zero count or fee would be worse than a loud failure.
+    Still not exercised against the live server -- the owner's ``btcbot demo-check`` run is what confirms it.
+
+    ``side`` is the OUTCOME the order profits from (``outcome_side``): buying NO, and selling YES, are both
+    ``"no"``. ``book_side`` is the same fact in book vocabulary (``bid`` = yes, ``ask`` = no).
     """
 
     order_id: str
     client_order_id: str | None
     ticker: str
     side: Side
-    action: str  # "buy" or "sell"; this bot only ever places "buy" orders (see execution.py)
+    action: str  # always "buy" for this bot; kept so callers written against the old shape still work
     order_type: str  # "limit" or "market"
-    status: str  # Kalshi's own vocabulary (e.g. "resting", "canceled", "executed"); not constrained here
-    price: Decimal | None
+    status: str  # "resting", "canceled" or "executed"
+    price: Decimal | None  # dollars, in the order's own outcome (yes price for a yes order, no price for a no order)
     initial_count: Decimal
     remaining_count: Decimal
     created_time: datetime | None
+    book_side: str | None = None
+    fill_count: Decimal | None = None
+    fees_usd: Decimal | None = None  # maker + taker fees charged so far
 
     @property
     def is_done(self) -> bool:
@@ -220,28 +263,37 @@ class KalshiOrder:
 
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> Self:
-        price = to_decimal(payload.get("yes_price_dollars") if payload.get("side") == "yes" else payload.get("no_price_dollars"), "order price")
+        side = require(payload, "outcome_side", "order")
+        if side not in ("yes", "no"):
+            raise ParseError(f"order: outcome_side must be yes or no, got {side!r}")
+        price = to_decimal(payload.get("yes_price_dollars" if side == "yes" else "no_price_dollars"), "order price")
         created = payload.get("created_time")
+        maker = to_decimal(payload.get("maker_fees_dollars"), "maker_fees_dollars")
+        taker = to_decimal(payload.get("taker_fees_dollars"), "taker_fees_dollars")
         return cls(
             order_id=require(payload, "order_id", "order"),
             client_order_id=payload.get("client_order_id"),
             ticker=require(payload, "ticker", "order"),
-            side=require(payload, "side", "order"),
-            action=payload.get("action") or "buy",
+            side=side,
+            action="buy",
             order_type=payload.get("type") or "limit",
             status=require(payload, "status", "order"),
             price=price,
-            initial_count=_require_decimal(payload.get("initial_count", 0), "initial_count"),
-            remaining_count=_require_decimal(payload.get("remaining_count", 0), "remaining_count"),
+            initial_count=_require_decimal(require(payload, "initial_count_fp", "order"), "initial_count_fp"),
+            remaining_count=_require_decimal(require(payload, "remaining_count_fp", "order"), "remaining_count_fp"),
             created_time=parse_time(created, "created_time") if created else None,
+            book_side=payload.get("book_side"),
+            fill_count=to_decimal(payload.get("fill_count_fp"), "fill_count_fp"),
+            fees_usd=None if maker is None and taker is None else (maker or Decimal(0)) + (taker or Decimal(0)),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class KalshiFill:
     """A real fill from ``GET /portfolio/fills`` (Phase 6). Distinct from :class:`btcbot.paper_broker.Fill`,
-    which is simulated. Field names carry the same "unverified against live docs" caveat as
-    :class:`KalshiOrder`."""
+    which is simulated. Same docs-as-read-2026-09-19 caveat as :class:`KalshiOrder`; ``fee_cost`` and
+    ``is_taker`` are REQUIRED, because defaulting them (as an earlier version did) would make the Phase 6d
+    fidelity report claim makers pay nothing whenever the field was merely misnamed."""
 
     trade_id: str
     order_id: str
@@ -253,31 +305,49 @@ class KalshiFill:
     fee_usd: Decimal
     is_taker: bool
     created_time: datetime
+    fill_id: str = ""
+
+    @property
+    def dedupe_key(self) -> str:
+        return self.fill_id or self.trade_id
 
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> Self:
-        side = require(payload, "side", "fill")
+        side = require(payload, "outcome_side", "fill")
+        if side not in ("yes", "no"):
+            raise ParseError(f"fill: outcome_side must be yes or no, got {side!r}")
         price = _require_decimal(payload.get("yes_price_dollars" if side == "yes" else "no_price_dollars"), "fill price")
-        # Whether -- and how much -- a maker fill is charged is exactly what 6d's fidelity report exists to
-        # settle (see the README's "Verified Kalshi API facts"); default to 0 rather than fail if absent.
-        fee = to_decimal(payload.get("fee_dollars"), "fee_dollars") or Decimal("0")
+        fee = to_decimal(payload.get("fee_cost"), "fee_cost")
+        if fee is None:
+            raise ParseError("fill: missing fee_cost")
+        is_taker = payload.get("is_taker")
+        if not isinstance(is_taker, bool):
+            raise ParseError("fill: is_taker must be a boolean")
+        fill_id = payload.get("fill_id") or ""
+        trade_id = payload.get("trade_id") or fill_id
+        if not trade_id:
+            raise ParseError("fill: needs a fill_id or trade_id")
+        ticker = payload.get("ticker") or payload.get("market_ticker")
+        if not ticker:
+            raise ParseError("fill: missing ticker")
         return cls(
-            trade_id=require(payload, "trade_id", "fill"),
+            trade_id=trade_id,
             order_id=require(payload, "order_id", "fill"),
-            ticker=require(payload, "ticker", "fill"),
+            ticker=ticker,
             side=side,
-            action=payload.get("action") or "buy",
+            action="buy",
             price=price,
-            count=_require_decimal(require(payload, "count", "fill"), "count"),
+            count=_require_decimal(require(payload, "count_fp", "fill"), "count_fp"),
             fee_usd=fee,
-            is_taker=bool(payload.get("is_taker", False)),
+            is_taker=is_taker,
             created_time=parse_time(require(payload, "created_time", "fill"), "created_time"),
+            fill_id=fill_id,
         )
 
 
 @dataclass(frozen=True, slots=True)
 class Position:
-    """A real position from ``GET /portfolio/positions`` (Phase 6). Kalshi reports one signed ``position``
+    """A real position from ``GET /portfolio/positions`` (Phase 6). Kalshi reports one signed ``position_fp``
     per ticker (positive = long YES, negative = long NO, since a binary market's two sides are
     complementary); normalized here to this codebase's ``side`` + non-negative ``count`` convention."""
 
@@ -285,15 +355,19 @@ class Position:
     side: Side
     count: Decimal
     market_exposure_usd: Decimal | None
+    realized_pnl_usd: Decimal | None = None
+    fees_paid_usd: Decimal | None = None
 
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> Self:
-        signed = _require_decimal(require(payload, "position", "position"), "position")
+        signed = _require_decimal(require(payload, "position_fp", "position"), "position_fp")
         return cls(
             ticker=require(payload, "ticker", "position"),
             side="yes" if signed >= 0 else "no",
             count=abs(signed),
             market_exposure_usd=to_decimal(payload.get("market_exposure_dollars"), "market_exposure_dollars"),
+            realized_pnl_usd=to_decimal(payload.get("realized_pnl_dollars"), "realized_pnl_dollars"),
+            fees_paid_usd=to_decimal(payload.get("fees_paid_dollars"), "fees_paid_dollars"),
         )
 
 
