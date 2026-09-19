@@ -18,7 +18,13 @@ truth for scope and phases; the README has the phase status and a dated table of
 - No API key, demo or production, gets used or written to a repo file by a Claude Code session. A key pasted
   into any chat is treated as exposed; the fix is to revoke/reissue it, never to use it. Phase 2's recorder
   uses public, unauthenticated endpoints only for this reason (Kalshi's order-book WebSocket needs a key even
-  for public data). `btcbot paper` (Phase 5) is the same: public data only, no key.
+  for public data). `btcbot paper` (Phase 5) is the same: public data only, no key. Phase 6 needs a demo key
+  for real order placement, so the same rule means `btcbot demo-check`'s validation run against the owner's
+  own demo credentials is the owner's to execute, not a Claude Code session's -- Claude writes the script (as
+  it wrote `auth-check`), the owner runs it. Phase 6 itself also has a prerequisite beyond the owner's
+  go-ahead: real `record`/`paper` data collected and reviewed on the owner's own machine (see
+  `docs/btc15m-bot-spec.md` section 8 and `docs/running-live.md`) -- phases 2-5 having only synthetic-fixture
+  validation is not sufficient grounds to start it.
 - `execution.py` only has a paper backend, and `paper_broker.py` never talks to Kalshi. `live_paper.py`
   (Phase 5) only ever drives that same paper backend. There is still no order-placing code against Kalshi
   anywhere in this repo; do not add any before the owner approves Phase 6.
