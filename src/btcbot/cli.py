@@ -9,6 +9,9 @@ Phase 2:
 
 Phase 3:
   calibrate   Brier score + reliability table from predictions logged into a recorder database
+
+Phase 4:
+  backtest    replay recorded data through the model, strategy, risk and paper broker
 """
 
 from __future__ import annotations
@@ -22,14 +25,16 @@ import sqlite3
 import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from btcbot.backtest import BacktestError, BacktestReport, run_backtest
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.market_discovery import find_current_market
 from btcbot.model import CalibrationSummary, compute_calibration_report
 from btcbot.models import Market, OrderBook, ParseError, Series, Side
+from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder, RecorderSummary
 from btcbot.spot_feed import CoinbaseSpotFeed, SpotBuffer
 
@@ -137,6 +142,31 @@ def render_calibration_report(report: Sequence[CalibrationSummary]) -> str:
                 f"mean predicted={row.mean_predicted:.3f}  observed rate={row.observed_rate:.3f}"
             )
     return "\n".join(lines)
+
+
+def render_backtest_reports(reports: Sequence[BacktestReport]) -> str:
+    blocks = []
+    for r in reports:
+        win_rate = "-" if r.win_rate is None else f"{r.win_rate:.1%}"
+        avg_p = "-" if r.avg_p_side_at_entry is None else f"{r.avg_p_side_at_entry:.3f}"
+        trades_per_day = "-" if r.trades_per_day is None else f"{r.trades_per_day:,.2f}"
+        beats = "-" if r.beats_trade_nothing is None else ("yes" if r.beats_trade_nothing else "no")
+        blocks.append(
+            "\n".join(
+                [
+                    f"--- queue={r.queue_assumption}  maker_fee_multiplier={r.maker_fee_multiplier} ---",
+                    f"Windows      : {r.windows_traded:,} traded of {r.windows_seen:,} seen",
+                    f"Trades       : {r.trades:,} ({r.wins:,} won, {r.losses:,} lost, {r.unresolved:,} unresolved)",
+                    f"Win rate     : {win_rate}   avg predicted prob at entry: {avg_p}",
+                    f"PnL          : ${r.total_pnl_usd:,.6f}   fees paid: ${r.total_fees_usd:,.6f}",
+                    f"Max drawdown : ${r.max_drawdown_usd:,.6f}",
+                    f"Trades/day   : {trades_per_day}",
+                    f"Beats trade-nothing after fees? {beats}",
+                    r.sample_size_note,
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
 
 
 # --------------------------------------------------------------------------- commands
@@ -255,6 +285,34 @@ async def _cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_backtest(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        print(f"error: no such database: {db_path}", file=sys.stderr)
+        return 1
+    config = load_config(args.config)
+    queues = (
+        (QueueAssumption.OPTIMISTIC, QueueAssumption.PESSIMISTIC)
+        if args.queue == "both"
+        else (QueueAssumption(args.queue),)
+    )
+    multipliers = (Decimal("0"), Decimal("0.25")) if args.maker_fee_multiplier == "both" else (Decimal(args.maker_fee_multiplier),)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        reports = [
+            run_backtest(conn, config, queue_assumption=queue, maker_fee_multiplier=multiplier)
+            for queue in queues
+            for multiplier in multipliers
+        ]
+    except (BacktestError, sqlite3.OperationalError, ParseError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(render_backtest_reports(reports))
+    return 0
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -296,6 +354,20 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--db", required=True, help="path to a recorder SQLite database with logged predictions")
     calibrate.add_argument("--bins", type=int, default=10, help="number of reliability bins (default: 10)")
     calibrate.set_defaults(handler=_cmd_calibrate)
+
+    backtest = commands.add_parser(
+        "backtest", help="replay recorded data through the model, strategy, risk and paper broker (Phase 4)"
+    )
+    backtest.add_argument("--db", required=True, help="path to a recorder SQLite database")
+    backtest.add_argument(
+        "--queue", choices=["optimistic", "pessimistic", "both"], default="both",
+        help="queue-fill assumption: see paper_broker.py (default: both)",
+    )
+    backtest.add_argument(
+        "--maker-fee-multiplier", default="both",
+        help="0, 0.25, another non-negative number, or 'both' for 0 and 0.25 (default: both)",
+    )
+    backtest.set_defaults(handler=_cmd_backtest)
     return parser
 
 
@@ -314,6 +386,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "calibrate" and args.bins <= 0:
         print("error: --bins must be greater than 0", file=sys.stderr)
         return 2
+    if args.command == "backtest" and args.maker_fee_multiplier != "both":
+        try:
+            multiplier_ok = Decimal(args.maker_fee_multiplier) >= 0
+        except InvalidOperation:
+            multiplier_ok = False
+        if not multiplier_ok:
+            print("error: --maker-fee-multiplier must be 'both' or a non-negative number", file=sys.stderr)
+            return 2
     for stream in (sys.stdout, sys.stderr):  # a non-ASCII title must not crash a Windows console
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:

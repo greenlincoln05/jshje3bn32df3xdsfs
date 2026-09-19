@@ -313,3 +313,90 @@ class TestCalibrateEndToEnd:
         conn.close()
         assert cli.main(["calibrate", "--db", str(db_path), "--bins", "0"]) == 2
         assert "--bins" in capsys.readouterr().err
+
+
+def make_backtest_db(tmp_path):
+    import json
+
+    db_path = tmp_path / "bt.sqlite"
+    Recorder(None, series_ticker="KXBTC15M", db_path=db_path).close()
+    conn = sqlite3.connect(str(db_path))
+
+    ticker = "KXBTC15M-26SEP190000-00"
+    start = datetime(2026, 9, 19, 0, 0, 0, tzinfo=UTC)
+    close_time = start + timedelta(seconds=500)
+
+    price = Decimal("80000")
+    for i in range(20):
+        ts = start - timedelta(seconds=20) + timedelta(seconds=i)
+        price = price + Decimal("1") if i % 2 == 0 else price - Decimal("0.5")
+        conn.execute(
+            "INSERT INTO spot_ticks (source, price, source_ts, receive_ts, monotonic_ts) VALUES (?,?,?,?,?)",
+            ("coinbase-ws", str(price), ts.isoformat(), ts.isoformat(), float(i)),
+        )
+    conn.execute(
+        """INSERT INTO market_state
+           (ticker, event_ticker, poll_ts, status, strike, open_time, close_time, volume, open_interest)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (ticker, "KXBTC15M-26SEP190000", start.isoformat(), "active", "80000",
+         (start - timedelta(seconds=300)).isoformat(), close_time.isoformat(), "0", "0"),
+    )
+    for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+        ts = start + timedelta(seconds=offset)
+        payload = json.dumps({"yes": [["0.30", str(size)]], "no": [["0.68", "15"]]})
+        conn.execute(
+            """INSERT INTO orderbook_snapshots
+               (ticker, request_started_ts, poll_ts, latency_ms, yes_bid_price, yes_bid_size, yes_ask_price,
+                yes_ask_size, no_bid_price, no_bid_size, no_ask_price, no_ask_size, book_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ticker, ts.isoformat(), ts.isoformat(), 10.0, "0.30", str(size), None, None, "0.68", "15", None, None, payload),
+        )
+    conn.execute(
+        """INSERT INTO settlements (ticker, event_ticker, result, settled_avg, strike, close_time, finalized_poll_ts)
+           VALUES (?,?,?,?,?,?,?)""",
+        (ticker, "KXBTC15M-26SEP190000", "yes", "80500", "80000", close_time.isoformat(), close_time.isoformat()),
+    )
+    conn.commit()
+    return db_path, conn
+
+
+class TestBacktestEndToEnd:
+    def test_reports_a_missing_database(self, tmp_path, capsys):
+        assert cli.main(["backtest", "--db", str(tmp_path / "nope.sqlite")]) == 1
+        assert "no such database" in capsys.readouterr().err
+
+    def test_reports_a_non_recorder_database(self, tmp_path, capsys):
+        empty_db = tmp_path / "empty.sqlite"
+        sqlite3.connect(str(empty_db)).close()
+        assert cli.main(["--config", CONFIG, "backtest", "--db", str(empty_db)]) == 1
+        assert "error:" in capsys.readouterr().err
+
+    def test_prints_all_four_combinations_by_default(self, tmp_path, capsys):
+        db_path, conn = make_backtest_db(tmp_path)
+        conn.close()
+        assert cli.main(["--config", CONFIG, "backtest", "--db", str(db_path)]) == 0
+        out = capsys.readouterr().out
+        assert out.count("--- queue=") == 4  # optimistic/pessimistic x maker_fee_multiplier 0/0.25
+        assert out.count("queue=optimistic") == 2
+        assert out.count("queue=pessimistic") == 2
+        assert "maker_fee_multiplier=0" in out
+        assert "maker_fee_multiplier=0.25" in out
+        assert "Beats trade-nothing after fees? yes" in out
+
+    def test_single_combination_via_flags(self, tmp_path, capsys):
+        db_path, conn = make_backtest_db(tmp_path)
+        conn.close()
+        assert cli.main(
+            ["--config", CONFIG, "backtest", "--db", str(db_path), "--queue", "pessimistic", "--maker-fee-multiplier", "0"]
+        ) == 0
+        out = capsys.readouterr().out
+        assert out.count("---") == 2  # exactly one report block
+        assert "queue=pessimistic" in out
+
+    def test_rejects_a_bad_maker_fee_multiplier(self, tmp_path, capsys):
+        assert cli.main(["backtest", "--db", "whatever", "--maker-fee-multiplier", "not-a-number"]) == 2
+        assert "--maker-fee-multiplier" in capsys.readouterr().err
+
+    def test_rejects_a_negative_maker_fee_multiplier(self, tmp_path, capsys):
+        assert cli.main(["backtest", "--db", "whatever", "--maker-fee-multiplier", "-1"]) == 2
+        assert "--maker-fee-multiplier" in capsys.readouterr().err

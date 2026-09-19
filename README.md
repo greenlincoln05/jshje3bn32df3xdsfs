@@ -15,7 +15,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | 1 | Skeleton, Kalshi client (RSA-PSS signing), market discovery | **done** |
 | 2 | Spot feed + recorder (24h+ of order books, spot ticks, settlements) | **built and tested; no real capture run yet** |
 | 3 | Fair-probability model + calibration report | **built and tested; no real calibration report yet (no captured data)** |
-| 4 | Backtest + queue-aware paper broker | not started |
+| 4 | Backtest + queue-aware paper broker | **built and tested; no real backtest result yet (no captured data)** |
 | 5 | Live paper run, several days | not started |
 | 6 | Demo-environment order/cancel/fill validation | not started |
 | 7 | Live, optional, only if phases 4-6 show positive edge after fees | not started |
@@ -59,6 +59,26 @@ yet — this is tooling, verified against synthetic fixtures, not a result. The 
 earlier planning docs mention is not part of the spec's own Phase 3 definition (section 8.3) and was left
 out of this phase's scope; it can be added later if wanted.
 
+**Phase 4, as built:** `paper_broker.py` (Kalshi's quadratic fee formula, the tapered tick grid, and
+queue-position fill simulation, bracketed optimistic/pessimistic since Phase 2 records order books, not a
+trade tape), `risk.py` (every limit in spec section 5: per-trade and exposure caps, trades/hour, a UTC daily
+loss limit, a consecutive-loss pause needing manual `resume()`, the KILL-file check, and an active,
+enforced "size cannot increase after a loss" gate, not just an absence of a feature that would do that),
+`strategy.py` (edge = p_side - price - expected_fee for YES/NO, resting orders only, hold to settlement),
+and `execution.py` (the interface spec section 3 asks be shared by paper and live -- only the paper backend
+exists; no order-placing code against Kalshi itself exists anywhere in this repo). `backtest.py` replays a
+recorder database through all four end to end, on one simulated clock where volatility carries continuously
+across window boundaries the way it would live, and reports PnL, win rate, max drawdown, trades/day, and an
+explicit "beats trade-nothing after fees?" line. `btcbot backtest` runs all four
+queue-assumption x maker-fee-multiplier combinations by default. 128 new offline tests (fixtures built with
+`recorder.py`'s own schema, plus `hypothesis` invariants for the fee formula and the queue's
+never-increases/never-negative properties).
+
+**No real backtest result exists yet**, the same root cause as Phases 2 and 3: no real recorded data exists
+to replay. Every number this phase can currently produce comes from hand-built synthetic fixtures, not real
+market data -- see [docs/running-live.md](docs/running-live.md) for how to actually produce and analyze a
+real capture once you're on a machine with real network access.
+
 ### A note on API keys
 
 No Kalshi API key has been used by any Claude session working on this repo, demo or production. A key that
@@ -89,6 +109,7 @@ btcbot discover                       # same, against KALSHI_ENV (default: demo)
 btcbot auth-check                     # one signed GET /portfolio/balance: proves your key and signing work
 btcbot record --env prod --hours 9    # poll public market data + Coinbase spot ticks into ./data/*.sqlite
 btcbot calibrate --db data/recorder-....sqlite   # Brier score + reliability table from logged predictions
+btcbot backtest --db data/recorder-....sqlite    # replay through strategy + risk + paper broker; PnL etc.
 ```
 
 `discover` needs no credentials because Kalshi's market data is public. `auth-check` needs `KALSHI_KEY_ID` and
@@ -104,8 +125,14 @@ their own. It writes one timestamped SQLite file per run under `--data-dir` (def
 `calibrate` reads predictions a running strategy has logged (via `btcbot.model.log_prediction`) into that same
 database, joins them to `record`'s `settlements` table by ticker, and reports a Brier score and a reliability
 table for the model, the market mid, and their blend. Nothing currently logs live predictions into a real
-database (that is Phase 4's strategy loop), so today `calibrate` only has something to report on synthetic
-test data.
+database -- `backtest.py` recomputes predictions on the fly during replay without persisting them, and a
+loop that would log them continuously is Phase 5 -- so today `calibrate` only has something to report on
+synthetic test data.
+
+`backtest` also needs no credentials: it only reads a local recorder database. By default it runs all four
+combinations of queue assumption (`optimistic`/`pessimistic`) and maker-fee multiplier (`0`/`0.25`) and
+prints one report per combination, since neither is confirmed (see "Verified Kalshi API facts" and
+`paper_broker.py`'s module docstring) -- `--queue` and `--maker-fee-multiplier` narrow it to one.
 
 Example (prices vary):
 
@@ -126,7 +153,7 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
 | Mode | Target | Money | Status |
 |------|--------|-------|--------|
 | `record` | prod market data, read-only | none | Phase 2: **built** (REST polling; no key) |
-| `paper` (default) | prod data, simulated fills | none | Phase 4-5 |
+| `paper` (default) | prod data, simulated fills | none | Phase 4: **built** (`backtest`, offline); live-loop pending Phase 5 |
 | `demo` | Kalshi demo environment | fake | Phase 6 |
 | `live` | Kalshi prod | real | Phase 7: needs `mode: live`, `--i-understand-real-money`, `KALSHI_ENV=prod` and a typed confirmation |
 
@@ -151,28 +178,30 @@ src/btcbot/
   models.py                 Market, Series, OrderBook, Balance: Decimal-only views of API payloads
   kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff
   market_discovery.py       find the open KXBTC15M market: series -> open markets (see the discovery note below)
-  cli.py                    discover, auth-check, record, calibrate
+  cli.py                    discover, auth-check, record, calibrate, backtest
   spot_feed.py              Phase 2: Coinbase public WebSocket ticker -> rolling buffer, staleness, REST fallback
   recorder.py               Phase 2: order books, market state, spot ticks and settlements -> SQLite
   model.py                  Phase 3: v1 fair-probability model, EWMA volatility, prediction logging, calibration
-  strategy.py               placeholder, Phase 4: edge and entry/exit decisions
-  risk.py                   placeholder, Phase 4: limits, kill switch, PnL tracking
-  execution.py              placeholder, Phase 4: one order interface for paper and live
-  paper_broker.py           placeholder, Phase 4: queue-aware simulated fills
-  backtest.py               placeholder, Phase 4: replay recorded data
+  strategy.py               Phase 4: edge = p_side - price - fee for YES/NO; resting orders only
+  risk.py                   Phase 4: every limit in spec section 5, kill switch, size-no-increase-after-a-loss
+  execution.py              Phase 4: the paper/live-shared order interface -- only the paper backend exists
+  paper_broker.py           Phase 4: fees, tick grid, queue-position fill simulation
+  backtest.py               Phase 4: replay a recorder database through all of the above; PnL/win-rate/etc.
 tests/
   fixtures/                 real public API payloads and an OpenSSL signing vector
   test_signing.py, test_client.py, test_config.py, test_models.py, test_market_discovery.py, test_cli.py
   test_spot_feed.py, test_recorder.py                    Phase 2, offline (fake WebSocket + fake Kalshi client)
   test_model.py                                          Phase 3, offline (includes hypothesis property tests)
-  test_risk.py, test_paper_broker.py                     placeholders for Phase 4
+  test_risk.py, test_paper_broker.py, test_strategy.py,
+  test_execution.py, test_backtest.py                    Phase 4, offline (synthetic fixtures + hypothesis)
 ```
 
-Placeholder modules hold only a docstring saying what the build spec asks of them; they contain no behaviour and are
-filled in by their phase. `config.py` and `models.py` are additions to the layout in the build spec. Kalshi's own
-WebSocket (order-book deltas) is not implemented: it needs an API key even for public channels (see "Verified Kalshi
-API facts" below), and no key has been provisioned through a secure channel, so `recorder.py` polls REST instead;
-`spot_feed.py`'s WebSocket client is Coinbase's separate, unauthenticated public ticker feed.
+`config.py` and `models.py` are additions to the layout in the build spec. Kalshi's own WebSocket (order-book
+deltas) is not implemented: it needs an API key even for public channels (see "Verified Kalshi API facts"
+below), and no key has been provisioned through a secure channel, so `recorder.py` polls REST instead;
+`spot_feed.py`'s WebSocket client is Coinbase's separate, unauthenticated public ticker feed. No order-placing
+code against Kalshi exists anywhere in this repo -- `execution.py`'s paper backend only ever calls
+`paper_broker.py`.
 
 ## Verified Kalshi API facts
 
