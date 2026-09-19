@@ -1,10 +1,18 @@
 """Kalshi Trade API client: RSA-PSS request signing and an async REST client with retries.
 
-Phase 1 is read-only: there are deliberately no order-placing methods yet. Public market-data endpoints
-(series, events, markets, orderbook) need no credentials; only ``get_balance`` is signed. The WebSocket
-client arrives with the recorder in Phase 2 and will reuse :class:`KalshiAuth` for its handshake.
+Public market-data endpoints (series, events, markets, orderbook) need no credentials. ``get_balance``,
+``get_order``, ``list_orders``, ``list_fills`` and ``get_positions`` are signed, read-only account queries,
+allowed against either environment (same as ``get_balance`` today). ``create_order`` and ``cancel_order``
+are the only calls that can change real-world state, so they refuse to sign against anything but the demo
+environment (:exc:`KalshiWriteNotAllowedError`) until the owner explicitly approves Phase 7 and its four
+gates (spec section 7) -- see CLAUDE.md.
 
-API facts here were checked against docs.kalshi.com on 2026-09-18 (see README, "Verified Kalshi API facts").
+API facts for every method above ``create_order`` were checked against docs.kalshi.com and live responses
+on 2026-09-18 (see README, "Verified Kalshi API facts"). The order/fill/position write-endpoint shapes were
+added in Phase 6 without network access to this sandbox and are **not** similarly verified -- see
+:class:`btcbot.models.KalshiOrder`'s docstring. The owner's first real ``btcbot demo-check`` run is what
+actually confirms or corrects them; a shape mismatch fails loudly (a 400/422 from Kalshi's demo API, not a
+silent wrong order) precisely because nothing here can touch real money.
 """
 
 from __future__ import annotations
@@ -14,6 +22,7 @@ import base64
 import logging
 import random
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal
 from pathlib import Path
@@ -26,7 +35,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from btcbot import __version__
 from btcbot.config import KalshiEnv
-from btcbot.models import Balance, Market, OrderBook, ParseError, Series, require
+from btcbot.models import Balance, KalshiFill, KalshiOrder, Market, OrderBook, ParseError, Position, Series, Side, require
 
 log = logging.getLogger("btcbot.kalshi")
 
@@ -127,6 +136,12 @@ class KalshiAPIError(KalshiError):
 
 class KalshiAuthError(KalshiAPIError):
     """401/403: bad key or signature, wrong environment, skewed clock, or missing entitlement."""
+
+
+class KalshiWriteNotAllowedError(KalshiError):
+    """Raised instead of signing a write call (``create_order``/``cancel_order``) against a non-demo
+    environment. Not an HTTP error: the request is never sent. The only way to lift this is Phase 7's four
+    gates (spec section 7), never a client constructor argument or an environment variable alone."""
 
 
 def _api_error(label: str, response: httpx.Response) -> KalshiAPIError:
@@ -245,11 +260,114 @@ class KalshiClient:
         data = await self._request("GET", f"/markets/{quote(ticker, safe='')}/orderbook", params=params)
         return OrderBook.from_api(ticker, data)
 
-    # ---- account (signed)
+    # ---- account (signed, read-only -- allowed against either environment, same as get_balance)
 
     async def get_balance(self) -> Balance:
         data = await self._request("GET", "/portfolio/balance", authenticated=True)
         return Balance.from_api(data)
+
+    async def get_order(self, order_id: str) -> KalshiOrder:
+        data = await self._request("GET", f"/portfolio/orders/{quote(order_id, safe='')}", authenticated=True)
+        return KalshiOrder.from_api(require(data, "order", "order response"))
+
+    async def list_orders(self, *, ticker: str | None = None, status: str | None = None) -> list[KalshiOrder]:
+        params = {"limit": "1000"}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        orders: list[KalshiOrder] = []
+        seen_cursors: set[str] = set()
+        while True:
+            data = await self._request("GET", "/portfolio/orders", params=params, authenticated=True)
+            page = require(data, "orders", "orders response")
+            if not isinstance(page, list):
+                raise ParseError("orders response: orders must be an array")
+            orders.extend(KalshiOrder.from_api(o) for o in page)
+            cursor = data.get("cursor")
+            if cursor is None or cursor == "":
+                return orders
+            if not isinstance(cursor, str):
+                raise ParseError("orders response: cursor must be a string")
+            if cursor in seen_cursors:
+                raise KalshiError("orders response repeated a pagination cursor; refusing incomplete results")
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
+
+    async def list_fills(self, *, ticker: str | None = None, order_id: str | None = None) -> list[KalshiFill]:
+        params = {"limit": "1000"}
+        if ticker:
+            params["ticker"] = ticker
+        if order_id:
+            params["order_id"] = order_id
+        fills: list[KalshiFill] = []
+        seen_cursors: set[str] = set()
+        while True:
+            data = await self._request("GET", "/portfolio/fills", params=params, authenticated=True)
+            page = require(data, "fills", "fills response")
+            if not isinstance(page, list):
+                raise ParseError("fills response: fills must be an array")
+            fills.extend(KalshiFill.from_api(f) for f in page)
+            cursor = data.get("cursor")
+            if cursor is None or cursor == "":
+                return fills
+            if not isinstance(cursor, str):
+                raise ParseError("fills response: cursor must be a string")
+            if cursor in seen_cursors:
+                raise KalshiError("fills response repeated a pagination cursor; refusing incomplete results")
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
+
+    async def get_positions(self) -> list[Position]:
+        data = await self._request("GET", "/portfolio/positions", authenticated=True)
+        page = require(data, "market_positions", "positions response")
+        if not isinstance(page, list):
+            raise ParseError("positions response: market_positions must be an array")
+        return [Position.from_api(p) for p in page]
+
+    # ---- account (signed, write -- demo-only until the owner approves Phase 7)
+
+    async def create_order(
+        self,
+        ticker: str,
+        side: Side,
+        *,
+        count: Decimal,
+        price: Decimal | None = None,
+        client_order_id: str | None = None,
+    ) -> KalshiOrder:
+        """Places a resting (limit, ``price`` given) or taker (market, ``price`` omitted) buy order. This
+        bot never sells to open or shorts a position (see execution.py/strategy.py), so ``action`` is
+        always ``"buy"``; closing early isn't implemented (spec: hold to settlement by default).
+
+        ``client_order_id`` defaults to a fresh UUID so an application-level retry after an ambiguous
+        failure can't double-place -- Kalshi is expected to deduplicate on this field (per the Phase 6 plan;
+        unverified, see the module docstring)."""
+        self._require_demo("create_order")
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "side": side,
+            "action": "buy",
+            "type": "limit" if price is not None else "market",
+            "count": str(count),
+        }
+        if price is not None:
+            body[f"{side}_price_dollars"] = str(price)
+        data = await self._request("POST", "/portfolio/orders", authenticated=True, json_body=body)
+        return KalshiOrder.from_api(require(data, "order", "create-order response"))
+
+    async def cancel_order(self, order_id: str) -> KalshiOrder:
+        self._require_demo("cancel_order")
+        data = await self._request("DELETE", f"/portfolio/orders/{quote(order_id, safe='')}", authenticated=True)
+        return KalshiOrder.from_api(require(data, "order", "cancel-order response"))
+
+    def _require_demo(self, action: str) -> None:
+        if self.env is not KalshiEnv.DEMO:
+            raise KalshiWriteNotAllowedError(
+                f"{action}: refusing to sign a write call against {self.env.value} -- write endpoints are "
+                "demo-only until the owner explicitly approves Phase 7 (spec section 7's four gates)"
+            )
 
     # ---- transport
 
@@ -260,6 +378,7 @@ class KalshiClient:
         *,
         params: Mapping[str, str] | None = None,
         authenticated: bool = False,
+        json_body: Mapping[str, Any] | None = None,
     ) -> Any:
         method = method.upper()
         path = f"{API_PREFIX}{endpoint}"
@@ -271,7 +390,7 @@ class KalshiClient:
             headers = self._auth_headers(method, path) if authenticated else None
             started = time.monotonic()
             try:
-                response = await self._http.request(method, path, params=params, headers=headers)
+                response = await self._http.request(method, path, params=params, headers=headers, json=json_body)
             except httpx.TransportError as exc:
                 if idempotent and attempt < self._max_retries:
                     await self._backoff(attempt, None, f"{label} ({type(exc).__name__})")
