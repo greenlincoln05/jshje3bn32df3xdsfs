@@ -44,6 +44,7 @@ from btcbot.models import Market, OrderBook, ParseError, Series, Side
 from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder, RecorderSummary
 from btcbot.spot_feed import CoinbaseSpotFeed, SpotBuffer
+from btcbot.stream_recorder import StreamRecorder, compare_brti_to_spot
 from btcbot.webui import create_dashboard_server
 
 # --------------------------------------------------------------------------- formatting
@@ -273,6 +274,113 @@ async def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def render_stream_summary(recorder_summary: RecorderSummary | None, stream: StreamRecorder, db_path: Path) -> str:
+    stats = stream.stats
+    lines = []
+    if recorder_summary is not None:
+        lines.append(render_recorder_summary(recorder_summary))
+    last = f" (last ${stats.last_brti:,.2f})" if stats.last_brti is not None else ""
+    unknown = f" ({', '.join(sorted(stats.unknown_types))})" if stats.unknown_types else ""
+    lines += [
+        f"BRTI ticks  : {stats.brti_ticks:,}{last}",
+        f"Book stream : {stats.book_snapshots:,} snapshots, {stats.book_deltas:,} deltas",
+        f"Reconnects  : {stats.reconnects:,} ({stats.resyncs:,} because a book could not be trusted)",
+        f"Dropped     : {stats.malformed_messages:,} malformed, {stats.unknown_messages:,} unrecognised{unknown}",
+    ]
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cmp = compare_brti_to_spot(conn)
+    finally:
+        conn.close()
+    if cmp.n:
+        lines.append(
+            f"BRTI vs Coinbase ({cmp.n:,} paired ticks): mean diff ${cmp.mean_diff:,.2f}, "
+            f"mean |diff| ${cmp.mean_abs_diff:,.2f}, median |diff| ${cmp.median_abs_diff:,.2f}, "
+            f"max |diff| ${cmp.max_abs_diff:,.2f}"
+        )
+    else:
+        lines.append("BRTI vs Coinbase: no paired ticks (no BRTI received, or no Coinbase ticks in the same window)")
+    if cmp.mean_feed_lag_ms is not None:
+        lines.append(f"Feed lag    : Kalshi received BRTI {cmp.mean_feed_lag_ms:,.0f} ms after CF published it (mean)")
+    return "\n".join(lines)
+
+
+async def _print_stream_status(stream: StreamRecorder, interval: float) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        st = stream.stats
+        last = f"${st.last_brti:,.2f}" if st.last_brti is not None else "waiting"
+        print(
+            f"{datetime.now(timezone.utc):%H:%M:%SZ} BRTI {last}  ticks {st.brti_ticks:,}  "
+            f"book events {st.book_snapshots + st.book_deltas:,}  reconnects {st.reconnects}",
+            flush=True,
+        )
+
+
+async def _cmd_stream(args: argparse.Namespace) -> int:
+    """Authenticated, READ-ONLY WebSocket capture. Needs the owner's own key in .env; no order is ever sent."""
+    config = load_config(args.config)
+    series_ticker = args.series or config.series_ticker
+    settings = KalshiSettings()
+    if settings.key_id is None or settings.private_key_path is None:
+        raise ConfigError(
+            "KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (see .env.example, or the dashboard's "
+            "Settings tab). Kalshi's WebSocket needs a signed handshake even for public data."
+        )
+    auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
+    env = KalshiEnv(args.env) if args.env else settings.env
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    db_path = data_dir / f"stream-{series_ticker}-{env.value}-{timestamp}.sqlite"
+
+    async with KalshiClient(env) as client:  # REST stays public/unsigned; only the WebSocket handshake signs
+        recorder = Recorder(
+            client, series_ticker=series_ticker, db_path=db_path, kill_file=args.kill_file,
+            poll_interval_sec=args.poll_interval,
+        )
+
+        async def current_ticker() -> str | None:
+            market = await find_current_market(client, series_ticker)
+            return market.ticker if market is not None else None
+
+        stream = StreamRecorder(
+            db_path, auth, env, ticker_provider=current_ticker, index_ids=(args.index,), include_5hz=not args.no_5hz,
+        )
+        spot_feed = CoinbaseSpotFeed(SpotBuffer(), on_tick=recorder.record_spot_tick)
+        spot_task = asyncio.ensure_future(spot_feed.run_forever())
+        rec_task = asyncio.ensure_future(recorder.run(duration_sec=args.hours * 3600))
+        stream_task = asyncio.ensure_future(stream.run_forever())
+        status_task = asyncio.ensure_future(_print_stream_status(stream, args.status_every))
+        print(
+            f"Streaming {args.index} + {series_ticker} order book ({env.value}, read-only, no orders) to {db_path}\n"
+            f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early.",
+            flush=True,
+        )
+        summary: RecorderSummary | None = None
+        error: BaseException | None = None
+        try:
+            await asyncio.wait({rec_task, stream_task}, return_when=asyncio.FIRST_COMPLETED)
+            if stream_task.done() and not stream_task.cancelled():
+                error = stream_task.exception()  # run_forever only ends on its own with a StreamError
+            if rec_task.done() and not rec_task.cancelled() and rec_task.exception() is None:
+                summary = rec_task.result()
+        finally:
+            for task in (status_task, stream_task, spot_task, rec_task):
+                task.cancel()
+            for task in (status_task, stream_task, spot_task, rec_task):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            await spot_feed.aclose()
+            stream.close()
+            recorder.close()
+    print(render_stream_summary(summary, stream, db_path))
+    if error is not None:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 async def _cmd_calibrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db)
     if not db_path.is_file():
@@ -437,6 +545,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     record.set_defaults(handler=_cmd_record)
 
+    stream = commands.add_parser(
+        "stream",
+        help="READ-ONLY authenticated WebSocket capture of BRTI + order-book deltas (needs your own key in .env)",
+    )
+    stream.add_argument("--env", choices=envs, help="Kalshi environment (default: KALSHI_ENV, else demo)")
+    stream.add_argument("--series", help="override series_ticker from config.yaml")
+    stream.add_argument("--hours", type=float, default=9.0, help="stop after this many hours (default: 9)")
+    stream.add_argument("--data-dir", default="data", help="directory for the SQLite database (default: ./data)")
+    stream.add_argument("--kill-file", default="KILL", help="creating this file stops recording (default: ./KILL)")
+    stream.add_argument("--index", default="BRTI", help="CF Benchmarks index id (default: BRTI)")
+    stream.add_argument("--no-5hz", action="store_true", help="skip the 5 Hz BRTI channel, keep the 1 Hz one")
+    stream.add_argument(
+        "--poll-interval", type=float, default=5.0, metavar="SECONDS",
+        help="seconds between REST polls for market state/settlements/fallback books (default: 5.0)",
+    )
+    stream.add_argument(
+        "--status-every", type=float, default=10.0, metavar="SECONDS", help="status line interval (default: 10)"
+    )
+    stream.set_defaults(handler=_cmd_stream)
+
     calibrate = commands.add_parser(
         "calibrate", help="Brier score + reliability table from predictions logged into a recorder database"
     )
@@ -507,6 +635,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not math.isfinite(args.poll_interval) or args.poll_interval <= 0:
             print("error: --poll-interval must be finite and greater than 0", file=sys.stderr)
             return 2
+    if args.command == "stream":
+        for name, value in (
+            ("--hours", args.hours), ("--poll-interval", args.poll_interval), ("--status-every", args.status_every),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                print(f"error: {name} must be finite and greater than 0", file=sys.stderr)
+                return 2
     if args.command == "calibrate" and args.bins <= 0:
         print("error: --bins must be greater than 0", file=sys.stderr)
         return 2

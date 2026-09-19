@@ -118,7 +118,12 @@ def list_databases(data_dir: Path) -> list[dict[str, Any]]:
     entries = []
     for path in sorted(data_dir.glob("*.sqlite"), key=lambda p: p.stat().st_mtime, reverse=True):
         name = path.name
-        kind = "paper" if name.startswith("paper-") else "recorder" if name.startswith("recorder-") else "unknown"
+        kind = (
+            "paper" if name.startswith("paper-")
+            else "recorder" if name.startswith("recorder-")
+            else "stream" if name.startswith("stream-")
+            else "unknown"
+        )
         stat = path.stat()
         entries.append({"name": name, "kind": kind, "size_bytes": stat.st_size, "modified_ts": stat.st_mtime})
     return entries
@@ -133,13 +138,21 @@ def _resolve_db(data_dir: Path, name: str) -> Path | None:
     return candidate if candidate.is_file() and candidate.suffix == ".sqlite" else None
 
 
+def _safe_trades(conn: sqlite3.Connection) -> list[Any]:
+    """A database that has not made a trade yet (or a plain recorder database) has no ``trades`` table."""
+    try:
+        return load_trades(conn)
+    except sqlite3.OperationalError:
+        return []
+
+
 def paper_summary(db_path: Path) -> dict[str, Any]:
     """Live trading state for a database :mod:`btcbot.live_paper` may still be writing: a plain read-write
     handle is fine to open concurrently because ``recorder.py`` runs its database in WAL mode, and this
     function never issues a write of its own."""
     conn = sqlite3.connect(str(db_path))
     try:
-        trades = load_trades(conn)
+        trades = _safe_trades(conn)
         try:
             tickers_seen = {row[0] for row in conn.execute("SELECT DISTINCT ticker FROM orderbook_snapshots")}
             span = conn.execute("SELECT MIN(poll_ts), MAX(poll_ts) FROM orderbook_snapshots").fetchone()
@@ -174,6 +187,71 @@ def paper_summary(db_path: Path) -> dict[str, Any]:
         "last_ts": span[1] if span else None,
         "cumulative_pnl": cumulative,
         "trades": [asdict(t) for t in reversed(trades)],  # newest first for the table
+    }
+
+
+def _downsample(rows: list[Any], limit: int) -> list[Any]:
+    if len(rows) <= limit:
+        return rows
+    step = len(rows) / limit
+    return [rows[int(i * step)] for i in range(limit)] + [rows[-1]]
+
+
+def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
+    """Everything the Market tab draws for one window of a recorder/paper database: market metadata, the
+    latest order book, spot and YES-mid history, and this window's paper trades. Read-only."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        try:
+            tickers = [r[0] for r in conn.execute(
+                "SELECT ticker FROM orderbook_snapshots GROUP BY ticker ORDER BY MAX(id) DESC LIMIT 50")]
+        except sqlite3.OperationalError:
+            return {"tickers": [], "ticker": None}
+        if not tickers:
+            return {"tickers": [], "ticker": None}
+        if ticker is None or ticker not in tickers:
+            ticker = tickers[0]
+        meta = conn.execute(
+            "SELECT status, strike, open_time, close_time, volume, open_interest FROM market_state "
+            "WHERE ticker=? ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
+        book_row = conn.execute(
+            "SELECT poll_ts, book_json FROM orderbook_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
+            (ticker,)).fetchone()
+        book = json.loads(book_row[1]) if book_row else {"yes": [], "no": []}
+        mids = conn.execute(
+            "SELECT poll_ts, yes_bid_price, yes_ask_price FROM orderbook_snapshots WHERE ticker=? ORDER BY id",
+            (ticker,)).fetchall()
+        first_ts = mids[0][0] if mids else None
+        spot = conn.execute(
+            "SELECT receive_ts, price FROM spot_ticks WHERE receive_ts>=? ORDER BY id",
+            (first_ts or "",)).fetchall() if first_ts else []
+        latest_spot = conn.execute("SELECT price, receive_ts FROM spot_ticks ORDER BY id DESC LIMIT 1").fetchone()
+        settlement = conn.execute(
+            "SELECT result, settled_avg FROM settlements WHERE ticker=?", (ticker,)).fetchone()
+        all_trades = _safe_trades(conn)
+        trades = [asdict(t) for t in reversed(all_trades) if t.ticker == ticker]
+        closes = dict(conn.execute("SELECT ticker, MAX(close_time) FROM market_state GROUP BY ticker"))
+        results = dict(conn.execute("SELECT ticker, result FROM settlements"))
+        trade_counts: dict[str, int] = {}
+        for t in all_trades:
+            trade_counts[t.ticker] = trade_counts.get(t.ticker, 0) + 1
+        windows = [
+            {"ticker": tk, "close_time": closes.get(tk), "result": results.get(tk), "trades": trade_counts.get(tk, 0)}
+            for tk in tickers
+        ]
+    finally:
+        conn.close()
+    return {
+        "tickers": tickers, "windows": windows, "ticker": ticker,
+        "status": meta[0] if meta else None, "strike": meta[1] if meta else None,
+        "open_time": meta[2] if meta else None, "close_time": meta[3] if meta else None,
+        "volume": meta[4] if meta else None, "open_interest": meta[5] if meta else None,
+        "book": book, "book_ts": book_row[0] if book_row else None,
+        "mid_series": _downsample([[r[0], r[1], r[2]] for r in mids], 400),
+        "spot_series": _downsample([[r[0], r[1]] for r in spot], 400),
+        "spot": latest_spot[0] if latest_spot else None, "spot_ts": latest_spot[1] if latest_spot else None,
+        "settlement": {"result": settlement[0], "settled_avg": settlement[1]} if settlement else None,
+        "trades": trades,
     }
 
 
@@ -258,6 +336,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"databases": list_databases(self.server.data_dir)})
             elif parsed.path == "/api/paper_summary":
                 self._send_json(200, self._paper_summary(query))
+            elif parsed.path == "/api/market":
+                db_path = self._require_db(query)
+                try:
+                    self._send_json(200, market_view(db_path, query.get("ticker")))
+                except (sqlite3.OperationalError, ParseError, ValueError) as exc:
+                    raise _ApiError(400, f"market view error: {exc}") from exc
             elif parsed.path == "/api/backtest":
                 self._send_json(200, self._backtest(query))
             elif parsed.path == "/api/settings":
@@ -337,135 +421,220 @@ def create_dashboard_server(*, data_dir: Path, env_path: Path, config_path: Path
 
 # --------------------------------------------------------------------------- frontend
 
-INDEX_HTML = """<!doctype html>
+INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>btc15m-bot dashboard</title>
 <style>
-  :root { color-scheme: dark; }
-  body { background: #0f1115; color: #e6e6e6; font: 14px/1.5 -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
-         margin: 0; padding: 24px; }
-  h1 { font-size: 18px; margin: 0 0 4px; }
-  .subtitle { color: #9aa4b2; margin-bottom: 20px; }
-  .banner { background: #1a2230; border: 1px solid #2c3a52; border-radius: 8px; padding: 10px 14px;
-            margin-bottom: 20px; color: #9fd3ff; font-size: 13px; }
-  nav { display: flex; gap: 8px; margin-bottom: 16px; }
-  nav button { background: #1b1e26; color: #cfd3da; border: 1px solid #2a2e38; border-radius: 6px;
-               padding: 8px 14px; cursor: pointer; font-size: 13px; }
-  nav button.active { background: #2b6cb0; color: white; border-color: #2b6cb0; }
-  section { display: none; }
-  section.active { display: block; }
-  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
-  select, input, button.action { background: #1b1e26; color: #e6e6e6; border: 1px solid #2a2e38;
-        border-radius: 6px; padding: 7px 10px; font-size: 13px; }
-  button.action { cursor: pointer; }
-  button.action:hover { border-color: #2b6cb0; }
-  .tiles { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
-  .tile { background: #161a22; border: 1px solid #262b36; border-radius: 8px; padding: 12px 16px; min-width: 130px; }
-  .tile .label { color: #9aa4b2; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
-  .tile .value { font-size: 20px; margin-top: 4px; }
-  .pnl-pos { color: #4ade80; } .pnl-neg { color: #f87171; }
-  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #22262f; }
-  th { color: #9aa4b2; font-weight: 600; font-size: 11px; text-transform: uppercase; }
-  canvas { background: #12151b; border: 1px solid #262b36; border-radius: 8px; }
-  .note { color: #9aa4b2; font-size: 12px; margin-top: 10px; }
-  .error { color: #f87171; margin-top: 10px; }
-  .ok { color: #4ade80; margin-top: 10px; }
+  :root { color-scheme: dark; --bg:#07090b; --panel:#0e1114; --panel2:#12161a; --line:#1c2126; --text:#e9edf0;
+          --muted:#7d8791; --green:#2ee6a6; --greenbg:#0f2a22; --red:#ff5a6a; --redbg:#2a1216; --orange:#ff9b3d;
+          --blue:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); margin: 0; padding: 20px;
+         font: 13px/1.45 Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .shell { max-width: 1240px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line);
+           border-radius: 14px; overflow: hidden; }
+  .top { display: flex; gap: 14px; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .coin { width: 32px; height: 32px; border-radius: 50%; background: var(--orange); color: #fff; display: grid;
+          place-items: center; font-weight: 700; flex: none; }
+  .title { font-weight: 700; font-size: 15px; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .sub b { color: var(--text); font-weight: 600; }
+  .grow { flex: 1; }
+  .pick { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .pick label { display: flex; flex-direction: column; gap: 3px; font-size: 10.5px; color: var(--muted);
+                text-transform: uppercase; letter-spacing: .05em; }
+  .pick select { min-width: 230px; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--text); }
+  .pickhelp { padding: 8px 18px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+  .pickhelp b { color: var(--text); font-weight: 600; }
+  select, input { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+                  padding: 7px 10px; font: inherit; max-width: 100%; }
+  button { font: inherit; }
+  button.action { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+                  padding: 7px 12px; cursor: pointer; }
+  button.action:hover { border-color: var(--green); }
+  button.action:disabled { opacity: .5; cursor: wait; }
+  nav { display: flex; gap: 4px; padding: 0 18px; border-bottom: 1px solid var(--line); }
+  nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+               padding: 11px 14px; cursor: pointer; font-weight: 600; }
+  nav button.active { color: var(--text); border-bottom-color: var(--green); }
+  .stats { display: flex; gap: 26px; padding: 10px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; font-size: 11px;
+           color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .stats b { color: var(--text); font-size: 13px; margin-left: 4px; letter-spacing: 0; }
+  section { display: none; } section.active { display: block; }
+  .chartwrap { padding: 8px 18px 0; }
+  canvas { width: 100%; display: block; }
+  .cols { display: grid; grid-template-columns: 1.05fr 1.15fr 1fr; border-top: 1px solid var(--line); }
+  .col { padding: 14px 16px; border-right: 1px solid var(--line); min-width: 0; }
+  .col:last-child { border-right: 0; }
+  @media (max-width: 960px) { .cols { grid-template-columns: 1fr; } .col { border-right: 0; border-bottom: 1px solid var(--line); } }
+  .facts { display: flex; gap: 22px; margin-bottom: 8px; flex-wrap: wrap; }
+  .fact .k { color: var(--muted); font-size: 11px; } .fact .v { font-weight: 600; font-size: 14px; }
+  .orange { color: var(--orange); } .green { color: var(--green); } .red { color: var(--red); }
+  .toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .toggle button { background: none; border: 0; color: var(--muted); padding: 5px 14px; cursor: pointer; font-weight: 700; font-size: 11px; }
+  .toggle button.on { background: var(--greenbg); color: var(--green); }
+  .toggle.no button.on { background: var(--redbg); color: var(--red); }
+  .ladder-head, .lrow { display: grid; grid-template-columns: 60px 1fr 1fr; padding: 3px 8px; font-variant-numeric: tabular-nums; }
+  .ladder-head { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  .ladder-head span:nth-child(n+2), .lrow span:nth-child(n+2) { text-align: right; }
+  .lrow { position: relative; }
+  .lrow .bar { position: absolute; right: 0; top: 0; bottom: 0; opacity: .22; }
+  .lrow span { position: relative; }
+  .lrow.ask .p { color: var(--red); } .lrow.ask .bar { background: var(--red); }
+  .lrow.bid .p { color: var(--green); } .lrow.bid .bar { background: var(--green); }
+  .mid { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 8px; margin: 3px 0;
+         border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .mid .big { font-size: 18px; font-weight: 700; } .mid .sp { color: var(--muted); font-size: 11px; }
+  .quote { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 10px; }
+  .quote div { text-align: center; padding: 8px; border-radius: 8px; font-weight: 700; }
+  .quote .y { background: var(--greenbg); color: var(--green); border: 1px solid #1b5a45; }
+  .quote .n { background: var(--redbg); color: var(--red); border: 1px solid #5a1f28; }
+  h3 { margin: 14px 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .tiles { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 18px; }
+  .tile { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-width: 120px; }
+  .tile .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .tile .value { font-size: 19px; margin-top: 3px; font-weight: 600; }
+  .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  .pad { padding: 14px 18px; }
+  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .error { color: var(--red); margin-top: 8px; } .ok { color: var(--green); margin-top: 8px; }
+  .empty { color: var(--muted); text-align: center; padding: 20px 10px; }
+  .warn { background: #2a1d10; border: 1px solid #6b4a1c; color: #fbbf77; border-radius: 8px; padding: 10px 14px; margin: 10px 0; display: none; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.live { color: var(--green); border-color: #1b5a45; } .badge.closed { color: var(--orange); border-color: #6b4a1c; }
+  .foot { padding: 10px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
+  @media (max-width: 700px) { body { padding: 8px; } table { display: block; overflow-x: auto; } }
 </style>
 </head>
 <body>
-<h1>btc15m-bot dashboard</h1>
-<div class="subtitle">Local only -- this page and everything it fetches stays on this machine.</div>
-<div class="banner">
-  Read-only monitoring plus a local settings editor. There is no order-placing code anywhere in this repo
-  (Phase 6 is not approved yet) -- nothing on this page can place, cancel, or modify a Kalshi order, in
-  demo or in prod.
+<div class="shell">
+  <div class="top">
+    <div class="coin">&#8383;</div>
+    <div>
+      <div class="title" id="hdr-title">BTC 15 min</div>
+      <div class="sub" id="hdr-sub">No data loaded</div>
+    </div>
+    <span class="badge" id="hdr-badge"></span>
+    <div class="grow"></div>
+    <div class="pick" id="db-row">
+      <label>1. Data file
+        <select id="db-select" title="Which run to look at. The newest is at the top."></select></label>
+      <label>2. Market window
+        <select id="ticker-select" title="Each 15-minute market. Leave on Latest to follow along."></select></label>
+      <button class="action" id="refresh-databases" title="Look for new files">Refresh</button>
+    </div>
+  </div>
+  <div class="pickhelp" id="pickhelp">Pick the newest <b>Paper trading</b> file to watch a live run. Leave the window on <b>Latest</b> to follow the current 15-minute market automatically.</div>
+  <nav>
+    <button data-tab="market" class="active">Market</button>
+    <button data-tab="monitor">Paper PnL</button>
+    <button data-tab="backtest">Backtest</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+
+  <section id="tab-market" class="active">
+    <div class="stats">
+      <span>Vol <b id="st-vol">--</b></span><span>Open int <b id="st-oi">--</b></span>
+      <span>Spread <b id="st-spread">--</b></span><span>Time left <b id="st-left">--</b></span>
+      <span>Last book <b id="st-ts">--</b></span><span>Data age <b id="st-age">--</b></span>
+    </div>
+    <div class="chartwrap"><canvas id="mid-chart" height="190"></canvas></div>
+    <div class="cols">
+      <div class="col">
+        <div class="facts">
+          <div class="fact"><div class="k">Expiration</div><div class="v orange" id="f-exp">--</div></div>
+          <div class="fact"><div class="k">To beat</div><div class="v" id="f-strike">--</div></div>
+          <div class="fact"><div class="k">Current price</div><div class="v" id="f-spot">--</div></div>
+        </div>
+        <canvas id="spot-chart" height="210"></canvas>
+        <div class="note" id="spot-note"></div>
+      </div>
+      <div class="col">
+        <div class="row" style="justify-content:space-between;margin-bottom:0">
+          <span class="sub">Order book</span>
+          <div class="toggle" id="side-toggle"><button data-side="yes" class="on">YES</button><button data-side="no">NO</button></div>
+        </div>
+        <div class="ladder-head"><span>Price</span><span>Contracts</span><span>Total</span></div>
+        <div id="asks"></div>
+        <div class="mid"><span class="big" id="mid-price">--</span><span class="sp" id="mid-spread"></span></div>
+        <div id="bids"></div>
+        <div class="note" id="market-note"></div>
+      </div>
+      <div class="col">
+        <div class="quote"><div class="y" id="q-yes">Yes --</div><div class="n" id="q-no">No --</div></div>
+        <h3>Paper trades, this window</h3>
+        <table id="win-trades"><thead><tr><th>Side</th><th>Size</th><th>Entry</th><th>Result</th><th>PnL</th></tr></thead><tbody></tbody></table>
+        <h3>Settlement</h3>
+        <div id="settle" class="sub">Not settled yet.</div>
+        <div class="note">Read-only view of recorded data. There is no order ticket: nothing here can place, cancel or modify a Kalshi order.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-monitor">
+    <div class="tiles" id="summary-tiles"></div>
+    <div class="chartwrap"><canvas id="pnl-chart" height="220"></canvas></div>
+    <div class="pad"><table id="trades-table">
+      <thead><tr><th>Ticker</th><th>Side</th><th>Size</th><th>Entry price</th><th>Entry time (UTC)</th><th>Result</th><th>PnL (USD)</th></tr></thead>
+      <tbody></tbody></table>
+      <div class="note" id="monitor-note"></div></div>
+  </section>
+
+  <section id="tab-backtest">
+    <div class="pad">
+      <div class="row">
+        <label for="queue-select">Queue assumption</label>
+        <select id="queue-select"><option value="both">both</option><option value="optimistic">optimistic</option><option value="pessimistic">pessimistic</option></select>
+        <label for="fee-input">Maker fee multiplier</label>
+        <select id="fee-input"><option value="both">both (0 and 0.25)</option><option value="0">0 (makers pay no fee)</option><option value="1">1 (makers pay the full fee)</option></select>
+        <button class="action" id="run-backtest">Run backtest</button>
+      </div>
+      <table id="backtest-table">
+        <thead><tr><th>Queue</th><th>Fee mult.</th><th>Trades</th><th>Win rate</th><th>Total PnL</th><th>Max drawdown</th><th>Trades/day</th><th>Beats trade-nothing?</th><th>Sample size</th></tr></thead>
+        <tbody></tbody></table>
+      <div class="note" id="backtest-note"></div>
+    </div>
+  </section>
+
+  <section id="tab-settings">
+    <div class="pad">
+      <p class="note">Stored only in the local settings file shown below, from your browser to this localhost server to that file. A key pasted anywhere else (a chat, an issue, a screenshot) should be treated as exposed and reissued.</p>
+      <div class="row">
+        <label><input type="radio" name="kalshi-env" value="demo"> Demo</label>
+        <label><input type="radio" name="kalshi-env" value="prod"> Live (prod)</label>
+      </div>
+      <div class="row"><label for="key-id-input">Key ID</label><input id="key-id-input" type="password" placeholder="leave blank to keep current value" size="36"></div>
+      <div class="row"><label for="key-path-input">Private key path</label><input id="key-path-input" placeholder="/path/to/key.pem" size="36"></div>
+      <div class="warn" id="prod-warn">Live (prod) is selected. Nothing in this repo can place orders yet, but keep this on Demo until Phase 6 is done and you mean it.</div>
+      <div class="row"><button class="action" id="save-settings">Save</button></div>
+      <div id="settings-status"></div>
+    </div>
+  </section>
+
+  <div class="foot">Local only: this page and everything it fetches stays on this machine. Read-only monitoring plus a local settings editor.</div>
 </div>
-
-<nav>
-  <button data-tab="monitor" class="active">Live / Paper monitor</button>
-  <button data-tab="backtest">Backtest</button>
-  <button data-tab="settings">Settings</button>
-</nav>
-
-<div class="row">
-  <label for="db-select">Database</label>
-  <select id="db-select"></select>
-  <button class="action" id="refresh-databases">Refresh list</button>
-</div>
-
-<section id="tab-monitor" class="active">
-  <div class="tiles" id="summary-tiles"></div>
-  <canvas id="pnl-chart" width="900" height="220"></canvas>
-  <table id="trades-table">
-    <thead><tr><th>Ticker</th><th>Side</th><th>Size</th><th>Entry price</th><th>Entry time (UTC)</th>
-      <th>Result</th><th>PnL (USD)</th></tr></thead>
-    <tbody></tbody>
-  </table>
-  <div class="note" id="monitor-note"></div>
-</section>
-
-<section id="tab-backtest">
-  <div class="row">
-    <label for="queue-select">Queue assumption</label>
-    <select id="queue-select">
-      <option value="both">both</option>
-      <option value="optimistic">optimistic</option>
-      <option value="pessimistic">pessimistic</option>
-    </select>
-    <label for="fee-input">Maker fee multiplier</label>
-    <input id="fee-input" value="both" size="8">
-    <button class="action" id="run-backtest">Run backtest</button>
-  </div>
-  <table id="backtest-table">
-    <thead><tr><th>Queue</th><th>Fee mult.</th><th>Trades</th><th>Win rate</th><th>Total PnL</th>
-      <th>Max drawdown</th><th>Trades/day</th><th>Beats trade-nothing?</th><th>Sample size</th></tr></thead>
-    <tbody></tbody>
-  </table>
-  <div class="note" id="backtest-note"></div>
-</section>
-
-<section id="tab-settings">
-  <p class="note">
-    Stored only in the local settings file shown below. Never sent anywhere except from your browser to this
-    localhost server, and this server only ever writes it to that file -- the same file every other
-    <code>btcbot</code> command reads via <code>KALSHI_ENV</code> / <code>KALSHI_KEY_ID</code> /
-    <code>KALSHI_PRIVATE_KEY_PATH</code>. A key pasted anywhere else (a chat, an issue, a screenshot) should
-    be treated as exposed and reissued, not reused.
-  </p>
-  <div class="row">
-    <label><input type="radio" name="kalshi-env" value="demo"> Demo</label>
-    <label><input type="radio" name="kalshi-env" value="prod"> Live (prod)</label>
-  </div>
-  <div class="row">
-    <label for="key-id-input">Key ID</label>
-    <input id="key-id-input" type="password" placeholder="leave blank to keep current value" size="36">
-  </div>
-  <div class="row">
-    <label for="key-path-input">Private key path</label>
-    <input id="key-path-input" placeholder="/path/to/key.pem" size="36">
-  </div>
-  <div class="row">
-    <button class="action" id="save-settings">Save</button>
-  </div>
-  <div id="settings-status"></div>
-</section>
 
 <script>
 const $ = (id) => document.getElementById(id);
+const $q = (sel) => document.querySelector(sel);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
 function fmtUsd(value) {
   if (value === null || value === undefined) return "--";
   const n = Number(value);
-  const cls = n > 0 ? "pnl-pos" : n < 0 ? "pnl-neg" : "";
-  return `<span class="${cls}">$${n.toFixed(2)}</span>`;
+  return `<span class="${n > 0 ? "pnl-pos" : n < 0 ? "pnl-neg" : ""}">${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}</span>`;
 }
-function fmtPct(value) {
-  return value === null || value === undefined ? "--" : (Number(value) * 100).toFixed(1) + "%";
-}
+const fmtPct = (v) => (v === null || v === undefined ? "--" : (Number(v) * 100).toFixed(1) + "%");
+const cents = (p) => (p === null || p === undefined || p === "" ? "--" : Number((Number(p) * 100).toFixed(1)) + "¢");
+const num = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
 async function getJson(url) {
   const res = await fetch(url);
@@ -474,50 +643,190 @@ async function getJson(url) {
   return data;
 }
 
+function drawSeries(canvas, points, opts) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = Number(canvas.getAttribute("height"));
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr); ctx.clearRect(0, 0, w, h);
+  ctx.font = "11px sans-serif";
+  if (points.length < 2) {
+    ctx.fillStyle = css("--muted"); ctx.fillText(opts.empty || "Not enough data yet.", 10, 22); return;
+  }
+  const padL = 6, padR = 60, padT = 10, padB = 22;
+  const xs = points.map((p) => p[0]), ys = points.map((p) => p[1]);
+  let lo = Math.min(...ys, ...(opts.include || [])), hi = Math.max(...ys, ...(opts.include || []));
+  if (opts.min !== undefined) lo = Math.min(lo, opts.min);
+  if (opts.max !== undefined) hi = Math.max(hi, opts.max);
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const x0 = xs[0], x1 = xs[xs.length - 1] === x0 ? x0 + 1 : xs[xs.length - 1];
+  const X = (x) => padL + ((x - x0) / (x1 - x0)) * (w - padL - padR);
+  const Y = (y) => padT + (1 - (y - lo) / (hi - lo)) * (h - padT - padB);
+  ctx.strokeStyle = css("--line"); ctx.fillStyle = css("--muted"); ctx.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const y = lo + ((hi - lo) * i) / 3;
+    ctx.beginPath(); ctx.moveTo(padL, Y(y)); ctx.lineTo(w - padR, Y(y)); ctx.stroke();
+    ctx.fillText(opts.yfmt(y), w - padR + 6, Y(y) + 4);
+  }
+  const xTicks = Math.max(1, Math.min(3, Math.floor((w - padL - padR) / 95)));
+  for (let i = 0; i <= xTicks; i++) {
+    const x = x0 + ((x1 - x0) * i) / xTicks;
+    const lbl = new Date(x).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: opts.seconds ? "2-digit" : undefined });
+    ctx.fillText(lbl, Math.max(padL, Math.min(X(x) - 22, w - padR - 58)), h - 6);
+  }
+  (opts.lines || []).forEach((l) => {
+    ctx.setLineDash([2, 3]); ctx.strokeStyle = l.color; ctx.beginPath();
+    ctx.moveTo(padL, Y(l.y)); ctx.lineTo(w - padR, Y(l.y)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = l.color; ctx.fillText(l.label, padL + 4, Y(l.y) - 4);
+  });
+  const path = () => {
+    ctx.beginPath();
+    points.forEach((p, i) => {
+      const x = X(p[0]), y = Y(p[1]);
+      if (i === 0) ctx.moveTo(x, y);
+      else if (opts.step) { ctx.lineTo(x, Y(points[i - 1][1])); ctx.lineTo(x, y); } else ctx.lineTo(x, y);
+    });
+  };
+  if (opts.fill) {
+    path(); ctx.lineTo(X(x1), h - padB); ctx.lineTo(X(x0), h - padB); ctx.closePath();
+    const g = ctx.createLinearGradient(0, padT, 0, h - padB);
+    g.addColorStop(0, opts.color + "66"); g.addColorStop(1, opts.color + "00");
+    ctx.fillStyle = g; ctx.fill();
+  }
+  path(); ctx.strokeStyle = opts.color; ctx.lineWidth = 2; ctx.stroke();
+  const last = points[points.length - 1];
+  ctx.fillStyle = opts.color; ctx.beginPath(); ctx.arc(X(last[0]), Y(last[1]), 3.5, 0, 7); ctx.fill();
+}
+
+let market = null, side = "yes";
+
+const KIND_LABELS = { paper: "Paper trading", recorder: "Data recording", stream: "BRTI + book stream", unknown: "Data file" };
+function dbLabel(db) {
+  const m = /^[a-z]+-[A-Z0-9]+-(demo|prod)-/.exec(db.name);
+  const env = m ? m[1].toUpperCase() : "";
+  const when = new Date(db.modified_ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const mb = db.size_bytes / 1048576;
+  return `${KIND_LABELS[db.kind] || KIND_LABELS.unknown}${env ? " \u00b7 " + env : ""} \u00b7 ${when} \u00b7 ${mb < 0.1 ? "<0.1" : mb.toFixed(1)} MB`;
+}
+
+function windowLabel(w, isLatest) {
+  const close = w.close_time ? new Date(w.close_time) : null;
+  const time = close ? close.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : w.ticker;
+  const state = close && close > Date.now() ? "live" : w.result ? "settled " + w.result.toUpperCase() : "closed";
+  return `${time} close \u00b7 ${state}` + (w.trades ? ` \u00b7 ${w.trades} trade${w.trades > 1 ? "s" : ""}` : "");
+}
+
 async function refreshDatabases() {
   const { databases } = await getJson("/api/databases");
-  const select = $("db-select");
-  const previous = select.value;
-  select.innerHTML = "";
-  for (const db of databases) {
+  const select = $("db-select"), previous = select.value;
+  select.innerHTML = databases.length ? "" : '<option value="">(no data files yet - run btcbot paper or record)</option>';
+  databases.forEach((db, i) => {
     const opt = document.createElement("option");
-    opt.value = db.name;
-    opt.textContent = `${db.name} (${db.kind})`;
-    select.appendChild(opt);
-  }
+    opt.value = db.name; opt.textContent = dbLabel(db) + (i === 0 ? "  (newest)" : ""); select.appendChild(opt);
+  });
   if (databases.some((db) => db.name === previous)) select.value = previous;
   return databases;
 }
 
+function ladder(levels, isAsk) {
+  const sorted = levels.slice().sort((a, b) => (isAsk ? a[0] - b[0] : b[0] - a[0]));
+  let run = 0;
+  const rows = sorted.map(([p, s]) => { run += p * s; return { p, s, t: run }; });
+  const max = Math.max(1, ...rows.map((r) => r.s));
+  const shown = isAsk ? rows.slice(0, 10).reverse() : rows.slice(0, 10);
+  return shown.map((r) => `<div class="lrow ${isAsk ? "ask" : "bid"}"><div class="bar" style="width:${(r.s / max) * 100}%"></div>
+    <span class="p">${cents(r.p)}</span><span>${num(r.s)}</span><span>${num(r.t)}</span></div>`).join("")
+    || `<div class="empty">no ${isAsk ? "asks" : "bids"}</div>`;
+}
+
+function renderBook() {
+  if (!market || !market.book) return;
+  const yesBids = market.book.yes.map(([p, s]) => [Number(p), Number(s)]);
+  const noBids = market.book.no.map(([p, s]) => [Number(p), Number(s)]);
+  const ownBids = side === "yes" ? yesBids : noBids, otherBids = side === "yes" ? noBids : yesBids;
+  const asks = otherBids.map(([p, s]) => [1 - p, s]);
+  $("asks").innerHTML = ladder(asks, true);
+  $("bids").innerHTML = ladder(ownBids, false);
+  const bestBid = ownBids.length ? Math.max(...ownBids.map((l) => l[0])) : null;
+  const bestAsk = asks.length ? Math.min(...asks.map((l) => l[0])) : null;
+  $("mid-price").textContent = bestBid !== null && bestAsk !== null ? cents((bestBid + bestAsk) / 2) : "--";
+  $("mid-price").className = "big " + (side === "yes" ? "green" : "red");
+  $("mid-spread").textContent = bestBid !== null && bestAsk !== null ? "SPREAD: " + cents(bestAsk - bestBid) : "";
+  const yb = yesBids.length ? Math.max(...yesBids.map((l) => l[0])) : null;
+  const nb = noBids.length ? Math.max(...noBids.map((l) => l[0])) : null;
+  $("q-yes").textContent = "Yes " + (nb !== null ? cents(1 - nb) : "--");
+  $("q-no").textContent = "No " + (yb !== null ? cents(1 - yb) : "--");
+  $("st-spread").textContent = yb !== null && nb !== null ? cents(1 - nb - yb) : "--";
+}
+
+function updateAge() {
+  const el = $("st-age");
+  if (!el || !market || !market.book_ts) return;
+  const age = (Date.now() - new Date(market.book_ts).getTime()) / 1000;
+  el.textContent = age < 60 ? age.toFixed(1) + "s" : "stale (" + Math.round(age / 60) + "m)";
+  el.className = age < 3 ? "green" : age < 10 ? "orange" : "red";
+}
+
+function timeLeft() {
+  if (!market || !market.close_time) return { text: "--", live: false };
+  const ms = new Date(market.close_time) - Date.now();
+  if (ms <= 0) return { text: "closed", live: false };
+  return { text: `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`, live: true };
+}
+
+async function refreshMarket() {
+  const db = $("db-select").value, note = $("market-note");
+  if (!db) { note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record, then click Refresh."; return; }
+  try {
+    const t = $("ticker-select").value;
+    market = await getJson(`/api/market?db=${encodeURIComponent(db)}` + (t ? `&ticker=${encodeURIComponent(t)}` : ""));
+    note.className = "note"; note.textContent = "";
+    const sel = $("ticker-select"), chosen = sel.value;
+    sel.innerHTML = '<option value="">Latest window (follows automatically)</option>' +
+      market.windows.map((w) => `<option value="${esc(w.ticker)}">${esc(windowLabel(w))}</option>`).join("");
+    sel.value = market.windows.some((w) => w.ticker === chosen) ? chosen : "";
+    if (!market.ticker) { note.textContent = "This database has no order-book snapshots yet."; return; }
+    const strike = market.strike ? Number(market.strike) : null;
+    $("hdr-title").textContent = "BTC 15 min" + (strike ? " · $" + num(strike) + " target" : "");
+    $("hdr-sub").innerHTML = `Target price: <b>${strike ? "$" + num(strike) : "--"}</b> · <b>${esc(market.ticker)}</b>`;
+    const tl = timeLeft();
+    $("hdr-badge").textContent = tl.live ? "LIVE" : "CLOSED";
+    $("hdr-badge").className = "badge " + (tl.live ? "live" : "closed");
+    $("st-vol").textContent = market.volume ? num(market.volume) : "--";
+    $("st-oi").textContent = market.open_interest ? num(market.open_interest) : "--";
+    $("st-left").textContent = tl.text;
+    updateAge();
+    $("st-ts").textContent = market.book_ts ? new Date(market.book_ts).toLocaleTimeString() : "--";
+    $("f-exp").textContent = market.close_time ? new Date(market.close_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--";
+    $("f-strike").textContent = strike ? "$" + num(strike) : "--";
+    const spot = market.spot ? Number(market.spot) : null;
+    $("f-spot").innerHTML = spot ? `<span class="orange">$${num(spot)}</span>` + (strike ? ` <span class="${spot >= strike ? "green" : "red"}" style="font-size:11px">${spot >= strike ? "+" : "-"}$${num(Math.abs(spot - strike))}</span>` : "") : "--";
+    renderBook();
+    const toMs = (s) => new Date(s).getTime();
+    drawSeries($("mid-chart"), market.mid_series.filter((r) => r[1] !== null && r[2] !== null)
+      .map((r) => [toMs(r[0]), (Number(r[1]) + Number(r[2])) / 2 * 100]),
+      { color: css("--green"), step: true, yfmt: (v) => v.toFixed(1), min: 0, max: 100, seconds: true, empty: "No YES price history yet." });
+    drawSeries($("spot-chart"), market.spot_series.map((r) => [toMs(r[0]), Number(r[1])]),
+      { color: css("--orange"), fill: true, seconds: true, yfmt: (v) => "$" + num(v), include: strike ? [strike] : [],
+        lines: strike ? [{ y: strike, color: css("--muted"), label: "Target: $" + num(strike) }] : [], empty: "No spot ticks recorded for this window." });
+    $("spot-note").textContent = "Spot is the Coinbase BTC-USD proxy the model uses, not Kalshi's BRTI.";
+    $q("#win-trades tbody").innerHTML = market.trades.length ? market.trades.map((x) => `<tr><td>${esc(x.side)}</td><td>${esc(x.size)}</td>
+      <td>${cents(x.entry_price)}</td><td>${esc(x.result ?? "pending")}</td><td>${fmtUsd(x.pnl_usd)}</td></tr>`).join("")
+      : '<tr><td colspan="5" class="empty">No paper trades in this window.</td></tr>';
+    $("settle").textContent = market.settlement && market.settlement.result
+      ? `Result: ${market.settlement.result.toUpperCase()}` + (market.settlement.settled_avg ? ` · settled avg $${num(market.settlement.settled_avg)}` : "")
+      : "Not settled yet.";
+  } catch (err) { note.className = "error"; note.textContent = "Error: " + err.message; }
+}
+
 function drawPnlChart(points) {
-  const canvas = $("pnl-chart");
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (points.length < 2) {
-    ctx.fillStyle = "#9aa4b2";
-    ctx.fillText("Not enough resolved trades yet for a chart.", 10, 20);
-    return;
-  }
-  const values = points.map((p) => Number(p.cumulative_pnl_usd));
-  const min = Math.min(0, ...values), max = Math.max(0, ...values);
-  const pad = 24;
-  const xStep = (canvas.width - 2 * pad) / (points.length - 1);
-  const yScale = (canvas.height - 2 * pad) / ((max - min) || 1);
-  const yOf = (v) => canvas.height - pad - (v - min) * yScale;
-  ctx.strokeStyle = "#3a4152"; ctx.beginPath();
-  ctx.moveTo(pad, yOf(0)); ctx.lineTo(canvas.width - pad, yOf(0)); ctx.stroke();
-  ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 2; ctx.beginPath();
-  values.forEach((v, i) => {
-    const x = pad + i * xStep, y = yOf(v);
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
-  ctx.stroke();
+  drawSeries($("pnl-chart"), points.map((p) => [new Date(p.ts).getTime(), Number(p.cumulative_pnl_usd)]),
+    { color: css("--blue"), fill: true, yfmt: (v) => "$" + v.toFixed(2), min: 0, max: 0, empty: "Not enough resolved trades yet for a chart." });
 }
 
 async function refreshMonitor() {
-  const db = $("db-select").value;
-  const note = $("monitor-note");
-  if (!db) { note.textContent = "No databases found in the data directory yet."; return; }
+  const db = $("db-select").value, note = $("monitor-note");
+  if (!db) { note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record first, then click Refresh."; return; }
   try {
     const s = await getJson(`/api/paper_summary?db=${encodeURIComponent(db)}`);
     note.textContent = "";
@@ -527,47 +836,44 @@ async function refreshMonitor() {
       ["Windows seen", s.windows_seen], ["Windows traded", s.windows_traded],
     ].map(([label, value]) => `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
     drawPnlChart(s.cumulative_pnl);
-    $("trades-table tbody").innerHTML = s.trades.map((t) => `<tr>
-      <td>${t.ticker}</td><td>${t.side}</td><td>${t.size}</td><td>${t.entry_price}</td>
-      <td>${t.entry_ts}</td><td>${t.result ?? "pending"}</td><td>${fmtUsd(t.pnl_usd)}</td></tr>`).join("");
-  } catch (err) {
-    note.textContent = `Error: ${err.message}`;
-  }
+    $q("#trades-table tbody").innerHTML = s.trades.length ? s.trades.map((t) => `<tr>
+      <td>${esc(t.ticker)}</td><td>${esc(t.side)}</td><td>${esc(t.size)}</td><td>${esc(t.entry_price)}</td>
+      <td>${esc(t.entry_ts)}</td><td>${esc(t.result ?? "pending")}</td><td>${fmtUsd(t.pnl_usd)}</td></tr>`).join("")
+      : '<tr><td colspan="7" class="empty">No trades yet in this database. That is normal for a short run or a quiet market.</td></tr>';
+  } catch (err) { note.className = "error"; note.textContent = `Error: ${err.message}`; }
 }
 
 async function runBacktest() {
-  const db = $("db-select").value;
-  const note = $("backtest-note");
-  if (!db) { note.textContent = "No databases found in the data directory yet."; return; }
-  const queue = $("queue-select").value;
-  const fee = $("fee-input").value || "both";
-  note.textContent = "Running...";
+  const db = $("db-select").value, note = $("backtest-note");
+  if (!db) { note.className = "error"; note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record first, then click Refresh."; return; }
+  note.className = "note"; note.textContent = "Running backtest..."; $("run-backtest").disabled = true;
   try {
-    const { reports } = await getJson(
-      `/api/backtest?db=${encodeURIComponent(db)}&queue=${queue}&maker_fee_multiplier=${encodeURIComponent(fee)}`
-    );
-    note.textContent = "";
-    $("backtest-table tbody").innerHTML = reports.map((r) => `<tr>
-      <td>${r.queue_assumption}</td><td>${r.maker_fee_multiplier}</td><td>${r.trades}</td>
+    const { reports } = await getJson(`/api/backtest?db=${encodeURIComponent(db)}&queue=${$("queue-select").value}&maker_fee_multiplier=${encodeURIComponent($("fee-input").value)}`);
+    $q("#backtest-table tbody").innerHTML = reports.length ? reports.map((r) => `<tr>
+      <td>${esc(r.queue_assumption)}</td><td>${esc(r.maker_fee_multiplier)}</td><td>${esc(r.trades)}</td>
       <td>${fmtPct(r.win_rate)}</td><td>${fmtUsd(r.total_pnl_usd)}</td><td>${fmtUsd(r.max_drawdown_usd)}</td>
       <td>${r.trades_per_day === null ? "--" : Number(r.trades_per_day).toFixed(2)}</td>
       <td>${r.beats_trade_nothing === null ? "n/a" : (r.beats_trade_nothing ? "yes" : "no")}</td>
-      <td>${r.sample_size_note}</td></tr>`).join("");
-  } catch (err) {
-    note.textContent = `Error: ${err.message}`;
-  }
+      <td>${esc(r.sample_size_note)}</td></tr>`).join("")
+      : '<tr><td colspan="9" class="empty">The backtest returned no rows.</td></tr>';
+    note.className = "note";
+    note.textContent = "Done. " + reports.length + " scenario(s). Results come from recorded data only, so treat small samples as noise.";
+  } catch (err) { note.className = "error"; note.textContent = `Error: ${err.message}`; }
+  finally { $("run-backtest").disabled = false; }
 }
 
 async function loadSettings() {
   const s = await getJson("/api/settings");
-  document.querySelector(`input[name="kalshi-env"][value="${s.kalshi_env}"]`).checked = true;
+  const radio = document.querySelector(`input[name="kalshi-env"][value="${s.kalshi_env}"]`) || document.querySelector('input[name="kalshi-env"][value="demo"]');
+  radio.checked = true;
+  $("prod-warn").style.display = radio.value === "prod" ? "block" : "none";
   $("key-id-input").placeholder = s.key_id_set ? `current key ends in ...${s.key_id_last4}` : "not set";
   $("key-path-input").value = s.private_key_path || "";
-  $("settings-status").innerHTML = `<div class="note">Settings file: ${s.env_file}${s.env_file_exists ? "" : " (does not exist yet -- Save will create it)"}</div>`;
+  $("settings-status").innerHTML = `<div class="note">Settings file: ${esc(s.env_file)}${s.env_file_exists ? "" : " (does not exist yet -- Save will create it)"}</div>`;
 }
 
 async function saveSettings() {
-  const payload = { kalshi_env: document.querySelector('input[name="kalshi-env"]:checked').value };
+  const payload = { kalshi_env: $q('input[name="kalshi-env"]:checked').value };
   if ($("key-id-input").value) payload.key_id = $("key-id-input").value;
   if ($("key-path-input").value) payload.private_key_path = $("key-path-input").value;
   const status = $("settings-status");
@@ -578,28 +884,49 @@ async function saveSettings() {
     $("key-id-input").value = "";
     status.innerHTML = '<div class="ok">Saved.</div>';
     await loadSettings();
-  } catch (err) {
-    status.innerHTML = `<div class="error">Error: ${err.message}</div>`;
-  }
+  } catch (err) { status.innerHTML = `<div class="error">Error: ${esc(err.message)}</div>`; }
 }
 
+let tab = "market";
+let refreshing = false;
+async function refreshTab() {
+  if (refreshing) return;  // a slow response must not pile up requests behind it
+  refreshing = true;
+  try {
+    if (tab === "market") await refreshMarket(); else if (tab === "monitor") await refreshMonitor();
+  } finally { refreshing = false; }
+}
 document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("click", () => {
-  document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
-  document.querySelectorAll("section").forEach((s) => s.classList.remove("active"));
-  btn.classList.add("active");
-  $(`tab-${btn.dataset.tab}`).classList.add("active");
-  if (btn.dataset.tab === "monitor") refreshMonitor();
+  tab = btn.dataset.tab;
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
+  document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === `tab-${tab}`));
+  $("db-row").style.display = tab === "settings" ? "none" : "";
+  $("pickhelp").style.display = tab === "settings" ? "none" : "";
+  $q("#ticker-select").parentElement.style.display = tab === "market" ? "" : "none";
+  refreshTab();
 }));
-$("refresh-databases").addEventListener("click", async () => { await refreshDatabases(); refreshMonitor(); });
-$("db-select").addEventListener("change", refreshMonitor);
+document.querySelectorAll("#side-toggle button").forEach((b) => b.addEventListener("click", () => {
+  side = b.dataset.side;
+  document.querySelectorAll("#side-toggle button").forEach((x) => x.classList.toggle("on", x === b));
+  $("side-toggle").classList.toggle("no", side === "no");
+  renderBook();
+}));
+$("refresh-databases").addEventListener("click", async () => { await refreshDatabases(); refreshTab(); });
+$("db-select").addEventListener("change", () => { $("ticker-select").innerHTML = ""; refreshTab(); });
+$("ticker-select").addEventListener("change", refreshTab);
 $("run-backtest").addEventListener("click", runBacktest);
 $("save-settings").addEventListener("click", saveSettings);
+document.querySelectorAll('input[name="kalshi-env"]').forEach((r) => r.addEventListener("change", () => {
+  $("prod-warn").style.display = $q('input[name="kalshi-env"]:checked').value === "prod" ? "block" : "none";
+}));
+window.addEventListener("resize", () => { if (tab === "market" || tab === "monitor") refreshTab(); });
 
 (async function init() {
-  await refreshDatabases();
-  await refreshMonitor();
-  await loadSettings();
-  setInterval(() => { if ($("tab-monitor").classList.contains("active")) refreshMonitor(); }, 5000);
+  try { await refreshDatabases(); } catch (e) { $("market-note").textContent = "Error: " + e.message; }
+  await refreshMarket();
+  try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
+  setInterval(() => { if (tab === "market" || tab === "monitor") refreshTab(); }, 1000);
+  setInterval(updateAge, 200);
 })();
 </script>
 </body>
