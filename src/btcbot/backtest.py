@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from bisect import bisect_right
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -25,7 +27,7 @@ from btcbot.model import TimedVolatility, ModelState, predict
 from btcbot.models import OrderBook, ParseError, PriceLevel, Side, parse_time
 from btcbot.paper_broker import PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, decide
+from btcbot.strategy import Action, Decision, decide
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -188,35 +190,206 @@ def load_trades(conn: sqlite3.Connection) -> list[TradeRecord]:
 # --------------------------------------------------------------------------- replay
 
 
-def run_backtest(
-    conn: sqlite3.Connection,
+# --------------------------------------------------------------------------- replay data and steps
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayData:
+    """Everything a replay reads, loaded once so a parameter sweep does not re-parse JSON per combination."""
+
+    snapshots: list[Snapshot]
+    windows: dict[str, tuple[Decimal, datetime]]
+    settlements: dict[str, Side]
+    spot_ticks: list[tuple[datetime, Decimal]]
+
+
+def load_replay_data(conn: sqlite3.Connection) -> ReplayData:
+    return ReplayData(load_snapshots(conn), load_windows(conn), load_settlements(conn), load_spot_ticks(conn))
+
+
+def merge_replay_data(parts: Sequence[ReplayData]) -> ReplayData:
+    """Combine several recordings into one chronological replay.
+
+    Two recorders running at once both capture the same window; replaying both would double-count it and
+    interleave two different book histories. So a ticker present in several parts is taken whole from the
+    part that captured the most snapshots of it, and a later part's spot ticks are used only outside the
+    time span an earlier part already covers."""
+    if not parts:
+        raise BacktestError("no data to merge")
+    best_part: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    for i, part in enumerate(parts):
+        per_ticker: dict[str, int] = {}
+        for snap in part.snapshots:
+            per_ticker[snap.ticker] = per_ticker.get(snap.ticker, 0) + 1
+        for ticker, n in per_ticker.items():
+            if n > counts.get(ticker, 0):
+                counts[ticker], best_part[ticker] = n, i
+    snapshots = [s for i, part in enumerate(parts) for s in part.snapshots if best_part[s.ticker] == i]
+    snapshots.sort(key=lambda s: s.poll_ts)
+
+    windows: dict[str, tuple[Decimal, datetime]] = {}
+    settlements: dict[str, Side] = {}
+    for part in parts:
+        windows.update(part.windows)
+        settlements.update(part.settlements)
+
+    spot: list[tuple[datetime, Decimal]] = []
+    covered: list[tuple[datetime, datetime]] = []
+    for part in sorted(parts, key=lambda p: len(p.spot_ticks), reverse=True):
+        if not part.spot_ticks:
+            continue
+        spot.extend(t for t in part.spot_ticks if not any(a <= t[0] <= b for a, b in covered))
+        covered.append((part.spot_ticks[0][0], part.spot_ticks[-1][0]))
+    spot.sort(key=lambda t: t[0])
+    return ReplayData(snapshots, windows, settlements, spot)
+
+
+@dataclass(frozen=True, slots=True)
+class Step:
+    """One order-book snapshot with the model's view of it already computed (it does not depend on any
+    strategy parameter except ``model_blend``, so a sweep prepares steps once per blend value)."""
+
+    snap: Snapshot
+    active: bool  # False: strike unknown or already past close; only the window change is processed
+    tau_sec: float
+    p_yes: float
+    stale: bool
+    spot: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedReplay:
+    steps: list[Step]
+    windows_seen: int
+    first_ts: datetime
+    last_ts: datetime
+    settlements: dict[str, Side]
+    spot_series: SpotSeries
+
+
+class SpotSeries:
+    """Spot prices by time, for the trend filter's "how far has spot moved over the last N seconds"."""
+
+    def __init__(self, ticks: Sequence[tuple[datetime, Decimal]]) -> None:
+        self._t = [ts.timestamp() for ts, _ in ticks]
+        self._p = [price for _, price in ticks]
+
+    def move(self, ts: datetime, lookback_sec: float) -> Decimal | None:
+        """Price at ``ts`` minus price ``lookback_sec`` earlier, or None without enough history (the older
+        reference tick must be within 5 s of the lookback point, so a gap in the feed yields no signal
+        rather than a stale one)."""
+        now = ts.timestamp()
+        hi = bisect_right(self._t, now) - 1
+        lo = bisect_right(self._t, now - lookback_sec) - 1
+        if hi < 0 or lo < 0 or (now - lookback_sec) - self._t[lo] > 5:
+            return None
+        return self._p[hi] - self._p[lo]
+
+
+def prepare_replay(
+    data: ReplayData, config: BotConfig, *, tickers: set[str] | None = None, model_blend: float | None = None
+) -> PreparedReplay:
+    """Walk the snapshots once, carrying volatility across windows, and record what the model says at each.
+    ``tickers`` restricts which windows are replayed (a train/test split) while every spot tick still feeds
+    the volatility estimate, exactly as it would have live."""
+    snapshots = [s for s in data.snapshots if tickers is None or s.ticker in tickers]
+    if not snapshots:
+        raise BacktestError("no order-book snapshots to replay")
+    blend = float(config.model_blend if model_blend is None else model_blend)
+    vol = TimedVolatility(config.vol_window_sec)
+    spot_ticks = data.spot_ticks
+    spot_idx = 0
+    last_price: Decimal | None = None
+    last_ts: datetime | None = None
+    steps: list[Step] = []
+    for snap in snapshots:
+        while spot_idx < len(spot_ticks) and spot_ticks[spot_idx][0] <= snap.poll_ts:
+            ts, price = spot_ticks[spot_idx]
+            vol.update(price, ts)
+            last_price, last_ts = price, ts
+            spot_idx += 1
+        if last_price is None or last_ts is None:
+            continue  # no spot data yet: cannot price anything
+        window = data.windows.get(snap.ticker)
+        tau_sec = (window[1] - snap.poll_ts).total_seconds() if window else 0.0
+        if window is None or tau_sec <= 0:
+            steps.append(Step(snap, False, tau_sec, 0.5, True, last_price))
+            continue
+        state = ModelState(
+            spot=last_price, strike=window[0], tau_sec=tau_sec, sigma=vol.sigma, market_mid=snap.book.mid("yes")
+        )
+        _, p_blend = predict(state, blend=blend)
+        stale = (snap.poll_ts - last_ts).total_seconds() > 3 or not vol.ready or tau_sec <= 60
+        steps.append(Step(snap, True, tau_sec, p_blend, stale, last_price))
+    return PreparedReplay(
+        steps=steps,
+        windows_seen=len({s.ticker for s in snapshots}),
+        first_ts=snapshots[0].poll_ts,
+        last_ts=snapshots[-1].poll_ts,
+        settlements=data.settlements,
+        spot_series=SpotSeries(spot_ticks),
+    )
+
+
+# --------------------------------------------------------------------------- optional entry filters (the lab)
+
+
+@dataclass(frozen=True, slots=True)
+class EntryFilters:
+    """Extra conditions layered on top of :func:`btcbot.strategy.decide`. All off by default, in which case a
+    replay is exactly the plain backtest.
+
+    ``trend_mode``: ``"with"`` only takes a side spot has been moving toward over ``trend_lookback_sec``
+    (at least ``trend_min_move_usd``), ``"against"`` only the side it has been moving away from (a
+    mean-reversion bet). ``account_usd`` + ``risk_pct_per_trade`` size each order as that fraction of the
+    current bankroll (starting account plus settled PnL, less capital already at risk), rounded down to
+    whole contracts; sizing never depends on a prior loss being "made back"."""
+
+    min_price: Decimal | None = None
+    max_price: Decimal | None = None
+    trend_mode: str = "off"
+    trend_lookback_sec: int = 60
+    trend_min_move_usd: Decimal = Decimal(0)
+    account_usd: Decimal | None = None
+    risk_pct_per_trade: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayResult:
+    trades: list[TradeRecord]
+    windows_traded: set[str]
+    windows_seen: int
+    first_ts: datetime
+    last_ts: datetime
+    filter_counts: dict[str, int]
+    final_bankroll: Decimal | None
+    equity_curve: list[tuple[datetime, Decimal]]
+
+
+def replay_prepared(
+    prepared: PreparedReplay,
     config: BotConfig,
     *,
     queue_assumption: QueueAssumption = QueueAssumption.OPTIMISTIC,
     maker_fee_multiplier: Decimal = Decimal("0"),
-) -> BacktestReport:
-    snapshots = load_snapshots(conn)
-    if not snapshots:
-        raise BacktestError("no order-book snapshots to replay")
-    windows = load_windows(conn)
-    settlements = load_settlements(conn)
-    spot_ticks = load_spot_ticks(conn)
-
+    filters: EntryFilters | None = None,
+) -> ReplayResult:
+    steps, settlements = prepared.steps, prepared.settlements
     broker = PaperBroker(maker_fee_multiplier=maker_fee_multiplier, queue_assumption=queue_assumption)
-    risk = RiskManager(config.risk, kill_file=_NO_KILL_FILE, clock=lambda: snapshots[0].poll_ts)
-    vol = TimedVolatility(config.vol_window_sec)
+    risk = RiskManager(config.risk, kill_file=_NO_KILL_FILE, clock=lambda: prepared.first_ts)
 
-    spot_idx = 0
-    last_spot_price: Decimal | None = None
-    last_spot_ts: datetime | None = None
     current_ticker: str | None = None
     resting_order_id: str | None = None
     position: TradeRecord | None = None
     trades: list[TradeRecord] = []
     windows_traded: set[str] = set()
+    counts = {"price_band": 0, "trend": 0, "too_small": 0, "risk_blocked": 0}
+    bankroll = filters.account_usd if filters is not None else None
+    equity: list[tuple[datetime, Decimal]] = []
 
     def finalize_window(ticker: str, ts: datetime) -> None:
-        nonlocal resting_order_id, position
+        nonlocal resting_order_id, position, bankroll
         if resting_order_id is not None:
             order = broker.get_order(resting_order_id)
             unfilled = order.remaining_size
@@ -238,34 +411,50 @@ def run_backtest(
                 risk.record_trade_closed(
                     TradeOutcome(ts=ts, size=position.size, pnl_usd=pnl), exposure_released_usd=exposure
                 )
+                if bankroll is not None:
+                    bankroll += pnl
+                    equity.append((ts, bankroll))
             position = None
 
-    for snap in snapshots:
-        while spot_idx < len(spot_ticks) and spot_ticks[spot_idx][0] <= snap.poll_ts:
-            ts, price = spot_ticks[spot_idx]
-            vol.update(price, ts)
-            last_spot_price = price
-            last_spot_ts = ts
-            spot_idx += 1
-        if last_spot_price is None:
-            continue  # no spot data yet: cannot price anything
+    def screen(decision: Decision, ts: datetime) -> Decision | None:
+        """Apply the lab's filters and sizing to a proposed resting order; None means do not place it."""
+        if filters is None:
+            return decision
+        price = decision.price
+        if (filters.min_price is not None and price < filters.min_price) or (
+            filters.max_price is not None and price > filters.max_price
+        ):
+            counts["price_band"] += 1
+            return None
+        if filters.trend_mode != "off":
+            move = prepared.spot_series.move(ts, filters.trend_lookback_sec)
+            toward_yes = move is not None and move >= filters.trend_min_move_usd
+            toward_no = move is not None and move <= -filters.trend_min_move_usd
+            wanted = toward_yes if decision.side == "yes" else toward_no
+            if filters.trend_mode == "against":
+                wanted = toward_no if decision.side == "yes" else toward_yes
+            if not wanted:
+                counts["trend"] += 1
+                return None
+        if bankroll is not None and filters.risk_pct_per_trade is not None:
+            cash = bankroll - risk.open_exposure_usd
+            contracts = int((max(cash, Decimal(0)) * filters.risk_pct_per_trade) / price)
+            contracts = min(contracts, config.risk.max_contracts_per_trade)
+            if contracts < 1:
+                counts["too_small"] += 1
+                return None
+            return replace(decision, size=Decimal(contracts))
+        return decision
 
+    for step in steps:
+        snap = step.snap
         if snap.ticker != current_ticker:
             if current_ticker is not None:
                 finalize_window(current_ticker, snap.poll_ts)
             current_ticker = snap.ticker
-
-        if snap.ticker not in windows:
-            continue  # strike not yet known for this ticker
-        strike, close_time = windows[snap.ticker]
-        tau_sec = (close_time - snap.poll_ts).total_seconds()
-        if tau_sec <= 0:
-            continue  # a stray snapshot polled after close
-
-        state = ModelState(
-            spot=last_spot_price, strike=strike, tau_sec=tau_sec, sigma=vol.sigma, market_mid=snap.book.mid("yes")
-        )
-        _, p_blend = predict(state, blend=float(config.model_blend))
+        if not step.active:
+            continue
+        p_blend = step.p_yes
 
         if resting_order_id is not None:
             for fill in broker.on_book_update(snap.book, ts=snap.poll_ts):
@@ -289,9 +478,9 @@ def run_backtest(
 
         decision = decide(
             book=snap.book,
-            tau_sec=tau_sec,
+            tau_sec=step.tau_sec,
             p_yes=p_blend,
-            spot_is_stale=(snap.poll_ts - last_spot_ts).total_seconds() > 3 or not vol.ready or tau_sec <= 60,
+            spot_is_stale=step.stale,
             min_edge=config.min_edge,
             min_depth=config.min_depth,
             max_spread=config.max_spread,
@@ -305,12 +494,16 @@ def run_backtest(
         )
 
         if decision.action is Action.REST:
-            approval = risk.check_new_order(size=decision.size, price=decision.price, now=snap.poll_ts)
-            if approval.approved:
-                resting_order_id = broker.place_resting_order(
-                    decision.side, decision.price, decision.size, ts=snap.poll_ts, book=snap.book
-                )
-                risk.record_order_opened(size=decision.size, price=decision.price, now=snap.poll_ts)
+            screened = screen(decision, snap.poll_ts)
+            if screened is not None:
+                approval = risk.check_new_order(size=screened.size, price=screened.price, now=snap.poll_ts)
+                if approval.approved:
+                    resting_order_id = broker.place_resting_order(
+                        screened.side, screened.price, screened.size, ts=snap.poll_ts, book=snap.book
+                    )
+                    risk.record_order_opened(size=screened.size, price=screened.price, now=snap.poll_ts)
+                else:
+                    counts["risk_blocked"] += 1
         elif decision.action is Action.CANCEL and resting_order_id is not None:
             order = broker.get_order(resting_order_id)
             unfilled = order.remaining_size
@@ -320,14 +513,40 @@ def run_backtest(
             resting_order_id = None
 
     if current_ticker is not None:
-        finalize_window(current_ticker, snapshots[-1].poll_ts)
+        finalize_window(current_ticker, prepared.last_ts)
 
-    return build_report(
-        trades,
-        windows_seen=len({s.ticker for s in snapshots}),
+    return ReplayResult(
+        trades=trades,
         windows_traded=windows_traded,
-        first_ts=snapshots[0].poll_ts,
-        last_ts=snapshots[-1].poll_ts,
+        windows_seen=prepared.windows_seen,
+        first_ts=prepared.first_ts,
+        last_ts=prepared.last_ts,
+        filter_counts=counts,
+        final_bankroll=bankroll,
+        equity_curve=equity,
+    )
+
+
+def run_backtest(
+    conn: sqlite3.Connection,
+    config: BotConfig,
+    *,
+    queue_assumption: QueueAssumption = QueueAssumption.OPTIMISTIC,
+    maker_fee_multiplier: Decimal = Decimal("0"),
+) -> BacktestReport:
+    data = load_replay_data(conn)
+    if not data.snapshots:
+        raise BacktestError("no order-book snapshots to replay")
+    prepared = prepare_replay(data, config)
+    result = replay_prepared(
+        prepared, config, queue_assumption=queue_assumption, maker_fee_multiplier=maker_fee_multiplier
+    )
+    return build_report(
+        result.trades,
+        windows_seen=result.windows_seen,
+        windows_traded=result.windows_traded,
+        first_ts=result.first_ts,
+        last_ts=result.last_ts,
         queue_assumption=queue_assumption,
         maker_fee_multiplier=maker_fee_multiplier,
     )

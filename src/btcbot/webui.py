@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
+import threading
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +31,9 @@ from urllib.parse import parse_qs, urlparse
 
 from btcbot.backtest import BacktestError, load_trades, run_backtest
 from btcbot.config import ConfigError, load_config
+from btcbot.lab import (
+    DEFAULT_GRID, TUNABLE, AccountSettings, LabError, LabParams, expand_grid, load_lab_data, parse_values, run_lab,
+)
 from btcbot.models import ParseError
 from btcbot.paper_broker import QueueAssumption
 
@@ -271,6 +277,97 @@ def backtest_reports(db_path: Path, config_path: Path, *, queue: str, maker_fee_
     return [asdict(report) for report in reports]
 
 
+# --------------------------------------------------------------------------- strategy lab jobs
+
+
+@dataclass
+class LabJob:
+    """One background lab run. The sweep can take minutes on days of data, so it runs on a thread and the
+    page polls :meth:`snapshot`."""
+
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    state: str = "running"  # running | done | error | cancelled
+    done: int = 0
+    total: int = 0
+    label: str = "loading recorded data"
+    error: str | None = None
+    report: dict[str, Any] | None = None
+    started: float = field(default_factory=time.monotonic)
+    cancel: threading.Event = field(default_factory=threading.Event)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id, "state": self.state, "done": self.done, "total": self.total, "label": self.label,
+            "error": self.error, "report": self.report, "elapsed_sec": time.monotonic() - self.started,
+        }
+
+
+def lab_defaults() -> dict[str, Any]:
+    return {
+        "tunable": list(TUNABLE),
+        "grid": {k: ", ".join("none" if v is None else str(v) for v in vals) for k, vals in DEFAULT_GRID.items()},
+    }
+
+
+def _lab_grid_from_payload(payload: dict[str, Any]) -> dict[str, list[Any]]:
+    grid: dict[str, list[Any]] = {}
+    for key, raw in (payload.get("grid") or {}).items():
+        if raw is None or str(raw).strip() == "":
+            continue  # a blank field means "do not vary this; keep the config default"
+        grid[key] = parse_values(key, str(raw))
+    if not grid:
+        raise LabError("choose at least one thing to vary (fill in one or more of the value lists)")
+    return grid
+
+
+def _lab_number(payload: dict[str, Any], key: str, default: str, *, lo: Decimal, hi: Decimal | None = None) -> Decimal:
+    try:
+        value = Decimal(str(payload.get(key, default) if payload.get(key, "") != "" else default))
+    except InvalidOperation:
+        raise LabError(f"{key} is not a number") from None
+    if not value.is_finite() or value < lo or (hi is not None and value > hi):
+        raise LabError(f"{key} is out of range")
+    return value
+
+
+def lab_preview(data_dir: Path, config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """How many combinations the grid expands to, and how many market windows the chosen files hold."""
+    grid = _lab_grid_from_payload(payload)
+    combos = expand_grid(LabParams.from_config(load_config(str(config_path))), grid)
+    windows: set[str] = set()
+    for name in payload.get("dbs") or []:
+        path = _resolve_db(data_dir, str(name))
+        if path is None:
+            continue
+        conn = sqlite3.connect(str(path))
+        try:
+            windows.update(r[0] for r in conn.execute("SELECT DISTINCT ticker FROM orderbook_snapshots"))
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+    return {"combinations": len(combos), "windows": len(windows)}
+
+
+def _run_lab_job(job: LabJob, paths: list[Path], config_path: Path, grid: dict[str, list[Any]], kwargs: dict[str, Any]) -> None:
+    def progress(done: int, total: int, label: str) -> None:
+        job.done, job.total, job.label = done, total, label
+
+    try:
+        data = load_lab_data(paths)
+        job.label = "running"
+        report = run_lab(data, load_config(str(config_path)), grid, progress=progress, cancelled=job.cancel.is_set, **kwargs)
+        job.report = asdict(report)
+        job.state = "done"
+    except LabError as exc:
+        job.state = "cancelled" if str(exc) == "cancelled" else "error"
+        job.error = None if job.state == "cancelled" else str(exc)
+    except (ConfigError, BacktestError, sqlite3.Error, ParseError, ValueError) as exc:
+        job.state, job.error = "error", f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # a background thread must always end in a visible state, never vanish
+        job.state, job.error = "error", f"unexpected {type(exc).__name__}: {exc}"
+
+
 # --------------------------------------------------------------------------- JSON plumbing
 
 
@@ -342,6 +439,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_json(200, market_view(db_path, query.get("ticker")))
                 except (sqlite3.OperationalError, ParseError, ValueError) as exc:
                     raise _ApiError(400, f"market view error: {exc}") from exc
+            elif parsed.path == "/api/lab/defaults":
+                self._send_json(200, lab_defaults())
+            elif parsed.path == "/api/lab/status":
+                job = self.server.lab_jobs.get(query.get("id", ""))  # type: ignore[attr-defined]
+                if job is None:
+                    raise _ApiError(404, "no such lab run (the dashboard may have been restarted)")
+                self._send_json(200, job.snapshot())
             elif parsed.path == "/api/backtest":
                 self._send_json(200, self._backtest(query))
             elif parsed.path == "/api/settings":
@@ -364,12 +468,65 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise _ApiError(400, str(exc)) from exc
                 write_env_settings(self.server.env_path, updates)
                 self._send_json(200, settings_status(self.server.env_path))
+            elif parsed.path == "/api/lab/preview":
+                try:
+                    self._send_json(200, lab_preview(self.server.data_dir, self.server.config_path, self._read_json_body()))
+                except (LabError, ConfigError) as exc:
+                    raise _ApiError(400, str(exc)) from exc
+            elif parsed.path == "/api/lab/start":
+                self._send_json(200, self._lab_start(self._read_json_body()))
+            elif parsed.path == "/api/lab/cancel":
+                job = self.server.lab_jobs.get(str(self._read_json_body().get("id", "")))  # type: ignore[attr-defined]
+                if job is None:
+                    raise _ApiError(404, "no such lab run")
+                job.cancel.set()
+                self._send_json(200, job.snapshot())
             else:
                 self._send_json(404, {"error": f"no such endpoint: {parsed.path}"})
         except _ApiError as exc:
             self._send_json(exc.status, {"error": exc.message})
         except Exception as exc:  # a JSON 500 beats a hung connection; this is a request boundary
             self._send_json(500, {"error": str(exc)})
+
+    def _lab_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        jobs: dict[str, LabJob] = self.server.lab_jobs  # type: ignore[attr-defined]
+        if any(j.state == "running" for j in jobs.values()):
+            raise _ApiError(409, "a lab run is already in progress; wait for it or cancel it")
+        names = payload.get("dbs")
+        if not isinstance(names, list) or not names:
+            raise _ApiError(400, "pick at least one data file")
+        paths = []
+        for name in names:
+            path = _resolve_db(self.server.data_dir, str(name))
+            if path is None:
+                raise _ApiError(404, f"no such database in {self.server.data_dir}: {name}")
+            paths.append(path)
+        try:
+            grid = _lab_grid_from_payload(payload)
+            account = AccountSettings(
+                account_usd=_lab_number(payload, "account_usd", "500", lo=Decimal(1)),
+                max_exposure_pct=_lab_number(payload, "max_exposure_pct", "25", lo=Decimal(1), hi=Decimal(100)),
+                daily_loss_pct=_lab_number(payload, "daily_loss_pct", "10", lo=Decimal(1), hi=Decimal(100)),
+            )
+            queue = str(payload.get("queue", "optimistic"))
+            if queue not in ("optimistic", "pessimistic"):
+                raise LabError("queue must be optimistic or pessimistic")
+            split = float(_lab_number(payload, "split", "0.7", lo=Decimal("0.2"), hi=Decimal("0.9")))
+            kwargs = {
+                "account": account, "train_fraction": split, "queue": QueueAssumption(queue),
+                "maker_fee_multiplier": _lab_number(payload, "maker_fee_multiplier", "0", lo=Decimal(0)),
+                "top_k": int(_lab_number(payload, "top_k", "8", lo=Decimal(1), hi=Decimal(25))),
+                "min_train_trades": int(_lab_number(payload, "min_train_trades", "20", lo=Decimal(1), hi=Decimal(10000))),
+            }
+            expand_grid(LabParams.from_config(load_config(str(self.server.config_path))), grid)  # fail fast on a bad grid
+        except (LabError, ConfigError) as exc:
+            raise _ApiError(400, str(exc)) from exc
+        job = LabJob()
+        jobs[job.id] = job
+        threading.Thread(
+            target=_run_lab_job, args=(job, paths, self.server.config_path, grid, kwargs), daemon=True, name=f"lab-{job.id}"
+        ).start()
+        return job.snapshot()
 
     def _paper_summary(self, query: dict[str, str]) -> dict[str, Any]:
         db_path = self._require_db(query)
@@ -415,6 +572,7 @@ def create_dashboard_server(*, data_dir: Path, env_path: Path, config_path: Path
     server.data_dir = data_dir  # type: ignore[attr-defined]
     server.env_path = env_path  # type: ignore[attr-defined]
     server.config_path = config_path  # type: ignore[attr-defined]
+    server.lab_jobs = {}  # type: ignore[attr-defined]
     server.daemon_threads = True
     return server
 
@@ -510,6 +668,28 @@ INDEX_HTML = r"""<!doctype html>
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
   .badge.live { color: var(--green); border-color: #1b5a45; } .badge.closed { color: var(--orange); border-color: #6b4a1c; }
   .foot { padding: 10px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
+  .lab { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 0; }
+  .lab > div { padding: 14px 18px; min-width: 0; }
+  .lab .setup { border-right: 1px solid var(--line); }
+  @media (max-width: 960px) { .lab { grid-template-columns: 1fr; } .lab .setup { border-right: 0; border-bottom: 1px solid var(--line); } }
+  .lab h3 { margin-top: 16px; } .lab h3:first-child { margin-top: 0; }
+  .field { display: grid; grid-template-columns: 1fr 1.1fr; gap: 4px 10px; align-items: center; margin-bottom: 7px; }
+  .field label { color: var(--text); font-size: 12.5px; }
+  .field small { grid-column: 1 / -1; color: var(--muted); font-size: 11px; margin-top: -3px; }
+  .field input { width: 100%; }
+  .checks label { display: block; font-size: 12.5px; padding: 2px 0; cursor: pointer; }
+  .presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .presets button { font-size: 11.5px; padding: 4px 9px; }
+  .bar { height: 6px; background: var(--panel2); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+  .bar div { height: 100%; background: var(--green); width: 0; transition: width .3s; }
+  .verdict { border-radius: 10px; padding: 12px 14px; margin: 0 0 14px; border: 1px solid var(--line); }
+  .verdict b { display: block; margin-bottom: 3px; }
+  .verdict.insufficient { background: #2a1d10; border-color: #6b4a1c; color: #fbbf77; }
+  .verdict.not_supported { background: var(--redbg); border-color: #5a1f28; color: #ff9aa6; }
+  .verdict.weak_signal { background: #0f1f33; border-color: #1f4a80; color: #8ec2ff; }
+  .lab td.num, .lab th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .lab tr.base td { color: var(--muted); font-style: italic; }
+  .lab ul.warns { color: var(--muted); font-size: 12px; padding-left: 18px; }
   @media (max-width: 700px) { body { padding: 8px; } table { display: block; overflow-x: auto; } }
 </style>
 </head>
@@ -536,6 +716,7 @@ INDEX_HTML = r"""<!doctype html>
     <button data-tab="market" class="active">Market</button>
     <button data-tab="monitor">Paper PnL</button>
     <button data-tab="backtest">Backtest</button>
+    <button data-tab="lab">Strategy Lab</button>
     <button data-tab="settings">Settings</button>
   </nav>
 
@@ -600,6 +781,44 @@ INDEX_HTML = r"""<!doctype html>
         <thead><tr><th>Queue</th><th>Fee mult.</th><th>Trades</th><th>Win rate</th><th>Total PnL</th><th>Max drawdown</th><th>Trades/day</th><th>Beats trade-nothing?</th><th>Sample size</th></tr></thead>
         <tbody></tbody></table>
       <div class="note" id="backtest-note"></div>
+    </div>
+  </section>
+
+  <section id="tab-lab">
+    <div class="lab">
+      <div class="setup">
+        <h3>1. Data to test on</h3>
+        <div class="checks" id="lab-dbs"></div>
+        <div class="note">Use real (PROD) recordings. Demo books are mostly synthetic. More days of data = results worth reading; you need at least 6 market windows, and hundreds before anything is believable.</div>
+
+        <h3>2. Account and risk</h3>
+        <div class="field"><label for="lab-account_usd">Account size ($)</label><input id="lab-account_usd" value="500"></div>
+        <div class="field"><label for="lab-max_exposure_pct">Max at risk at once (%)</label><input id="lab-max_exposure_pct" value="25"></div>
+        <div class="field"><label for="lab-daily_loss_pct">Daily loss stop (%)</label><input id="lab-daily_loss_pct" value="10"></div>
+
+        <h3>3. What to vary <span class="sub">(comma lists; blank = keep the default)</span></h3>
+        <div class="presets" id="lab-presets"></div>
+        <div id="lab-fields"></div>
+
+        <h3>4. How to judge it</h3>
+        <div class="field"><label for="lab-split">Train share of windows</label><input id="lab-split" value="0.7"><small>Ranked on this earlier slice, then shown on the held-out rest.</small></div>
+        <div class="field"><label for="lab-min_train_trades">Min trades to rank</label><input id="lab-min_train_trades" value="20"></div>
+        <div class="field"><label for="lab-queue">Fill assumption</label>
+          <select id="lab-queue"><option value="optimistic">optimistic (best case)</option><option value="pessimistic">pessimistic (never fills)</option></select></div>
+        <div class="field"><label for="lab-maker_fee_multiplier">Maker fee multiplier</label>
+          <select id="lab-maker_fee_multiplier"><option value="0">0 (makers pay nothing)</option><option value="0.25">0.25</option><option value="1">1 (full fee)</option></select></div>
+
+        <div class="row" style="margin-top:14px">
+          <button class="action" id="lab-run">Run lab</button>
+          <button class="action" id="lab-cancel" disabled>Cancel</button>
+          <span class="note" id="lab-preview"></span>
+        </div>
+        <div class="bar" id="lab-bar" style="display:none"><div id="lab-bar-fill"></div></div>
+        <div class="note" id="lab-status"></div>
+      </div>
+      <div class="results" id="lab-results">
+        <div class="empty">Pick data, choose what to vary, and press <b>Run lab</b>. Results appear here: every combination is ranked on the training windows and then shown on windows it never saw.</div>
+      </div>
     </div>
   </section>
 
@@ -887,6 +1106,138 @@ async function saveSettings() {
   } catch (err) { status.innerHTML = `<div class="error">Error: ${esc(err.message)}</div>`; }
 }
 
+// ---------------------------------------------------------------- strategy lab
+const LAB_FIELDS = [
+  ["min_edge", "Min edge", "0.02, 0.04, 0.06", "How far the model's win chance must beat your bid price (after fees)."],
+  ["max_spread", "Max spread ($)", "0.02, 0.06", "Skip thin books: bid-ask gap must be at most this."],
+  ["max_tau_sec", "Earliest entry (secs left)", "480, 600, 780", "Only enter once this many seconds or fewer remain in the 15-minute window."],
+  ["min_tau_sec", "Latest entry (secs left)", "30, 120, 300", "Stop entering when fewer than this many seconds remain."],
+  ["min_price", "Min entry price ($)", "none, 0.20", "0.20 = 20 cents. 'none' = no floor."],
+  ["max_price", "Max entry price ($)", "none, 0.60", "0.60 = 60 cents. 'none' = no cap."],
+  ["trend_mode", "Trend filter", "off, with, against", "with = only the side spot is moving toward; against = fade the move."],
+  ["trend_lookback_sec", "Trend lookback (secs)", "60, 180", "How far back to measure the move."],
+  ["trend_min_move_usd", "Trend min move ($)", "0, 10, 25", "Ignore moves smaller than this."],
+  ["model_blend", "Model weight (0-1)", "0.3, 0.5, 0.8", "1 = trust the model only, 0 = trust the market mid only."],
+  ["risk_pct", "Risk per trade (% of account)", "1, 2, 5", "Blank = fixed number of contracts instead."],
+  ["contracts", "Fixed contracts", "5, 10", "Used when risk % is blank."],
+];
+const LAB_PRESETS = {
+  "Entry timing": { max_tau_sec: "480, 600, 780", min_tau_sec: "30, 60, 120, 300" },
+  "Entry price": { min_price: "none, 0.15, 0.30", max_price: "none, 0.50, 0.60, 0.70" },
+  "Trend": { trend_mode: "off, with, against", trend_lookback_sec: "60, 180", trend_min_move_usd: "0, 10, 25" },
+  "Risk sizing": { risk_pct: "1, 2, 5, 10" },
+  "Edge and spread": { min_edge: "0.01, 0.02, 0.04, 0.06", max_spread: "0.02, 0.04, 0.06" },
+  "A bit of everything": { min_edge: "0.02, 0.04", min_tau_sec: "30, 120", max_price: "none, 0.60", trend_mode: "off, with" },
+};
+let labJob = null, labTimer = null, labPreviewTimer = null;
+
+function buildLabForm(databases) {
+  $("lab-fields").innerHTML = LAB_FIELDS.map(([key, label, ph, help]) =>
+    `<div class="field"><label for="lab-${key}">${label}</label><input id="lab-${key}" placeholder="${esc(ph)}"><small>${esc(help)}</small></div>`).join("");
+  $("lab-presets").innerHTML = Object.keys(LAB_PRESETS).map((n) => `<button class="action" data-preset="${esc(n)}">${esc(n)}</button>`).join("");
+  document.querySelectorAll("#lab-presets button").forEach((b) => b.addEventListener("click", () => {
+    LAB_FIELDS.forEach(([key]) => { $("lab-" + key).value = LAB_PRESETS[b.dataset.preset][key] || ""; });
+    labPreview();
+  }));
+  document.querySelectorAll("#lab-fields input, #lab-account_usd").forEach((i) => i.addEventListener("input", labPreviewSoon));
+  renderLabDbs(databases);
+  LAB_PRESETS["Entry timing"] && Object.entries(LAB_PRESETS["Entry timing"]).forEach(([k, v]) => { $("lab-" + k).value = v; });
+  labPreview();
+}
+
+function renderLabDbs(databases) {
+  const usable = databases.filter((d) => d.kind !== "unknown");
+  $("lab-dbs").innerHTML = usable.length ? usable.map((d) => {
+    const demo = /-demo-/.test(d.name);
+    return `<label><input type="checkbox" value="${esc(d.name)}" ${demo ? "" : "checked"}> ${esc(dbLabel(d))}${demo ? ' <span class="orange">(demo, synthetic)</span>' : ""}</label>`;
+  }).join("") : '<div class="empty">No recordings yet. Run <code>btcbot paper</code> or <code>btcbot record</code> first.</div>';
+  document.querySelectorAll("#lab-dbs input").forEach((i) => i.addEventListener("change", labPreviewSoon));
+}
+
+function labPayload() {
+  const grid = {};
+  LAB_FIELDS.forEach(([key]) => { grid[key] = $("lab-" + key).value; });
+  const dbs = [...document.querySelectorAll("#lab-dbs input:checked")].map((i) => i.value);
+  const out = { dbs, grid };
+  ["account_usd", "max_exposure_pct", "daily_loss_pct", "split", "min_train_trades", "queue", "maker_fee_multiplier"].forEach((k) => { out[k] = $("lab-" + k).value; });
+  return out;
+}
+
+async function postJson(url, body) {
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function labPreviewSoon() { clearTimeout(labPreviewTimer); labPreviewTimer = setTimeout(labPreview, 350); }
+async function labPreview() {
+  const el = $("lab-preview");
+  try {
+    const r = await postJson("/api/lab/preview", labPayload());
+    el.className = r.combinations > 400 ? "error" : "note";
+    el.textContent = `${r.combinations.toLocaleString()} combinations \u00b7 ${r.windows.toLocaleString()} windows in the selected files`;
+  } catch (err) { el.className = "note"; el.textContent = err.message; }
+}
+
+const mUsd = (v) => `<span class="${Number(v) > 0 ? "pnl-pos" : Number(v) < 0 ? "pnl-neg" : ""}">${Number(v) < 0 ? "-" : ""}$${Math.abs(Number(v)).toFixed(2)}</span>`;
+function metricCells(m) {
+  const wr = m.win_rate === null ? "--" : (m.win_rate * 100).toFixed(0) + "%";
+  const t = m.t_stat === null ? "--" : (m.t_stat > 0 ? "+" : "") + m.t_stat.toFixed(1);
+  return `<td class="num">${m.resolved}</td><td class="num">${wr}</td><td class="num">${mUsd(m.pnl)}</td><td class="num">${t}</td>`;
+}
+
+function renderLabReport(r) {
+  const rows = r.rows.map((row) => `<tr><td class="num">${row.rank}</td><td>${esc(row.description)}${row.equivalent ? ` <span class="sub">(+${row.equivalent} equivalent)</span>` : ""}</td>${metricCells(row.train)}${metricCells(row.test)}
+    <td class="num">${row.test.return_pct === null ? "--" : row.test.return_pct.toFixed(1) + "%"}</td>
+    <td class="num">${row.test.max_drawdown_pct === null ? "--" : row.test.max_drawdown_pct.toFixed(1) + "%"}</td></tr>`).join("");
+  const base = `<tr class="base"><td class="num">base</td><td>config.yaml defaults</td>${metricCells(r.baseline_train)}${metricCells(r.baseline_test)}
+    <td class="num">${r.baseline_test.return_pct === null ? "--" : r.baseline_test.return_pct.toFixed(1) + "%"}</td>
+    <td class="num">${r.baseline_test.max_drawdown_pct === null ? "--" : r.baseline_test.max_drawdown_pct.toFixed(1) + "%"}</td></tr>`;
+  $("lab-results").innerHTML = `
+    <div class="verdict ${esc(r.verdict_level)}"><b>${{ insufficient: "Not enough data to conclude", not_supported: "Did not hold up on unseen windows", weak_signal: "Held up on unseen windows (weakly)" }[r.verdict_level] || ""}</b>${esc(r.verdict)}</div>
+    <div class="sub" style="margin-bottom:8px">${r.windows_total} windows: ${r.windows_train} train, ${r.windows_test} test (1 skipped between). ${r.combinations.toLocaleString()} combinations, ${r.ranked_combinations.toLocaleString()} with at least ${r.min_train_trades} training trades. Account $${esc(r.account_usd)} \u00b7 ${esc(r.queue)} fills \u00b7 ${r.seconds.toFixed(1)}s.</div>
+    <table><thead><tr><th class="num">#</th><th>What changed</th>
+      <th class="num" colspan="4" style="text-align:center">TRAIN (used to rank)</th><th class="num" colspan="4" style="text-align:center">TEST (never seen)</th><th class="num">Return</th><th class="num">Max DD</th></tr>
+      <tr><th></th><th></th><th class="num">Trades</th><th class="num">Win</th><th class="num">PnL</th><th class="num">t</th><th class="num">Trades</th><th class="num">Win</th><th class="num">PnL</th><th class="num">t</th><th class="num">(test)</th><th class="num">(test)</th></tr></thead>
+      <tbody>${base}${rows || '<tr><td colspan="12" class="empty">Nothing had enough training trades to rank.</td></tr>'}</tbody></table>
+    <h3>Read this before believing anything</h3><ul class="warns">${r.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}<li>t is the average PnL per trade divided by its noise; roughly, below 2 is indistinguishable from luck.</li></ul>`;
+}
+
+function labSetRunning(running) {
+  $("lab-run").disabled = running; $("lab-cancel").disabled = !running;
+  $("lab-bar").style.display = running ? "block" : "none";
+}
+
+async function labPoll() {
+  if (!labJob) return;
+  try {
+    const st = await getJson("/api/lab/status?id=" + encodeURIComponent(labJob));
+    const pct = st.total ? (st.done / st.total) * 100 : 5;
+    $("lab-bar-fill").style.width = pct + "%";
+    $("lab-status").className = "note";
+    $("lab-status").textContent = st.state === "running"
+      ? `${st.done}/${st.total || "?"} \u00b7 ${st.label} \u00b7 ${Math.round(st.elapsed_sec)}s` : "";
+    if (st.state !== "running") {
+      clearInterval(labTimer); labJob = null; labSetRunning(false);
+      if (st.state === "done") renderLabReport(st.report);
+      else if (st.state === "cancelled") { $("lab-status").textContent = "Cancelled."; }
+      else { $("lab-status").className = "error"; $("lab-status").textContent = "Error: " + st.error; }
+    }
+  } catch (err) { clearInterval(labTimer); labJob = null; labSetRunning(false); $("lab-status").className = "error"; $("lab-status").textContent = "Error: " + err.message; }
+}
+
+async function labRun() {
+  $("lab-status").className = "note"; $("lab-status").textContent = "Starting...";
+  try {
+    const st = await postJson("/api/lab/start", labPayload());
+    labJob = st.id; labSetRunning(true);
+    clearInterval(labTimer); labTimer = setInterval(labPoll, 1000); labPoll();
+  } catch (err) { $("lab-status").className = "error"; $("lab-status").textContent = "Error: " + err.message; }
+}
+
+async function labCancel() { if (labJob) { try { await postJson("/api/lab/cancel", { id: labJob }); } catch (e) { /* the poll will surface it */ } } }
+
 let tab = "market";
 let refreshing = false;
 async function refreshTab() {
@@ -900,8 +1251,9 @@ document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("c
   tab = btn.dataset.tab;
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
   document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === `tab-${tab}`));
-  $("db-row").style.display = tab === "settings" ? "none" : "";
-  $("pickhelp").style.display = tab === "settings" ? "none" : "";
+  const noPicker = tab === "settings" || tab === "lab";
+  $("db-row").style.display = noPicker ? "none" : "";
+  $("pickhelp").style.display = noPicker ? "none" : "";
   $q("#ticker-select").parentElement.style.display = tab === "market" ? "" : "none";
   refreshTab();
 }));
@@ -911,10 +1263,12 @@ document.querySelectorAll("#side-toggle button").forEach((b) => b.addEventListen
   $("side-toggle").classList.toggle("no", side === "no");
   renderBook();
 }));
-$("refresh-databases").addEventListener("click", async () => { await refreshDatabases(); refreshTab(); });
+$("refresh-databases").addEventListener("click", async () => { const dbs = await refreshDatabases(); renderLabDbs(dbs); refreshTab(); });
 $("db-select").addEventListener("change", () => { $("ticker-select").innerHTML = ""; refreshTab(); });
 $("ticker-select").addEventListener("change", refreshTab);
 $("run-backtest").addEventListener("click", runBacktest);
+$("lab-run").addEventListener("click", labRun);
+$("lab-cancel").addEventListener("click", labCancel);
 $("save-settings").addEventListener("click", saveSettings);
 document.querySelectorAll('input[name="kalshi-env"]').forEach((r) => r.addEventListener("change", () => {
   $("prod-warn").style.display = $q('input[name="kalshi-env"]:checked').value === "prod" ? "block" : "none";
@@ -922,7 +1276,9 @@ document.querySelectorAll('input[name="kalshi-env"]').forEach((r) => r.addEventL
 window.addEventListener("resize", () => { if (tab === "market" || tab === "monitor") refreshTab(); });
 
 (async function init() {
-  try { await refreshDatabases(); } catch (e) { $("market-note").textContent = "Error: " + e.message; }
+  let dbList = [];
+  try { dbList = await refreshDatabases(); } catch (e) { $("market-note").textContent = "Error: " + e.message; }
+  buildLabForm(dbList);
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
   setInterval(() => { if (tab === "market" || tab === "monitor") refreshTab(); }, 1000);
