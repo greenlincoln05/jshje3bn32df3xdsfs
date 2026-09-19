@@ -841,7 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Sweep strategy parameters over recorded data. Combinations are ranked on the first part of "
         "the windows and shown on the held-out rest. Tunable keys: "
         + ", ".join(sorted(DEFAULT_GRID.keys() | {"min_depth", "max_spread", "min_price", "trend_lookback_sec",
-                                                  "trend_min_move_usd", "model_blend", "risk_pct", "contracts"})),
+                                                  "trend_min_move_usd", "model_blend", "risk_pct", "contracts", "persist_steps", "max_growth_pct",
+                                                  "min_p_side"})),
     )
     lab.add_argument("--db", action="append", default=[], help="recorded database (repeatable; default: every *.sqlite in --data-dir)")
     lab.add_argument("--data-dir", default="data", help="where to look when no --db is given (default: ./data)")

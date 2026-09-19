@@ -27,7 +27,7 @@ from btcbot.model import TimedVolatility, ModelState, predict
 from btcbot.models import OrderBook, ParseError, PriceLevel, Side, parse_time
 from btcbot.paper_broker import PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, Decision, decide
+from btcbot.strategy import Action, Decision, decide, percent_size
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -344,15 +344,22 @@ class EntryFilters:
     (at least ``trend_min_move_usd``), ``"against"`` only the side it has been moving away from (a
     mean-reversion bet). ``account_usd`` + ``risk_pct_per_trade`` size each order as that fraction of the
     current bankroll (starting account plus settled PnL, less capital already at risk), rounded down to
-    whole contracts; sizing never depends on a prior loss being "made back"."""
+    whole contracts; sizing never depends on a prior loss being "made back".
+
+    ``persist_steps``: only enter once the strategy has wanted the SAME side for this many consecutive snapshots
+    (about one per second), so a single-quote flicker cannot trigger an entry. ``min_p_side``: only enter a side
+    the blended model puts at least this likely to win, so a cheap bet against the favourite is refused."""
 
     min_price: Decimal | None = None
     max_price: Decimal | None = None
+    persist_steps: int = 1
+    min_p_side: Decimal | None = None
     trend_mode: str = "off"
     trend_lookback_sec: int = 60
     trend_min_move_usd: Decimal = Decimal(0)
     account_usd: Decimal | None = None
     risk_pct_per_trade: Decimal | None = None
+    max_growth_pct: Decimal | None = None  # after a win the next order may grow by at most this percent (None: no ramp)
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,12 +391,18 @@ def replay_prepared(
     position: TradeRecord | None = None
     trades: list[TradeRecord] = []
     windows_traded: set[str] = set()
-    counts = {"price_band": 0, "trend": 0, "too_small": 0, "risk_blocked": 0}
+    counts = {"price_band": 0, "trend": 0, "too_small": 0, "risk_blocked": 0, "persistence": 0, "low_confidence": 0}
+    rest_side: str | None = None  # the side the strategy has wanted on consecutive snapshots, and for how long
+    rest_streak = 0
     bankroll = filters.account_usd if filters is not None else None
     equity: list[tuple[datetime, Decimal]] = []
+    last_order_size: Decimal | None = None  # the ordered size of the most recent order (for the growth ramp)
+    last_result: str | None = None  # "win" / "loss" of the most recent settled trade
+    if bankroll is not None and filters.risk_pct_per_trade is not None:
+        risk.set_account_value(bankroll)
 
     def finalize_window(ticker: str, ts: datetime) -> None:
-        nonlocal resting_order_id, position, bankroll
+        nonlocal resting_order_id, position, bankroll, last_result
         if resting_order_id is not None:
             order = broker.get_order(resting_order_id)
             unfilled = order.remaining_size
@@ -411,15 +424,26 @@ def replay_prepared(
                 risk.record_trade_closed(
                     TradeOutcome(ts=ts, size=position.size, pnl_usd=pnl), exposure_released_usd=exposure
                 )
+                last_result = "loss" if pnl < 0 else "win"
                 if bankroll is not None:
                     bankroll += pnl
                     equity.append((ts, bankroll))
+                    if filters.risk_pct_per_trade is not None:
+                        risk.set_account_value(bankroll)
             position = None
 
-    def screen(decision: Decision, ts: datetime) -> Decision | None:
+    def screen(decision: Decision, ts: datetime, p_yes: float, streak: int) -> Decision | None:
         """Apply the lab's filters and sizing to a proposed resting order; None means do not place it."""
         if filters is None:
             return decision
+        if streak < filters.persist_steps:
+            counts["persistence"] += 1
+            return None
+        if filters.min_p_side is not None:
+            p_side = p_yes if decision.side == "yes" else 1.0 - p_yes
+            if p_side < float(filters.min_p_side):
+                counts["low_confidence"] += 1
+                return None
         price = decision.price
         if (filters.min_price is not None and price < filters.min_price) or (
             filters.max_price is not None and price > filters.max_price
@@ -437,13 +461,15 @@ def replay_prepared(
                 counts["trend"] += 1
                 return None
         if bankroll is not None and filters.risk_pct_per_trade is not None:
-            cash = bankroll - risk.open_exposure_usd
-            contracts = int((max(cash, Decimal(0)) * filters.risk_pct_per_trade) / price)
-            contracts = min(contracts, config.risk.max_contracts_per_trade)
-            if contracts < 1:
+            size = percent_size(
+                price, cash_usd=max(bankroll - risk.open_exposure_usd, Decimal(0)), risk_pct=filters.risk_pct_per_trade * 100,
+                previous_size=last_order_size, last_result=last_result, max_growth_pct=filters.max_growth_pct,
+                max_contracts=Decimal(config.risk.max_contracts_per_trade),
+            )
+            if size < 1:
                 counts["too_small"] += 1
                 return None
-            return replace(decision, size=Decimal(contracts))
+            return replace(decision, size=size)
         return decision
 
     for step in steps:
@@ -452,6 +478,7 @@ def replay_prepared(
             if current_ticker is not None:
                 finalize_window(current_ticker, snap.poll_ts)
             current_ticker = snap.ticker
+            rest_side, rest_streak = None, 0  # a new window starts a new streak
         if not step.active:
             continue
         p_blend = step.p_yes
@@ -494,10 +521,17 @@ def replay_prepared(
         )
 
         if decision.action is Action.REST:
-            screened = screen(decision, snap.poll_ts)
+            rest_streak = rest_streak + 1 if rest_side == decision.side else 1
+            rest_side = decision.side
+        else:
+            rest_side, rest_streak = None, 0
+
+        if decision.action is Action.REST:
+            screened = screen(decision, snap.poll_ts, p_blend, rest_streak)
             if screened is not None:
                 approval = risk.check_new_order(size=screened.size, price=screened.price, now=snap.poll_ts)
                 if approval.approved:
+                    last_order_size = screened.size
                     resting_order_id = broker.place_resting_order(
                         screened.side, screened.price, screened.size, ts=snap.poll_ts, book=snap.book
                     )

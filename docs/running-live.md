@@ -181,6 +181,29 @@ call, because reading an order back can fail even when the order exists. If a ru
 cleans up. Only three commands can place a demo order: `demo-check`, `demo-probe` and `demo`. The dashboard and
 every other command cannot.
 
+## 4e. Bet size that grows with the account (percent sizing)
+
+In `config.yaml`, set (the values shown are the defaults for the new keys):
+
+```yaml
+sizing:
+  mode: percent
+  account_usd: 500            # the starting account; it then moves only with SETTLED profit and loss
+  risk_pct_per_trade: 2       # percent of the CURRENT account staked per order (config caps this at 10)
+  max_growth_per_win_pct: 20  # after a settled win the next order may be at most this much larger (min +1 contract)
+risk:
+  max_contracts_per_trade: 1000      # the hard sanity cap; raise it or bets cannot grow past it
+  max_open_exposure_pct: 25          # the exposure cap follows the account instead of a fixed $25
+  daily_loss_limit_pct: 10           # so does the daily loss stop
+```
+
+`btcbot paper` and `btcbot demo` both use it (same trading loop). How it behaves: the first order is `risk_pct` of the
+account; every settled win makes the account bigger, so the next order is a little bigger (capped by the growth
+rule); every settled loss makes the account smaller, so the next order is smaller, and it can never be larger than
+the order that lost. Nothing is raised to win a loss back. Test it in the Strategy Lab first (`risk_pct` and
+`max_growth_pct` are lab keys: `btcbot lab --grid risk_pct=1,2,5 --grid max_growth_pct=none,10,25`), on paper
+or demo only. It compounds whatever the strategy does: with no edge it just loses faster at a larger size.
+
 ## 5. Dashboard (optional, no credentials, no network needed)
 
 ```powershell

@@ -76,6 +76,50 @@ def kelly_size(
     return max(Decimal(1), min(contracts, max_contracts))
 
 
+def percent_size(
+    price: Decimal,
+    *,
+    cash_usd: Decimal,
+    risk_pct: Decimal,
+    previous_size: Decimal | None,
+    last_result: str | None,
+    max_growth_pct: Decimal | None,
+    max_contracts: Decimal,
+) -> Decimal:
+    """Contracts to buy at ``price`` when staking ``risk_pct`` percent of the current account (``cash_usd``: the
+    account, settled profit and loss included, less capital already at risk). Returns 0 when the account cannot
+    afford one contract at that percent, and the caller then skips the trade.
+
+    The rules, in order, all of which exist to make growth gradual and to keep the repo's "no size increase after a
+    loss" rule true by construction instead of by a later veto:
+
+    1. The target is ``floor(cash * risk_pct% / price)``, at most ``max_contracts``. It follows the account down
+       immediately, so a shrinking account always means smaller bets.
+    2. After a LOSS the size never exceeds ``previous_size`` (the order before it). A loss can only shrink or hold
+       the next order; ``btcbot.risk.RiskManager`` enforces the same rule as a backstop.
+    3. Otherwise, when the target is above ``previous_size`` (the account has grown), the next order may rise by at
+       most ``max_growth_pct`` percent of ``previous_size``, and by at least one contract so small sizes can still
+       move. With ``max_growth_pct`` None the ramp is off and the target is used as is.
+
+    This is fixed-fractional sizing: bets get larger only because settled results made the account larger, and
+    smaller when it shrank. It is not a martingale (nothing is ever raised to win back a loss), and it does not
+    create an edge: with a strategy that loses on average, compounding just loses faster at a larger size."""
+    if price <= 0:
+        return Decimal(0)
+    target = ((cash_usd * risk_pct / 100) / price).to_integral_value(rounding=ROUND_FLOOR)
+    target = min(target, max_contracts)
+    if target < 1:
+        return Decimal(0)
+    if previous_size is None or target <= previous_size:
+        return target
+    if last_result == "loss":
+        return previous_size
+    if max_growth_pct is None:
+        return target
+    step = max(Decimal(1), (previous_size * max_growth_pct / 100).to_integral_value(rounding=ROUND_FLOOR))
+    return min(target, previous_size + step)
+
+
 def decide(
     *,
     book: OrderBook,
