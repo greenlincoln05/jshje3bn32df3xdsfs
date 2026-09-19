@@ -145,8 +145,54 @@ Paper fills must model **queue position**: a resting order fills only after the 
 3. **Model + calibration.** Implement v1 model, produce a calibration report on recorded data (Brier score, reliability plot, comparison vs. market mid).
 4. **Backtest + paper broker.** Replay recorded data with queue-aware fills and fees. Report PnL, win rate, max drawdown, trades/day, and edge vs. realized results. Include a clear statement on whether results beat a "trade nothing" baseline after fees.
 5. **Live paper.** Run the paper strategy in real time for at least several days. Compare live paper results to the backtest.
-6. **Demo environment.** Place real orders against Kalshi's demo environment to validate order/cancel/fill handling.
-7. **Live (optional, only if phases 4-6 show positive edge after fees).** Tiny size, all risk limits on, monitoring and alerts.
+6. **Demo environment.** Place real orders against Kalshi's demo environment to validate order/cancel/fill
+   handling. **Prerequisite:** real `record`/`paper` data collected on the owner's own machine (several days
+   of each) and reviewed -- calibration, backtest, and live-paper-vs-backtest comparison -- per
+   `docs/running-live.md`; phases 2-5 having only synthetic-fixture validation is not enough to start this
+   phase. Also needs a demo API key: the owner sets it up directly in a gitignored `.env`, never pasted into
+   any chat (a key that has been pasted anywhere is exposed and must be revoked/reissued, not used). No
+   Claude Code session uses or stores it, so the `demo-check` run in 6c is the owner's to execute -- Claude
+   writes the script, the owner runs it, the same division as `auth-check` today.
+   - **6a. Client write endpoints** (`kalshi_client.py`): `create_order`, `cancel_order`, `get_order`,
+     `list_orders`, `list_fills`, `get_positions`. Every order carries a client-generated `client_order_id`
+     so a retry can't double-place. The client refuses to sign write calls unless `env == demo` (a hard
+     assertion) until Phase 7. Tests use `httpx.MockTransport` with recorded demo payloads -- no network.
+   - **6b. `DemoExecutionBackend`** (`execution.py`): implements the existing `ExecutionBackend` protocol
+     unchanged, so strategy code cannot tell it isn't paper. Fills come from polling `list_fills`; an
+     authenticated WebSocket fill/order channel is a later addition, only if polling proves too slow. On
+     startup it reconciles local state against Kalshi's actual open orders and positions and cancels
+     orphans. The paper broker and the demo backend see the same book snapshots, so their fills are
+     directly comparable.
+   - **6c. Validation script** (`btcbot demo-check`), in order: `auth-check`; balance; a tiny
+     far-from-market resting order then a cancel; an order that fills, then a position and settlement
+     check; rejection handling (bad tick, insufficient balance, closed market); a rate-limit (429) backoff
+     test; a crash-and-restart reconciliation test. Writes a report with one row per check.
+   - **6d. Fidelity report:** compares the paper broker's queue-fill and fee model against actual demo
+     fills (latency, fill rate, fee charged) -- this is what settles whether makers pay a fee under plain
+     `quadratic` (see "Verified Kalshi API facts" in the README). Caveat: demo books are thin and synthetic
+     per that same table, so this validates plumbing and fee math, not edge.
+   - **Exit criteria:** every `demo-check` row passes, and a forced kill leaves no orphaned orders on the
+     exchange. Stop and report, per section 12, same as every other phase.
+
+**Phase 6.5 -- Live-readiness** (after demo validation, before any live money, not in the original spec):
+alerting (push or email on kill-switch, loss-limit pause, repeated errors, or a stale feed); monitoring
+(heartbeat, a stale-feed halt, an order/position reconciliation loop); a kill switch that cancels all
+resting orders on the exchange itself, not just locally; a runbook (startup, stop, incident steps) under
+`docs/`; a settlement follow-up check that the bot's own PnL matches the account balance.
+
+7. **Live (optional, only if phases 4-6 show positive edge after fees).** Requires ALL four gates from
+   section 7, plus a unit test asserting that dropping any single one of them refuses to start. Minimal
+   size, hard exposure and daily-loss caps, size never increases after a loss, no martingale. Rollout: a
+   supervised first day with a runtime cap of a few hours and the owner watching, then extend slowly. Kill
+   criteria are written down in advance (e.g. live results deviating from paper by more than a set amount,
+   or drawdown past a set threshold, means stop and reassess). No profitability claims without recorded
+   out-of-sample results.
+
+**Beyond Phase 7 (optional, not gated, not scheduled):** authenticated WebSocket order-book deltas for full
+order-flow data, plus the `cfbenchmarks_value` channel for BRTI itself; model v2 (jump/vol-regime handling,
+a walk-forward recalibration schedule); fee-aware taker paths if the maker edge proves too thin; a parameter
+sweep under strict out-of-sample and multiple-testing discipline; an analysis dashboard for paper vs. live
+vs. backtest.
 
 ## 9. Testing and quality
 
