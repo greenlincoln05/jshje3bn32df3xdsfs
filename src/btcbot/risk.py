@@ -1,6 +1,149 @@
-"""Risk limits, kill switch and position/PnL tracking. Placeholder, first needed for Phase 4: nothing is implemented yet.
+"""Risk limits, kill switch and position/PnL tracking (Phase 4), per docs/btc15m-bot-spec.md section 5.
 
-Planned per docs/btc15m-bot-spec.md (section 5), checked before every order: per-trade and open-exposure caps, trades per
-hour, a daily loss limit, a pause after consecutive losses, and a KILL file that cancels open orders and exits. Position
-size must never increase after a loss. On any unhandled exception or auth failure: cancel open orders, log, exit non-zero.
+Every limit here is checked by :meth:`RiskManager.check_new_order` before an order is placed, never after.
+"Size never increases after a loss" is enforced as an active gate, not merely an absence of a feature: a
+loss of size S caps the next order at S until a win clears the cap. That is narrower than a permanent
+one-way ratchet -- it stops martingale-style doubling right after a loss, which is what section 5 and
+CLAUDE.md's "no size increase after a loss" are about, not a rule against ever sizing normally again.
+
+"Pause after consecutive losses ... require manual restart" has no human in the loop during a backtest.
+:meth:`RiskManager.resume` is that manual step; a backtest that never calls it after a pause is faithfully
+simulating what would happen live, including however much of the run that leaves untraded.
 """
+
+from __future__ import annotations
+
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from btcbot.config import RiskLimits
+
+
+@dataclass(frozen=True, slots=True)
+class RiskDecision:
+    approved: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TradeOutcome:
+    ts: datetime
+    size: Decimal
+    pnl_usd: Decimal  # net of fees; negative is a loss
+
+
+class RiskManager:
+    def __init__(
+        self,
+        limits: RiskLimits,
+        *,
+        kill_file: str | Path = "KILL",
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
+        self._limits = limits
+        self._kill_file = Path(kill_file)
+        self._clock = clock
+        self._open_exposure_usd = Decimal("0")
+        self._trade_times: deque[datetime] = deque()
+        self._consecutive_losses = 0
+        self._paused = False
+        self._pause_reason = ""
+        self._daily_loss_usd = Decimal("0")
+        self._daily_reset_date = None
+        self._max_size_since_loss: Decimal | None = None
+
+    # ---- read-only state, useful for reporting
+
+    @property
+    def open_exposure_usd(self) -> Decimal:
+        return self._open_exposure_usd
+
+    @property
+    def consecutive_losses(self) -> int:
+        return self._consecutive_losses
+
+    @property
+    def daily_loss_usd(self) -> Decimal:
+        return self._daily_loss_usd
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def kill_switch_active(self) -> bool:
+        return self._kill_file.exists()
+
+    def _roll_daily_window(self, now: datetime) -> None:
+        today = now.astimezone(timezone.utc).date()
+        if today != self._daily_reset_date:
+            self._daily_reset_date = today
+            self._daily_loss_usd = Decimal("0")
+
+    # ---- the gate
+
+    def check_new_order(self, *, size: Decimal, price: Decimal, now: datetime | None = None) -> RiskDecision:
+        now = now if now is not None else self._clock()
+        self._roll_daily_window(now)
+        if self.kill_switch_active():
+            return RiskDecision(False, "KILL file present")
+        if self._paused:
+            return RiskDecision(False, f"paused: {self._pause_reason}")
+        if self._daily_loss_usd >= self._limits.daily_loss_limit_usd:
+            return RiskDecision(False, "daily loss limit reached")
+        if size <= 0:
+            return RiskDecision(False, "size must be positive")
+        if size > self._limits.max_contracts_per_trade:
+            return RiskDecision(False, "exceeds max_contracts_per_trade")
+        if self._max_size_since_loss is not None and size > self._max_size_since_loss:
+            return RiskDecision(False, "size increase after a loss is not allowed")
+        exposure = price * size
+        if self._open_exposure_usd + exposure > self._limits.max_open_exposure_usd:
+            return RiskDecision(False, "exceeds max_open_exposure_usd")
+        self._drop_trades_older_than_an_hour(now)
+        if len(self._trade_times) >= self._limits.max_trades_per_hour:
+            return RiskDecision(False, "exceeds max_trades_per_hour")
+        return RiskDecision(True)
+
+    def _drop_trades_older_than_an_hour(self, now: datetime) -> None:
+        while self._trade_times and (now - self._trade_times[0]) > timedelta(hours=1):
+            self._trade_times.popleft()
+
+    # ---- lifecycle: call these once check_new_order has approved and the order is acted on
+
+    def record_order_opened(self, *, size: Decimal, price: Decimal, now: datetime | None = None) -> None:
+        now = now if now is not None else self._clock()
+        self._trade_times.append(now)
+        self._open_exposure_usd += price * size
+
+    def release_exposure(self, usd: Decimal) -> None:
+        """For a position closed with an unknown outcome (e.g. replay data ends before settlement):
+        release the capital without touching the win/loss streak, since the outcome is genuinely unknown."""
+        self._open_exposure_usd = max(Decimal("0"), self._open_exposure_usd - usd)
+
+    def record_trade_closed(self, outcome: TradeOutcome, *, exposure_released_usd: Decimal) -> None:
+        self.release_exposure(exposure_released_usd)
+        self._roll_daily_window(outcome.ts)
+        if outcome.pnl_usd < 0:
+            self._daily_loss_usd += -outcome.pnl_usd
+            self._consecutive_losses += 1
+            self._max_size_since_loss = (
+                outcome.size if self._max_size_since_loss is None else min(self._max_size_since_loss, outcome.size)
+            )
+            if self._consecutive_losses >= self._limits.max_consecutive_losses:
+                self._paused = True
+                self._pause_reason = f"{self._consecutive_losses} consecutive losses"
+        else:
+            self._consecutive_losses = 0
+            self._max_size_since_loss = None
+
+    def resume(self) -> None:
+        """The manual restart spec section 5 asks for after a consecutive-loss pause."""
+        self._paused = False
+        self._pause_reason = ""
+        self._consecutive_losses = 0
