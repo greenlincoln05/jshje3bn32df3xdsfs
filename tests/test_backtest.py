@@ -80,7 +80,7 @@ def seed_fillable_window(conn, ticker, *, start_ts, strike=Decimal("80000"), clo
     an up-trending spot feed (so YES has a clear edge over the 0.30 bid)."""
     close_time = close_time or (start_ts + timedelta(seconds=500))
     sizes = sizes if sizes is not None else [15, 14, 13, 12, 11, 10, 14, 0]
-    insert_spot_run(conn, start_ts - timedelta(seconds=20), 20)
+    insert_spot_run(conn, start_ts - timedelta(seconds=90), 110)
     insert_market(conn, ticker, strike=strike, close_time=close_time, open_time=start_ts - timedelta(seconds=300))
     for offset, size in enumerate(sizes):
         insert_snapshot(
@@ -204,7 +204,7 @@ class TestRollover:
         conn = make_db(tmp_path)
         # window 1: depth never shrinks, so the order rests but is never filled
         close_1 = T0 + timedelta(seconds=500)
-        insert_spot_run(conn, T0 - timedelta(seconds=20), 20)
+        insert_spot_run(conn, T0 - timedelta(seconds=90), 110)
         insert_market(conn, TICKER, strike=Decimal("80000"), close_time=close_1, open_time=T0 - timedelta(seconds=300))
         for offset in range(5):
             insert_snapshot(conn, TICKER, T0 + timedelta(seconds=offset), yes=[("0.30", "20")], no=[("0.68", "15")])
@@ -228,7 +228,7 @@ class TestRollover:
     def test_windows_seen_counts_untraded_windows_too(self, tmp_path):
         conn = make_db(tmp_path)
         close_time = T0 + timedelta(seconds=500)
-        insert_spot_run(conn, T0 - timedelta(seconds=20), 20)
+        insert_spot_run(conn, T0 - timedelta(seconds=90), 110)
         insert_market(conn, TICKER, strike=Decimal("80000"), close_time=close_time, open_time=T0 - timedelta(seconds=300))
         # depth never dips below min_depth=10, so nothing ever fills
         for offset in range(5):

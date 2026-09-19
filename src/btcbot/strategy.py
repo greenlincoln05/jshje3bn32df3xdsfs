@@ -54,12 +54,14 @@ def decide(
     has_resting_order: bool,
     has_position: bool,
 ) -> Decision:
-    if has_position:
-        return Decision(Action.HOLD, reason="already positioned; holding to settlement")
     if has_resting_order:
+        if spot_is_stale:
+            return Decision(Action.CANCEL, reason="cancelling because pricing inputs are unavailable")
         if tau_sec <= cancel_before_close_sec:
             return Decision(Action.CANCEL, reason="cancelling before close")
         return Decision(Action.HOLD, reason="order already resting")
+    if has_position:
+        return Decision(Action.HOLD, reason="already positioned; holding to settlement")
     if spot_is_stale:
         return Decision(Action.SKIP, reason="stale spot feed")
     if not (min_tau_sec <= tau_sec <= max_tau_sec):

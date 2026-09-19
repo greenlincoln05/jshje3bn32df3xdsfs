@@ -327,8 +327,8 @@ def make_backtest_db(tmp_path):
     close_time = start + timedelta(seconds=500)
 
     price = Decimal("80000")
-    for i in range(20):
-        ts = start - timedelta(seconds=20) + timedelta(seconds=i)
+    for i in range(110):
+        ts = start - timedelta(seconds=90) + timedelta(seconds=i)
         price = price + Decimal("1") if i % 2 == 0 else price - Decimal("0.5")
         conn.execute(
             "INSERT INTO spot_ticks (source, price, source_ts, receive_ts, monotonic_ts) VALUES (?,?,?,?,?)",

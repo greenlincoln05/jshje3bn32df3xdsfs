@@ -352,7 +352,7 @@ async def _cmd_paper(args: argparse.Namespace) -> int:
 
         def on_tick(tick):
             recorder.record_spot_tick(tick)
-            trader.on_spot_tick(tick.price)
+            trader.on_spot_tick(tick.price, tick.receive_ts)
 
         spot_feed = CoinbaseSpotFeed(spot_buffer, on_tick=on_tick)
         spot_task = asyncio.ensure_future(spot_feed.run_forever())

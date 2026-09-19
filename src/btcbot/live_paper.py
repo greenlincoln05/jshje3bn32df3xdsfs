@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 
 from btcbot.backtest import BacktestReport, TradeRecord, build_report
 from btcbot.execution import PaperExecutionBackend
-from btcbot.model import EwmaVolatility, ModelState, Prediction, init_predictions_schema, log_prediction, log_return, predict
+from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictions_schema, log_prediction, predict
 from btcbot.models import Market, OrderBook
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
@@ -66,9 +66,8 @@ class LivePaperTrader:
         self._broker = PaperBroker(maker_fee_multiplier=maker_fee_multiplier, queue_assumption=queue_assumption)
         self._backend = PaperExecutionBackend(self._broker)
         self._risk = RiskManager(config.risk, kill_file=kill_file, clock=lambda: self.last_ts or datetime.now(timezone.utc))
-        self._vol = EwmaVolatility(config.vol_window_sec)
+        self._vol = TimedVolatility(config.vol_window_sec)
 
-        self._last_price_for_vol: Decimal | None = None
         self._current_ticker: str | None = None
         self._resting_order_id: str | None = None
         self._position: TradeRecord | None = None
@@ -88,10 +87,8 @@ class LivePaperTrader:
     def unresolved_count(self) -> int:
         return len(self._pending_settlements)
 
-    def on_spot_tick(self, price: Decimal) -> None:
-        if self._last_price_for_vol is not None:
-            self._vol.update(log_return(self._last_price_for_vol, price))
-        self._last_price_for_vol = price
+    def on_spot_tick(self, price: Decimal, ts: datetime) -> None:
+        self._vol.update(price, ts)
 
     async def on_orderbook_snapshot(self, market: Market, book: OrderBook, poll_ts: datetime) -> None:
         self.first_ts = self.first_ts or poll_ts
@@ -109,14 +106,16 @@ class LivePaperTrader:
         if spot is None:
             return
         tau_sec = (market.close_time - poll_ts).total_seconds()
-        if tau_sec < 0:
+        if tau_sec <= 0:
             return
 
         state = ModelState(spot=spot, strike=market.strike, tau_sec=tau_sec, sigma=self._vol.sigma, market_mid=book.mid("yes"))
         p_model, p_blend = predict(state, blend=float(self._config.model_blend))
-        log_prediction(
-            self._conn, Prediction(market.ticker, poll_ts, state, float(self._config.model_blend), p_model, p_blend)
-        )
+        pricing_ready = self._vol.ready and not self._spot_buffer.is_stale() and tau_sec > 60
+        if pricing_ready:
+            log_prediction(
+                self._conn, Prediction(market.ticker, poll_ts, state, float(self._config.model_blend), p_model, p_blend)
+            )
 
         for fill in self._backend.sync_market(book, poll_ts):
             self.windows_traded.add(market.ticker)
@@ -128,7 +127,9 @@ class LivePaperTrader:
             book=book,
             tau_sec=tau_sec,
             p_yes=p_blend,
-            spot_is_stale=self._spot_buffer.is_stale(),
+            # No BRTI partial average is supplied yet: do not open new positions
+            # in the final minute using the model's spot fallback as an average.
+            spot_is_stale=not pricing_ready,
             min_edge=self._config.min_edge,
             min_depth=self._config.min_depth,
             max_spread=self._config.max_spread,
