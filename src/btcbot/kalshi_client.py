@@ -409,6 +409,20 @@ class KalshiClient:
         )
         return CancelAck.from_api(data)
 
+    async def set_target_balance_allocation(self, percent_by_exchange: Mapping[int, int]) -> None:
+        """Opt in to (or change) Kalshi's automatic collateral rebalancing across exchange shards: every ~10 s
+        it moves the account's sweepable balance toward these percentages. Needed because crypto markets trade on
+        their own shard (2) and an order there is rejected with ``insufficient_shard_balance`` until collateral
+        is on it. A write to account state, so demo-only like the order calls. Percentages must total 100;
+        an empty mapping disables rebalancing."""
+        self._require_demo("set_target_balance_allocation")
+        if percent_by_exchange and sum(percent_by_exchange.values()) != 100:
+            raise ValueError("allocation percentages must total 100")
+        if any(i < 0 or not 0 <= p <= 100 for i, p in percent_by_exchange.items()):
+            raise ValueError("exchange_index must be >= 0 and each percent between 0 and 100")
+        body = {"allocations": [{"exchange_index": i, "percent": p} for i, p in sorted(percent_by_exchange.items())]}
+        await self._request("POST", "/portfolio/target_balance_allocation", authenticated=True, json_body=body)
+
     def _require_demo(self, action: str) -> None:
         if self.env is not KalshiEnv.DEMO:
             raise KalshiWriteNotAllowedError(

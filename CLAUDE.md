@@ -73,6 +73,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - BRTI + order-book stream, READ-ONLY, needs YOUR key in `.env` (run by the owner): `.venv/Scripts/btcbot.exe stream --env prod --hours 9`
 - Strategy lab on recorded data (offline): `.venv/Scripts/btcbot.exe lab --grid min_edge=0.02,0.04 --grid max_price=none,0.6`
 - Demo-only order validation, needs a demo key (Phase 6, owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe demo-check`
+- One-time demo setup, needs YOUR demo key (run by the owner; puts collateral on the shard BTC trades on): `.venv/Scripts/btcbot.exe demo-allocate`
 - Demo-environment order validation, needs YOUR demo key (run by the owner): `.venv/Scripts/btcbot.exe demo-check`
 - Strategy placing REAL orders on the DEMO exchange (fake money), with a paper twin of every order, needs YOUR demo key: `.venv/Scripts/btcbot.exe demo --hours 2`
 - Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`

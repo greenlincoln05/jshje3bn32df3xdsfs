@@ -148,9 +148,17 @@ against it.
 
 ```powershell
 btcbot auth-check --env demo      # one signed balance read
+btcbot demo-allocate              # ONCE: put demo collateral on the exchange shard BTC trades on (see below)
 btcbot demo-check                 # places and cancels tiny orders, checks rejections, reads orders back
 btcbot demo --hours 2             # the paper strategy, placing real demo orders
 ```
+
+**Why `demo-allocate`:** Kalshi splits an account's balance across exchange shards, and crypto markets (KXBTC15M)
+trade on their own shard (index 2). An order there is rejected with `HTTP 404 insufficient_shard_balance` (a
+misleading 404) unless collateral is on that shard, however much money the account holds in total. `demo-allocate`
+sets Kalshi's target balance allocation so the funds move there (about 10 s), then waits and confirms. It is a
+demo-only account change; `demo-check` and `demo` both check for this first and say so instead of failing order by
+order. Note the funds then sit on shard 2, so a market on another shard would need its own allocation.
 
 `demo-check` uses Kalshi's V2 order endpoints, which quote everything from the YES side, so a NO order is sent as
 an `ask` on YES at `1 - price`. It places one tiny unfillable YES order and one NO order, **reads each back**,

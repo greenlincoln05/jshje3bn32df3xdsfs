@@ -317,3 +317,31 @@ class TestSideMappingIsVerifiedAgainstTheExchange:
         assert result.passed is False and "mapping" in result.detail and "WRONG" in result.detail
         assert report.ok is False
         assert all(order.is_done for order in client.orders.values() if order.price == Decimal("0.01"))  # nothing left resting
+
+
+class TestShardCollateralPreflight:
+    async def test_no_collateral_on_the_markets_shard_stops_with_one_clear_row(self):
+        client = FakeClient()
+        client.open_markets = [make_market(raw={"exchange_index": 2})]
+        client.balance = Balance(available=Decimal("100"), portfolio_value=Decimal(0), by_exchange={0: Decimal("100"), 2: Decimal(0)})
+
+        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+
+        row = result_named(report, "collateral on the market's exchange shard")
+        assert row.passed is False and "shard 2" in row.detail and "demo-allocate" in row.detail
+        assert report.ok is False
+        assert [r.name for r in report.results][-1] == "collateral on the market's exchange shard"  # nothing else was tried
+        assert client.orders == {}  # and no order was sent to fail the same way four times
+
+    async def test_funded_shard_lets_the_checks_run(self):
+        client = FakeClient()
+        client.open_markets = [make_market(raw={"exchange_index": 2})]
+        client.balance = Balance(available=Decimal("100"), portfolio_value=Decimal(0), by_exchange={2: Decimal("100")})
+        report = await run_demo_check(client, SERIES, clock=lambda: T0)
+        assert result_named(report, "collateral on the market's exchange shard").passed is True
+        assert result_named(report, "resting YES order + cancel").passed is True
+
+    async def test_an_unreported_shard_is_a_skip_not_a_failure(self):
+        report = await run_demo_check(FakeClient(), SERIES, clock=lambda: T0)  # no exchange_index, no breakdown
+        assert result_named(report, "collateral on the market's exchange shard").passed is None
+        assert report.ok is True

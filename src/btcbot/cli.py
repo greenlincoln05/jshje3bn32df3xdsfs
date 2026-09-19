@@ -43,6 +43,7 @@ from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.lab import DEFAULT_GRID, AccountSettings, LabError, load_lab_data, parse_values, render_lab_report, run_lab
+from btcbot.demo_check import collateral_preflight
 from btcbot.demo_trader import DemoTrader, render_demo_report
 from btcbot.execution import DemoExecutionBackend
 from btcbot.live_paper import LivePaperTrader
@@ -467,6 +468,54 @@ async def _cmd_lab(args: argparse.Namespace) -> int:
     return 0
 
 
+CRYPTO_EXCHANGE_INDEX = 2  # docs.kalshi.com "Exchange Sharding": crypto (KXBTC...) markets trade on shard 2
+
+
+def allocation_for(shard: int | None, percent: int) -> dict[int, int]:
+    """Target percentages: ``percent`` of the balance on the market's shard, the remainder on shard 0."""
+    shard = CRYPTO_EXCHANGE_INDEX if shard is None else shard
+    if not 1 <= percent <= 100:
+        raise ValueError("percent must be between 1 and 100")
+    if shard == 0 or percent == 100:
+        return {shard: 100}
+    return {shard: percent, 0: 100 - percent}
+
+
+async def _cmd_demo_allocate(args: argparse.Namespace) -> int:
+    """Move demo collateral onto the exchange shard the BTC market trades on (Kalshi splits balances across shards;
+    an order on a shard with no collateral is rejected with insufficient_shard_balance). Demo only, run once."""
+    config = load_config(args.config)
+    series_ticker = args.series or config.series_ticker
+    settings = KalshiSettings()
+    if settings.key_id is None or settings.private_key_path is None:
+        raise ConfigError("KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (a DEMO key)")
+    auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
+    async with KalshiClient(KalshiEnv.DEMO, auth=auth) as client:
+        market = await find_current_market(client, series_ticker)
+        shard = market.exchange_index if market is not None else None
+        if shard is None:
+            print(f"Kalshi did not report an exchange shard for {series_ticker}; assuming crypto's shard {CRYPTO_EXCHANGE_INDEX}.")
+        target = allocation_for(shard, args.percent)
+        shard = shard if shard is not None else CRYPTO_EXCHANGE_INDEX
+        before = await client.get_balance()
+        print(f"Demo balance ${before.available:,.2f}; by shard: {dict(sorted(before.by_exchange.items())) or 'not reported'}")
+        print(f"Setting target allocation {target} (percent by exchange shard). Kalshi rebalances about every 10 s.")
+        await client.set_target_balance_allocation(target)
+        for _ in range(15):
+            await asyncio.sleep(3)
+            after = await client.get_balance()
+            if after.by_exchange.get(shard, Decimal(0)) > 0:
+                print(f"OK: ${after.by_exchange[shard]:,.2f} is now on shard {shard}. Re-run `btcbot demo-check`.")
+                return 0
+        print(
+            f"Allocation accepted, but shard {shard} still shows no funds after 45 s "
+            f"(by shard: {dict(sorted(after.by_exchange.items())) or 'not reported'}). Wait a little and re-run "
+            "`btcbot demo-check`; if it still fails, paste this output.",
+            file=sys.stderr,
+        )
+        return 1
+
+
 async def _cmd_demo(args: argparse.Namespace) -> int:
     """The paper trader's strategy placing REAL orders in Kalshi's DEMO environment (fake money). Needs the
     owner's own demo key in .env. Always the demo environment: the client itself also refuses to sign an order
@@ -489,6 +538,12 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
 
     async with KalshiClient(env, auth=auth) as client:  # signs only the calls that need it; market data stays public
         balance = await client.get_balance()  # proves the demo key works before anything is placed
+        market_now = await find_current_market(client, series_ticker)
+        if market_now is not None:
+            collateral = collateral_preflight(balance, market_now)
+            if collateral.passed is False:
+                print(f"error: {collateral.detail}", file=sys.stderr)
+                return 1
         reconcile = await DemoExecutionBackend(client, "").reconcile()
         print(
             f"Demo account: available ${balance.available:,.2f}. Cancelled {len(reconcile.cancelled_order_ids)} "
@@ -763,6 +818,14 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--maker-fee-multiplier", default="0", help="fee multiplier for the SHADOW paper order only (default: 0)")
     demo.set_defaults(handler=_cmd_demo)
 
+    allocate = commands.add_parser(
+        "demo-allocate",
+        help="one-time: move DEMO collateral onto the exchange shard BTC trades on (fixes insufficient_shard_balance)",
+    )
+    allocate.add_argument("--series", help="override series_ticker from config.yaml")
+    allocate.add_argument("--percent", type=int, default=100, help="percent of the balance to put on the market's shard (default: 100)")
+    allocate.set_defaults(handler=_cmd_demo_allocate)
+
     calibrate = commands.add_parser(
         "calibrate", help="Brier score + reliability table from predictions logged into a recorder database"
     )
@@ -865,6 +928,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.top < 1 or args.min_train_trades < 1 or args.max_combos < 1:
             print("error: --top, --min-train-trades and --max-combos must be at least 1", file=sys.stderr)
             return 2
+    if args.command == "demo-allocate" and not 1 <= args.percent <= 100:
+        print("error: --percent must be between 1 and 100", file=sys.stderr)
+        return 2
     if args.command == "demo":
         if not math.isfinite(args.hours) or args.hours <= 0 or not math.isfinite(args.poll_interval) or args.poll_interval <= 0:
             print("error: --hours and --poll-interval must be finite and greater than 0", file=sys.stderr)
