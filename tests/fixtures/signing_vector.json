@@ -1,0 +1,6 @@
+{
+  "description": "Signature produced by OpenSSL (independent of the cryptography library) with Kalshi's parameters: RSA-PSS, SHA-256, MGF1(SHA-256), salt length 32. Message is the example from Kalshi's docs. Only the public key is stored.",
+  "message": "1703123456789GET/trade-api/v2/portfolio/balance",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1FYZ2SbHH/M1GbhnICPr\nhv13lTPg9DBOx8rotNY6leK/ACwFC5sNMabDlrzLZscb+FT6s/aoPt59J6XeCftZ\nYJkDc+5eQuXI+V0bz02Dve2boMd4jcKi72epb53Q5t0IR4rKD4bwnRWIF5sJcFjK\nJdqjH1//cvcXAIMVnNxsm0/0BHTkjhR/uMLJHdauRUzwyXqyeVwzdaICMGg6qj0F\nrd45fu/XF74OhSk1PMU3VhHRo7YOPfSZHCwJB+8r2BExhdiaAnmGwLKZhS2UyGYZ\n19XwY5iis0YyE5ieIrZrKCD9zQaXOd1kECp4UB9K1Zo6CZabdZdqJhEdW/ugLTbL\nvQIDAQAB\n-----END PUBLIC KEY-----\n",
+  "signature_b64": "XnakVrQRlEeG5C03rRbIJT16dbor2Q0AzYDG68m5Mfml5HFWysOzKH5sZafn7FCWDgrYZPGJp1G9rdsowXpieW9LTon9fhpzzO7fOMMGLfF4GxIxd26kQcTR8IiZhxmIP05TxldrQwzESP5s3d+G6pZoGajb5zXgmaWnClgXeNc9TqUOunKT1MU8q5v6fGNSBE8oyG0Wh1E+1J+Cc9bedwCnDH+Qpg0IVBhwOBsnNU/bKUixTAf3iW/gbND8hG+nMqbwPQc6eJz7X1NmTZa9LH/TBDL/aLqE6Bx9syg9ghRIZ2APgf95/iLBMrMHO9RX/xAPP2OiPGxPasHScSNX8g=="
+}
