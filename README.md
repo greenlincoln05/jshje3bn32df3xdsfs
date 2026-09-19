@@ -83,17 +83,32 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
 ```text
 config.yaml                 all tunables (spec section 6); credentials and environment are NOT in here
 .env.example                KALSHI_ENV, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH
+CLAUDE.md                   working rules and conventions for Claude Code sessions in this repo
+docs/
+  btc15m-bot-spec.md        the original build spec: source of truth for scope and phases
 src/btcbot/
   config.py                 BotConfig (config.yaml) and KalshiSettings (env vars / .env)
-  models.py                 Market, Event, Series, OrderBook, Balance: Decimal-only views of API payloads
+  models.py                 Market, Series, OrderBook, Balance: Decimal-only views of API payloads
   kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff
   market_discovery.py       find the open KXBTC15M market: series -> open markets (see the discovery note below)
   cli.py                    discover, auth-check
-tests/                      pytest; fixtures/ holds real public API payloads and an OpenSSL signing vector
+  spot_feed.py              placeholder, Phase 2: Coinbase spot feed
+  recorder.py               placeholder, Phase 2: order books, spot ticks and settlements to disk
+  model.py                  placeholder, Phase 3: fair-probability model
+  strategy.py               placeholder, Phase 4: edge and entry/exit decisions
+  risk.py                   placeholder, Phase 4: limits, kill switch, PnL tracking
+  execution.py              placeholder, Phase 4: one order interface for paper and live
+  paper_broker.py           placeholder, Phase 4: queue-aware simulated fills
+  backtest.py               placeholder, Phase 4: replay recorded data
+tests/
+  fixtures/                 real public API payloads and an OpenSSL signing vector
+  test_signing.py, test_client.py, test_config.py, test_models.py, test_market_discovery.py, test_cli.py
+  test_model.py, test_risk.py, test_paper_broker.py     placeholders for Phases 3 and 4
 ```
 
-Later phases add `spot_feed`, `recorder`, `model`, `strategy`, `risk`, `execution`, `paper_broker`, `backtest` and the
-WebSocket client. `models.py` is an addition to the layout in the build spec.
+Placeholder modules hold only a docstring saying what the build spec asks of them; they contain no behaviour and are
+filled in by their phase. `config.py` and `models.py` are additions to the layout in the build spec, and the WebSocket
+client will live in `kalshi_client.py` when Phase 2 adds it.
 
 ## Verified Kalshi API facts
 
