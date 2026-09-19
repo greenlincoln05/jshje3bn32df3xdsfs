@@ -11,12 +11,18 @@ truth for scope and phases; the README has the phase status and a dated table of
 - No martingale, doubling or any size increase after a loss. No secrets in the repo (`.env*`, `*.pem`, `*.key`, key-like `.txt` files and `secrets/` are
   gitignored). No profitability claims without recorded out-of-sample results. No Robinhood scraping and no unofficial
   data sources.
-- The placeholder modules (`spot_feed`, `recorder`, `model`, `strategy`, `risk`, `execution`, `paper_broker`,
-  `backtest`) hold only a docstring. Replacing one is part of its phase, not of housekeeping.
+- The placeholder modules (`model`, `strategy`, `risk`, `execution`, `paper_broker`, `backtest`) hold only a
+  docstring. Replacing one is part of its phase, not of housekeeping. `spot_feed` and `recorder` (Phase 2) are
+  implemented.
+- No API key, demo or production, gets used or written to a repo file by a Claude Code session. A key pasted
+  into any chat is treated as exposed; the fix is to revoke/reissue it, never to use it. Phase 2's recorder
+  uses public, unauthenticated endpoints only for this reason (Kalshi's order-book WebSocket needs a key even
+  for public data).
 
 ## Commands
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
 - Read-only live check, no credentials needed: `.venv/Scripts/btcbot.exe discover --env prod`
+- Record public data (no credentials needed): `.venv/Scripts/btcbot.exe record --env prod --hours 9`
 
 ## Conventions
 - Prices and contract counts are `Decimal`, never `float`. The client decodes JSON numbers straight to `Decimal`.
