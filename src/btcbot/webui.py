@@ -206,6 +206,29 @@ def _downsample(rows: list[Any], limit: int) -> list[Any]:
     return [rows[int(i * step)] for i in range(limit)] + [rows[-1]]
 
 
+def market_quote(db_path: Path, ticker: str) -> dict[str, Any]:
+    """Small read-only snapshot for fast rendering; never scans chart/trade history."""
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1)
+    try:
+        book = conn.execute(
+            "SELECT poll_ts, book_json, latency_ms FROM orderbook_snapshots "
+            "WHERE ticker=? ORDER BY poll_ts DESC LIMIT 1", (ticker,),
+        ).fetchone()
+        meta = conn.execute(
+            "SELECT open_time, close_time FROM market_state WHERE ticker=? ORDER BY poll_ts DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        spot = conn.execute(
+            "SELECT price, receive_ts FROM spot_ticks WHERE receive_ts>=? AND receive_ts<=? "
+            "ORDER BY receive_ts DESC LIMIT 1", meta,
+        ).fetchone() if meta else None
+        return {"ticker": ticker, "book": json.loads(book[1]) if book else {"yes": [], "no": []},
+                "book_ts": book[0] if book else None, "book_latency_ms": book[2] if book else None,
+                "spot": spot[0] if spot else None, "spot_ts": spot[1] if spot else None}
+    finally:
+        conn.close()
+
+
 def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
     """Everything the Market tab draws for one window of a recorder/paper database: market metadata, the
     latest order book, spot and YES-mid history, and this window's paper trades. Read-only."""
@@ -441,6 +464,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"databases": list_databases(self.server.data_dir)})
             elif parsed.path == "/api/paper_summary":
                 self._send_json(200, self._paper_summary(query))
+            elif parsed.path == "/api/quote":
+                self._send_json(200, market_quote(self._require_db(query), query.get("ticker", "")))
             elif parsed.path == "/api/market":
                 db_path = self._require_db(query)
                 try:
@@ -1256,6 +1281,29 @@ async function labCancel() { if (labJob) { try { await postJson("/api/lab/cancel
 
 let tab = "market";
 let refreshing = false;
+let quoting = false;
+async function refreshQuote() {
+  if (quoting || refreshing || document.hidden || tab !== "market" || !market?.ticker) return;
+  const db = $("db-select").value, ticker = market.ticker, selection = $("ticker-select").value;
+  if (selection && selection !== ticker) return;
+  quoting = true;
+  try {
+    const q = await getJson(`/api/quote?db=${encodeURIComponent(db)}&ticker=${encodeURIComponent(ticker)}`);
+    if (refreshing || db !== $("db-select").value || selection !== $("ticker-select").value || ticker !== market?.ticker) return;
+    if (q.book_ts && (!market.book_ts || q.book_ts >= market.book_ts)) {
+      market.book = q.book; market.book_ts = q.book_ts; market.book_latency_ms = q.book_latency_ms;
+      renderBook();
+      $("st-ts").textContent = new Date(q.book_ts).toLocaleTimeString();
+      $("st-latency").textContent = q.book_latency_ms == null ? "--" : q.book_latency_ms.toFixed(0) + " ms";
+    }
+    if (q.spot_ts && (!market.spot_ts || q.spot_ts >= market.spot_ts)) {
+      market.spot = q.spot; market.spot_ts = q.spot_ts;
+      $("f-spot").textContent = "$" + num(Number(q.spot));
+    }
+    updateAge();
+  } catch (e) { /* ages continue advancing when the local reader is unavailable */ }
+  finally { quoting = false; }
+}
 async function refreshTab() {
   if (refreshing) return;  // a slow response must not pile up requests behind it
   refreshing = true;
@@ -1297,8 +1345,9 @@ window.addEventListener("resize", () => { if (tab === "market" || tab === "monit
   buildLabForm(dbList);
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
-  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor")) refreshTab(); }, 500);
-  setInterval(updateAge, 200);
+  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor")) refreshTab(); }, 1000);
+  setInterval(refreshQuote, 50);
+  setInterval(updateAge, 50);
 })();
 </script>
 </body>

@@ -235,8 +235,11 @@ and following settlements. An overrun retains a full interval cooldown; failures
 also retain their existing cooldown. This removes additive request-time delay without
 catch-up request bursts. This is still REST sampling, not streaming order-book data.
 
-The dashboard refreshes visible market/monitor tabs every 500 ms, with at most one
-refresh in flight and a five-second fetch timeout. Book and Coinbase spot ages are
+The dashboard reads lightweight quotes up to 20 times/second (50 ms) while the
+Market tab is visible. Charts/history and the monitor refresh once per second. Each
+refresh lane permits only one request in flight, with a five-second fetch timeout.
+Fast quote reads skip while a full refresh is running. This cadence only reads local
+SQLite; it does not increase external API requests or create new market ticks. Book and Coinbase spot ages are
 shown separately; an open window is marked STALE if either is missing or at least
 three seconds old. Book request latency is displayed separately from data age.
 Historical spot charts and prices are limited to the selected market window.
