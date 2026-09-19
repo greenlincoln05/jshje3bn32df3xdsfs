@@ -118,7 +118,12 @@ def list_databases(data_dir: Path) -> list[dict[str, Any]]:
     entries = []
     for path in sorted(data_dir.glob("*.sqlite"), key=lambda p: p.stat().st_mtime, reverse=True):
         name = path.name
-        kind = "paper" if name.startswith("paper-") else "recorder" if name.startswith("recorder-") else "unknown"
+        kind = (
+            "paper" if name.startswith("paper-")
+            else "recorder" if name.startswith("recorder-")
+            else "stream" if name.startswith("stream-")
+            else "unknown"
+        )
         stat = path.stat()
         entries.append({"name": name, "kind": kind, "size_bytes": stat.st_size, "modified_ts": stat.st_mtime})
     return entries
@@ -223,11 +228,21 @@ def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
         latest_spot = conn.execute("SELECT price, receive_ts FROM spot_ticks ORDER BY id DESC LIMIT 1").fetchone()
         settlement = conn.execute(
             "SELECT result, settled_avg FROM settlements WHERE ticker=?", (ticker,)).fetchone()
-        trades = [asdict(t) for t in reversed(_safe_trades(conn)) if t.ticker == ticker]
+        all_trades = _safe_trades(conn)
+        trades = [asdict(t) for t in reversed(all_trades) if t.ticker == ticker]
+        closes = dict(conn.execute("SELECT ticker, MAX(close_time) FROM market_state GROUP BY ticker"))
+        results = dict(conn.execute("SELECT ticker, result FROM settlements"))
+        trade_counts: dict[str, int] = {}
+        for t in all_trades:
+            trade_counts[t.ticker] = trade_counts.get(t.ticker, 0) + 1
+        windows = [
+            {"ticker": tk, "close_time": closes.get(tk), "result": results.get(tk), "trades": trade_counts.get(tk, 0)}
+            for tk in tickers
+        ]
     finally:
         conn.close()
     return {
-        "tickers": tickers, "ticker": ticker,
+        "tickers": tickers, "windows": windows, "ticker": ticker,
         "status": meta[0] if meta else None, "strike": meta[1] if meta else None,
         "open_time": meta[2] if meta else None, "close_time": meta[3] if meta else None,
         "volume": meta[4] if meta else None, "open_interest": meta[5] if meta else None,
@@ -428,6 +443,12 @@ INDEX_HTML = r"""<!doctype html>
   .sub { color: var(--muted); font-size: 12px; }
   .sub b { color: var(--text); font-weight: 600; }
   .grow { flex: 1; }
+  .pick { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .pick label { display: flex; flex-direction: column; gap: 3px; font-size: 10.5px; color: var(--muted);
+                text-transform: uppercase; letter-spacing: .05em; }
+  .pick select { min-width: 230px; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--text); }
+  .pickhelp { padding: 8px 18px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+  .pickhelp b { color: var(--text); font-weight: 600; }
   select, input { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
                   padding: 7px 10px; font: inherit; max-width: 100%; }
   button { font: inherit; }
@@ -502,12 +523,15 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <span class="badge" id="hdr-badge"></span>
     <div class="grow"></div>
-    <div class="row" id="db-row" style="margin:0">
-      <select id="db-select" title="Database"></select>
-      <select id="ticker-select" title="Market window"></select>
-      <button class="action" id="refresh-databases">Refresh</button>
+    <div class="pick" id="db-row">
+      <label>1. Data file
+        <select id="db-select" title="Which run to look at. The newest is at the top."></select></label>
+      <label>2. Market window
+        <select id="ticker-select" title="Each 15-minute market. Leave on Latest to follow along."></select></label>
+      <button class="action" id="refresh-databases" title="Look for new files">Refresh</button>
     </div>
   </div>
+  <div class="pickhelp" id="pickhelp">Pick the newest <b>Paper trading</b> file to watch a live run. Leave the window on <b>Latest</b> to follow the current 15-minute market automatically.</div>
   <nav>
     <button data-tab="market" class="active">Market</button>
     <button data-tab="monitor">Paper PnL</button>
@@ -519,7 +543,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="stats">
       <span>Vol <b id="st-vol">--</b></span><span>Open int <b id="st-oi">--</b></span>
       <span>Spread <b id="st-spread">--</b></span><span>Time left <b id="st-left">--</b></span>
-      <span>Snapshot <b id="st-ts">--</b></span>
+      <span>Last book <b id="st-ts">--</b></span><span>Data age <b id="st-age">--</b></span>
     </div>
     <div class="chartwrap"><canvas id="mid-chart" height="190"></canvas></div>
     <div class="cols">
@@ -676,14 +700,30 @@ function drawSeries(canvas, points, opts) {
 
 let market = null, side = "yes";
 
+const KIND_LABELS = { paper: "Paper trading", recorder: "Data recording", stream: "BRTI + book stream", unknown: "Data file" };
+function dbLabel(db) {
+  const m = /^[a-z]+-[A-Z0-9]+-(demo|prod)-/.exec(db.name);
+  const env = m ? m[1].toUpperCase() : "";
+  const when = new Date(db.modified_ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const mb = db.size_bytes / 1048576;
+  return `${KIND_LABELS[db.kind] || KIND_LABELS.unknown}${env ? " \u00b7 " + env : ""} \u00b7 ${when} \u00b7 ${mb < 0.1 ? "<0.1" : mb.toFixed(1)} MB`;
+}
+
+function windowLabel(w, isLatest) {
+  const close = w.close_time ? new Date(w.close_time) : null;
+  const time = close ? close.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : w.ticker;
+  const state = close && close > Date.now() ? "live" : w.result ? "settled " + w.result.toUpperCase() : "closed";
+  return `${time} close \u00b7 ${state}` + (w.trades ? ` \u00b7 ${w.trades} trade${w.trades > 1 ? "s" : ""}` : "");
+}
+
 async function refreshDatabases() {
   const { databases } = await getJson("/api/databases");
   const select = $("db-select"), previous = select.value;
-  select.innerHTML = databases.length ? "" : '<option value="">(no databases)</option>';
-  for (const db of databases) {
+  select.innerHTML = databases.length ? "" : '<option value="">(no data files yet - run btcbot paper or record)</option>';
+  databases.forEach((db, i) => {
     const opt = document.createElement("option");
-    opt.value = db.name; opt.textContent = `${db.name} (${db.kind})`; select.appendChild(opt);
-  }
+    opt.value = db.name; opt.textContent = dbLabel(db) + (i === 0 ? "  (newest)" : ""); select.appendChild(opt);
+  });
   if (databases.some((db) => db.name === previous)) select.value = previous;
   return databases;
 }
@@ -719,6 +759,14 @@ function renderBook() {
   $("st-spread").textContent = yb !== null && nb !== null ? cents(1 - nb - yb) : "--";
 }
 
+function updateAge() {
+  const el = $("st-age");
+  if (!el || !market || !market.book_ts) return;
+  const age = (Date.now() - new Date(market.book_ts).getTime()) / 1000;
+  el.textContent = age < 60 ? age.toFixed(1) + "s" : "stale (" + Math.round(age / 60) + "m)";
+  el.className = age < 3 ? "green" : age < 10 ? "orange" : "red";
+}
+
 function timeLeft() {
   if (!market || !market.close_time) return { text: "--", live: false };
   const ms = new Date(market.close_time) - Date.now();
@@ -733,9 +781,10 @@ async function refreshMarket() {
     const t = $("ticker-select").value;
     market = await getJson(`/api/market?db=${encodeURIComponent(db)}` + (t ? `&ticker=${encodeURIComponent(t)}` : ""));
     note.className = "note"; note.textContent = "";
-    const sel = $("ticker-select");
-    sel.innerHTML = market.tickers.map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join("");
-    if (market.ticker) sel.value = market.ticker;
+    const sel = $("ticker-select"), chosen = sel.value;
+    sel.innerHTML = '<option value="">Latest window (follows automatically)</option>' +
+      market.windows.map((w) => `<option value="${esc(w.ticker)}">${esc(windowLabel(w))}</option>`).join("");
+    sel.value = market.windows.some((w) => w.ticker === chosen) ? chosen : "";
     if (!market.ticker) { note.textContent = "This database has no order-book snapshots yet."; return; }
     const strike = market.strike ? Number(market.strike) : null;
     $("hdr-title").textContent = "BTC 15 min" + (strike ? " · $" + num(strike) + " target" : "");
@@ -746,6 +795,7 @@ async function refreshMarket() {
     $("st-vol").textContent = market.volume ? num(market.volume) : "--";
     $("st-oi").textContent = market.open_interest ? num(market.open_interest) : "--";
     $("st-left").textContent = tl.text;
+    updateAge();
     $("st-ts").textContent = market.book_ts ? new Date(market.book_ts).toLocaleTimeString() : "--";
     $("f-exp").textContent = market.close_time ? new Date(market.close_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--";
     $("f-strike").textContent = strike ? "$" + num(strike) : "--";
@@ -838,12 +888,21 @@ async function saveSettings() {
 }
 
 let tab = "market";
-const refreshTab = () => { if (tab === "market") refreshMarket(); else if (tab === "monitor") refreshMonitor(); };
+let refreshing = false;
+async function refreshTab() {
+  if (refreshing) return;  // a slow response must not pile up requests behind it
+  refreshing = true;
+  try {
+    if (tab === "market") await refreshMarket(); else if (tab === "monitor") await refreshMonitor();
+  } finally { refreshing = false; }
+}
 document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("click", () => {
   tab = btn.dataset.tab;
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
   document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === `tab-${tab}`));
   $("db-row").style.display = tab === "settings" ? "none" : "";
+  $("pickhelp").style.display = tab === "settings" ? "none" : "";
+  $q("#ticker-select").parentElement.style.display = tab === "market" ? "" : "none";
   refreshTab();
 }));
 document.querySelectorAll("#side-toggle button").forEach((b) => b.addEventListener("click", () => {
@@ -866,7 +925,8 @@ window.addEventListener("resize", () => { if (tab === "market" || tab === "monit
   try { await refreshDatabases(); } catch (e) { $("market-note").textContent = "Error: " + e.message; }
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
-  setInterval(() => { if (tab === "market" || tab === "monitor") refreshTab(); }, 3000);
+  setInterval(() => { if (tab === "market" || tab === "monitor") refreshTab(); }, 1000);
+  setInterval(updateAge, 200);
 })();
 </script>
 </body>

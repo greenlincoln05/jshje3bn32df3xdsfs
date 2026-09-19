@@ -97,6 +97,27 @@ this will say "nothing to score" against one. A `paper` run (step 3) logs predic
 goes, so pointing `calibrate` at a `paper` run's database once some windows have settled will have real
 predictions to score.
 
+## 4b. Stream BRTI and the live order book (needs your own API key; read-only)
+
+```powershell
+btcbot stream --env prod --hours 9
+```
+
+Same database layout as `record`, plus `brti_ticks` (BRTI at 1 Hz and 5 Hz, with the trailing 60 s average Kalshi
+settles on) and `ws_book_events` (order-book snapshots and deltas over WebSocket instead of one REST poll per
+second). Kalshi's WebSocket handshake needs a signed request even for public channels, so put `KALSHI_KEY_ID` and
+`KALSHI_PRIVATE_KEY_PATH` in `.env` (the dashboard's Settings tab writes the same file). **It sends only
+subscribe/unsubscribe on market-data channels. It cannot place, cancel or modify an order.**
+
+- Prints a status line every 10 s (`--status-every`). Stops on the time limit, the `KILL` file, or a refused
+  handshake (bad key, or a demo key used on prod: it does not retry a rejected key).
+- At the end it prints how far Coinbase sat from BRTI (mean/median/max absolute difference) and the feed lag, which
+  is the number that tells you whether the Coinbase proxy is good enough near the strike.
+- The channel names and message shapes come from docs.kalshi.com and have not been exercised against the live
+  server. If the first run shows `unrecognised` message types, or 0 BRTI ticks, paste the summary and the
+  `run_log` rows (`select * from run_log where level='warning'`); the parser is deliberately loud about this.
+- If BRTI needs an entitlement on your account the server will say so in a `ws_error` row.
+
 ## 5. Dashboard (optional, no credentials, no network needed)
 
 ```powershell

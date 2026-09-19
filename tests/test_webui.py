@@ -380,3 +380,20 @@ class TestMarketEndpointAndNoTradesTable:
     def test_market_requires_known_db(self, dashboard):
         status, _ = _get(dashboard.base_url, "/api/market?db=missing.sqlite")
         assert status == 404
+
+    def test_market_view_lists_windows_with_close_time_and_trade_counts(self, dashboard):
+        db_path = make_db(dashboard.data_dir)
+        conn = sqlite3.connect(str(db_path))
+        close = T0 + timedelta(minutes=15)
+        insert_market(conn, TICKER, strike=Decimal("80000"), close_time=close)
+        insert_snapshot(conn, TICKER, T0 + timedelta(seconds=1), yes=[("0.40", "10.00")], no=[("0.55", "5.00")])
+        conn.close()
+        status, body = _get(dashboard.base_url, f"/api/market?db={db_path.name}")
+        assert status == 200
+        assert body["windows"] == [{"ticker": TICKER, "close_time": close.isoformat(), "result": None, "trades": 0}]
+
+    def test_list_databases_labels_stream_files(self, tmp_path):
+        (tmp_path / "stream-KXBTC15M-prod-20260919T000000Z.sqlite").write_bytes(b"")
+        (tmp_path / "recorder-KXBTC15M-prod-20260919T000000Z.sqlite").write_bytes(b"")
+        kinds = {e["name"].split("-")[0]: e["kind"] for e in list_databases(tmp_path)}
+        assert kinds == {"stream": "stream", "recorder": "recorder"}
