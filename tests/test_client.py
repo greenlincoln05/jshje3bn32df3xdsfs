@@ -366,13 +366,13 @@ class TestMarketDataEndpoints:
 
         assert dict(script.requests[0].url.params) == {"series_ticker": "S", "limit": "1000"}
 
-    async def test_list_markets_warns_when_more_pages_exist(self, caplog):
+    async def test_list_markets_rejects_a_repeated_cursor(self):
         script = Script(ok({"markets": [], "cursor": "next-page"}))
         client, _ = make_client(script)
         async with client:
-            await client.list_markets(series_ticker="S")
-
-        assert "more than one page" in caplog.text
+            with pytest.raises(KalshiError, match="repeated.*cursor"):
+                await client.list_markets(series_ticker="S")
+        assert len(script.requests) == 2
 
     async def test_tickers_are_url_quoted(self, load_fixture):
         script = Script(ok(load_fixture("market_active.json")))

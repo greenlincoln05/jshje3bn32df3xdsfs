@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -99,12 +100,16 @@ async def _watch(client: KalshiClient, series_ticker: str, interval: float) -> i
     while True:
         now = datetime.now(timezone.utc)
         try:
-            market = await find_current_market(client, series_ticker, now=now)
+            market = await find_current_market(client, series_ticker)
             if market is None:
                 print(f"{now:%H:%M:%SZ} no open {series_ticker} market", flush=True)
             else:
                 book = await client.get_orderbook(market.ticker)
-                print(render_watch_line(market, book, now), flush=True)
+                now = datetime.now(timezone.utc)
+                if not market.is_open_at(now):
+                    print(f"{now:%H:%M:%SZ} {market.ticker} closed during quote fetch; retrying discovery", flush=True)
+                else:
+                    print(render_watch_line(market, book, now), flush=True)
         except (KalshiError, ParseError) as exc:  # a network blip or odd payload should not end a long watch
             print(f"{now:%H:%M:%SZ} error: {exc}", flush=True)
         await asyncio.sleep(interval)
@@ -127,7 +132,11 @@ async def _cmd_discover(args: argparse.Namespace) -> int:
             )
             return 1
         book = await client.get_orderbook(market.ticker)
-    print(render_discovery(env, series, market, book, datetime.now(timezone.utc)))
+    now = datetime.now(timezone.utc)
+    if not market.is_open_at(now):
+        print(f"Market {market.ticker} closed during quote fetch; retry discovery.", file=sys.stderr)
+        return 1
+    print(render_discovery(env, series, market, book, now))
     return 0
 
 
@@ -170,8 +179,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "discover" and args.watch is not None and args.watch <= 0:
-        print("error: --watch must be greater than 0", file=sys.stderr)
+    if args.command == "discover" and args.watch is not None and (not math.isfinite(args.watch) or args.watch <= 0):
+        print("error: --watch must be finite and greater than 0", file=sys.stderr)
         return 2
     for stream in (sys.stdout, sys.stderr):  # a non-ASCII title must not crash a Windows console
         reconfigure = getattr(stream, "reconfigure", None)

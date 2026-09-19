@@ -34,10 +34,11 @@ async def find_current_market(
     returning a long-closed market under it. Each market is re-checked for status ``active`` and
     ``open_time <= now < close_time``, and the earliest-closing survivor wins.
 
-    ``now`` defaults to the local UTC clock, so a skewed clock can misjudge a market for a moment around
-    a window boundary. Callers already stay out of the last ``min_tau_sec`` seconds, so this is harmless.
+    ``now`` defaults to the local UTC clock sampled after the response arrives, so network retries
+    cannot leave discovery using the previous window's time. Explicit ``now`` supports replay/tests.
+    Keep the host clock synchronized; callers must also re-check validity before using a quote.
     """
-    when = now or datetime.now(timezone.utc)
     markets = await client.list_markets(series_ticker=series_ticker, status="open")
+    when = now if now is not None else datetime.now(timezone.utc)
     open_markets = [market for market in markets if market.is_open_at(when)]
     return min(open_markets, key=lambda market: market.close_time, default=None)

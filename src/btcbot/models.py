@@ -70,13 +70,24 @@ class PriceLevel:
 
 
 def _parse_levels(raw: Any, name: str) -> tuple[PriceLevel, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ParseError(f"{name}: expected an array of [price, size] pairs")
     levels = []
-    for item in raw or ():
-        try:
-            price, size = item
-        except (TypeError, ValueError):
-            raise ParseError(f"{name}: expected [price, size] pairs, got {item!r}") from None
-        levels.append(PriceLevel(_require_decimal(price, f"{name} price"), _require_decimal(size, f"{name} size")))
+    seen_prices: set[Decimal] = set()
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ParseError(f"{name}: expected [price, size] pairs, got {item!r}")
+        price = _require_decimal(item[0], f"{name} price")
+        size = _require_decimal(item[1], f"{name} size")
+        if not 0 <= price <= ONE or size < 0:
+            raise ParseError(f"{name}: price must be in [0, 1] and size nonnegative")
+        if price in seen_prices:
+            raise ParseError(f"{name}: duplicate price level {price}")
+        seen_prices.add(price)
+        if size > 0:
+            levels.append(PriceLevel(price, size))
     # Kalshi sends ascending prices with the best bid last; sort anyway rather than rely on it.
     return tuple(sorted(levels, key=lambda level: level.price))
 
@@ -96,6 +107,8 @@ class OrderBook:
     @classmethod
     def from_api(cls, ticker: str, payload: Mapping[str, Any]) -> Self:
         book = require(payload, "orderbook_fp", "orderbook")
+        if not isinstance(book, Mapping):
+            raise ParseError("orderbook_fp: expected an object")
         return cls(
             ticker=ticker,
             yes_bids=_parse_levels(book.get("yes_dollars"), "yes_dollars"),
