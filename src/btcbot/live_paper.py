@@ -4,9 +4,11 @@ Runs the strategy, risk and paper broker against data as it is polled, sharing e
 backtest.py replays offline: :mod:`btcbot.model` for predictions, :mod:`btcbot.strategy` for decisions,
 :mod:`btcbot.risk` for limits, :mod:`btcbot.execution`'s ``PaperExecutionBackend`` for fills. Every
 prediction is logged (``btcbot.model.log_prediction``) and every trade is recorded in the same shape
-backtest.py uses (``TradeRecord``, ``build_report``), so ``btcbot backtest --db <this run's database>``
-replays the exact same recorded data afterward -- comparing its report to this run's own summary is spec
-section 8.5's "compare live paper results to the backtest."
+backtest.py uses (``TradeRecord``, ``build_report``) *and* persisted to this run's database as it happens
+(``btcbot.backtest.log_trade``, into the ``trades`` table ``init_trades_schema`` creates), so a second
+process reading the same file -- ``btcbot backtest --db <this run's database>`` for a replay comparison
+(spec section 8.5), or ``btcbot dashboard`` for a live view -- sees trades as they resolve, not just at the
+end of the run.
 
 :class:`btcbot.recorder.Recorder` still owns polling and the base tables (order books, market state, spot
 ticks, settlements); this module only hooks into it (``on_orderbook``/``on_settlement``) rather than polling
@@ -29,7 +31,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from btcbot.backtest import BacktestReport, TradeRecord, build_report
+from btcbot.backtest import BacktestReport, TradeRecord, build_report, init_trades_schema, log_trade
 from btcbot.execution import PaperExecutionBackend
 from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictions_schema, log_prediction, predict
 from btcbot.models import Market, OrderBook
@@ -58,6 +60,7 @@ class LivePaperTrader:
         kill_file: str = "KILL",
     ) -> None:
         init_predictions_schema(conn)
+        init_trades_schema(conn)
         self._conn = conn
         self._config = config
         self._spot_buffer = spot_buffer
@@ -171,6 +174,7 @@ class LivePaperTrader:
             self._position = None
         for pending in self._pending_settlements.values():
             self.trades.append(pending)
+            log_trade(self._conn, pending)
         self._pending_settlements.clear()
 
     def report(self) -> BacktestReport:
@@ -225,7 +229,9 @@ class LivePaperTrader:
         exposure = pending.entry_price * pending.size
         payout = settle(pending.side, pending.size, result)
         pnl = payout - exposure - pending.fee_paid
-        self.trades.append(replace(pending, result=result, pnl_usd=pnl))
+        resolved = replace(pending, result=result, pnl_usd=pnl)
+        self.trades.append(resolved)
+        log_trade(self._conn, resolved)
         self._risk.record_trade_closed(
             TradeOutcome(ts=settled_ts, size=pending.size, pnl_usd=pnl), exposure_released_usd=exposure
         )

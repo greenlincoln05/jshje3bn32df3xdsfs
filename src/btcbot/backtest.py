@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -116,6 +116,73 @@ class BacktestReport:
     avg_p_side_at_entry: float | None
     beats_trade_nothing: bool | None
     sample_size_note: str
+
+
+# --------------------------------------------------------------------------- trade logging
+
+TRADES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    size TEXT NOT NULL,
+    entry_price TEXT NOT NULL,
+    entry_ts TEXT NOT NULL,
+    fee_paid TEXT NOT NULL,
+    p_side_at_entry REAL NOT NULL,
+    result TEXT,
+    pnl_usd TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trades_entry_ts ON trades (entry_ts);
+"""
+
+
+def init_trades_schema(conn: sqlite3.Connection) -> None:
+    """Lets a live run's trades (:mod:`btcbot.live_paper`) be read from a second connection while the run
+    is still going -- e.g. the dashboard's live-monitor view -- the same pattern
+    :func:`btcbot.model.init_predictions_schema` uses for predictions."""
+    conn.executescript(TRADES_SCHEMA)
+    conn.commit()
+
+
+def log_trade(conn: sqlite3.Connection, trade: TradeRecord) -> None:
+    conn.execute(
+        """INSERT INTO trades (ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            trade.ticker,
+            trade.side,
+            str(trade.size),
+            str(trade.entry_price),
+            trade.entry_ts.astimezone(timezone.utc).isoformat(),
+            str(trade.fee_paid),
+            trade.p_side_at_entry,
+            trade.result,
+            None if trade.pnl_usd is None else str(trade.pnl_usd),
+        ),
+    )
+    conn.commit()
+
+
+def load_trades(conn: sqlite3.Connection) -> list[TradeRecord]:
+    rows = conn.execute(
+        """SELECT ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd
+           FROM trades ORDER BY entry_ts"""
+    ).fetchall()
+    return [
+        TradeRecord(
+            ticker=ticker,
+            side=side,
+            size=Decimal(size),
+            entry_price=Decimal(entry_price),
+            entry_ts=parse_time(entry_ts),
+            fee_paid=Decimal(fee_paid),
+            p_side_at_entry=p_side_at_entry,
+            result=result,
+            pnl_usd=None if pnl_usd is None else Decimal(pnl_usd),
+        )
+        for ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd in rows
+    ]
 
 
 # --------------------------------------------------------------------------- replay

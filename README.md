@@ -109,7 +109,8 @@ days" the spec asks for, has to happen on the owner's own machine -- see
 No Kalshi API key has been used by any Claude session working on this repo, demo or production. A key that
 has been pasted into a chat (this one or another assistant's) should be treated as exposed and revoked/rotated,
 regardless of whether it targets demo or prod — the practice that keeps this safe is a fresh key that goes
-straight into a local `.env` and is never pasted into a conversation.
+straight into a local `.env` (directly, or via `btcbot dashboard`'s Settings tab, which only ever writes to
+that same local file) and is never pasted into a conversation.
 
 ## Setup
 
@@ -136,6 +137,7 @@ btcbot record --env prod --hours 9    # poll public market data + Coinbase spot 
 btcbot paper --env prod --hours 9     # trade the paper strategy against live public data; no real orders
 btcbot calibrate --db data/recorder-....sqlite   # Brier score + reliability table from logged predictions
 btcbot backtest --db data/recorder-....sqlite    # replay through strategy + risk + paper broker; PnL etc.
+btcbot dashboard                      # local web UI: monitor backtests, live paper PnL/trades, edit .env
 ```
 
 `discover` needs no credentials because Kalshi's market data is public. `auth-check` needs `KALSHI_KEY_ID` and
@@ -181,6 +183,30 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
   NO   bid  0.945 x       972.37   ask  0.946 x       638.13   spread 0.001   mid 0.9455
 ```
 
+## Dashboard (local web UI)
+
+`btcbot dashboard` is a monitoring tool, not one of the numbered build phases: a small local web server
+(stdlib `http.server`, no new dependency) that reads what `record`/`paper`/`backtest` already produce.
+
+- **Binds to `127.0.0.1` only** (`--port`, default 8765) -- never reachable from another machine.
+- **Live / Paper monitor** tab: picks a `--data-dir` (default `./data`) database and shows trade count, win
+  rate, total PnL, unresolved count, a cumulative-PnL chart, and a trades table, refreshing every few
+  seconds. This reads a new `trades` table `btcbot paper` now writes to as trades resolve (in addition to
+  keeping them in memory for its own end-of-run report), so a `paper` run can be watched live from a second
+  process while it's still going, the same way `calibrate` already reads its `predictions` table mid-run.
+- **Backtest** tab: runs `btcbot backtest`'s replay against a chosen database and queue/fee combination on
+  demand and renders the report, instead of using the CLI.
+- **Settings** tab: reads and writes the same local `--env-file` (default `./.env`) every other command
+  already reads via `KALSHI_ENV` / `KALSHI_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` -- a nicer editor for the file
+  `docs/running-live.md` already tells you to edit by hand, nothing more. It never sends a key anywhere
+  except from your own browser to this localhost server, which only ever writes it to that file, and it
+  always masks the key id on read. **This cannot place, cancel, or modify a Kalshi order, in demo or in
+  prod:** there is no order-placing code anywhere in this repo yet (CLAUDE.md's Phase 6 gate) -- entering a
+  key here only lets you run `auth-check` yourself with it, exactly as if you'd edited `.env` directly.
+
+As always: a key pasted into a chat with any assistant is exposed and should be reissued, never reused --
+type it into the dashboard's Settings tab (or `.env` directly) instead, on your own machine.
+
 ## Safety model
 
 | Mode | Target | Money | Status |
@@ -211,7 +237,7 @@ src/btcbot/
   models.py                 Market, Series, OrderBook, Balance: Decimal-only views of API payloads
   kalshi_client.py          RSA-PSS signing (KalshiAuth) + async REST client with retry/backoff
   market_discovery.py       find the open KXBTC15M market: series -> open markets (see the discovery note below)
-  cli.py                    discover, auth-check, record, calibrate, backtest, paper
+  cli.py                    discover, auth-check, record, calibrate, backtest, paper, dashboard
   spot_feed.py              Phase 2: Coinbase public WebSocket ticker -> rolling buffer, staleness, REST fallback
   recorder.py               Phase 2: order books, market state, spot ticks and settlements -> SQLite
   model.py                  Phase 3: v1 fair-probability model, EWMA volatility, prediction logging, calibration
@@ -221,6 +247,7 @@ src/btcbot/
   paper_broker.py           Phase 4: fees, tick grid, queue-position fill simulation
   backtest.py               Phase 4: replay a recorder database through all of the above; PnL/win-rate/etc.
   live_paper.py             Phase 5: drives the same stack live via recorder.py's hooks; reuses backtest's report
+  webui.py                  not a phase: local dashboard (backtests, live paper PnL/trades, .env settings)
 tests/
   fixtures/                 real public API payloads and an OpenSSL signing vector
   test_signing.py, test_client.py, test_config.py, test_models.py, test_market_discovery.py, test_cli.py
@@ -229,6 +256,7 @@ tests/
   test_risk.py, test_paper_broker.py, test_strategy.py,
   test_execution.py, test_backtest.py                    Phase 4, offline (synthetic fixtures + hypothesis)
   test_live_paper.py                                     Phase 5, offline (fake spot buffer + hand-built snapshots)
+  test_webui.py                                           dashboard, offline (real HTTP calls to 127.0.0.1 only)
 ```
 
 `config.py` and `models.py` are additions to the layout in the build spec. Kalshi's own WebSocket (order-book

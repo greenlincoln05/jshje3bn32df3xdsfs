@@ -15,6 +15,9 @@ Phase 4:
 
 Phase 5:
   paper       run the paper strategy against live public data in real time (no real orders)
+
+Not a phase (a monitoring tool):
+  dashboard   local web UI for backtests, live paper PnL/trades, and local Kalshi settings
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ from btcbot.models import Market, OrderBook, ParseError, Series, Side
 from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder, RecorderSummary
 from btcbot.spot_feed import CoinbaseSpotFeed, SpotBuffer
+from btcbot.webui import create_dashboard_server
 
 # --------------------------------------------------------------------------- formatting
 
@@ -379,6 +383,25 @@ async def _cmd_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_dashboard(args: argparse.Namespace) -> int:
+    server = create_dashboard_server(
+        data_dir=Path(args.data_dir), env_path=Path(args.env_file), config_path=Path(args.config), port=args.port
+    )
+    port = server.server_address[1]
+    print(
+        f"Dashboard at http://127.0.0.1:{port} (binds to 127.0.0.1 only -- not reachable from other machines).\n"
+        f"Data dir: {args.data_dir}  Settings file: {args.env_file}  Backtest config: {args.config}\n"
+        "No order-placing code exists in this repo yet, so nothing here can place, cancel, or modify an "
+        "order. Ctrl+C to stop.",
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -454,6 +477,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     paper.add_argument("--maker-fee-multiplier", default="0", help="a non-negative number (default: 0)")
     paper.set_defaults(handler=_cmd_paper)
+
+    dashboard = commands.add_parser(
+        "dashboard", help="local web UI: backtests, live paper PnL/trades, and local Kalshi settings"
+    )
+    dashboard.add_argument("--port", type=int, default=8765, help="localhost port to bind (default: 8765)")
+    dashboard.add_argument("--data-dir", default="data", help="directory of *.sqlite databases to browse (default: ./data)")
+    dashboard.add_argument("--env-file", default=".env", help="local settings file the Settings tab edits (default: ./.env)")
+    dashboard.set_defaults(handler=_cmd_dashboard)
     return parser
 
 
@@ -492,6 +523,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not _is_non_negative_decimal(args.maker_fee_multiplier):
             print("error: --maker-fee-multiplier must be a non-negative number", file=sys.stderr)
             return 2
+    if args.command == "dashboard" and not (0 <= args.port <= 65535):
+        print("error: --port must be between 0 and 65535", file=sys.stderr)
+        return 2
     for stream in (sys.stdout, sys.stderr):  # a non-ASCII title must not crash a Windows console
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
