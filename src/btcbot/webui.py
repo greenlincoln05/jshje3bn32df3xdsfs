@@ -442,6 +442,8 @@ def lab_preview(data_dir: Path, config_path: Path, payload: dict[str, Any]) -> d
             pass
         finally:
             conn.close()
+    if any("demo" in str(name).lower() for name in payload.get("dbs") or []):
+        raise LabError("Strategy Lab excludes demo/synthetic files; select production recordings only.")
     return {"combinations": len(combos), "windows": len(windows)}
 
 
@@ -1245,10 +1247,11 @@ const LAB_FIELDS = [
   ["max_price", "Max entry price ($)", "none, 0.60", "0.60 = 60 cents. 'none' = no cap."],
   ["persist_steps", "Edge must persist (seconds)", "1, 5, 15, 30", "Only enter once the strategy has wanted the same side this many seconds in a row (ignores one-quote flickers)."],
   ["min_p_side", "Min chance of winning", "none, 0.5, 0.6", "Only enter a side the model says is at least this likely to win. 0.5 refuses bets against the favourite."],
-  ["trend_mode", "Trend filter", "off, with, against", "with = only the side spot is moving toward; against = fade the move."],
+  ["trend_mode", "Trend filter", "off, with, against, aligned4", "aligned4 requires matching 15m/30m/1h/24h directions and full history. with = only the side spot is moving toward; against = fade the move."],
   ["trend_lookback_sec", "Trend lookback (secs)", "60, 180", "How far back to measure the move."],
   ["trend_min_move_usd", "Trend min move ($)", "0, 10, 25", "Ignore moves smaller than this."],
   ["model_blend", "Model weight (0-1)", "0.3, 0.5, 0.8", "1 = trust the model only, 0 = trust the market mid only."],
+  ["min_stake_pct", "Minimum order premium (% initial account)", "5", "Default 5: $5 on $100; $25 on $500. Fees extra. Whole contracts round up; risk/cash limits may skip. Partial fills can be smaller."],
   ["risk_pct", "Risk per trade (% of account)", "1, 2, 5", "Blank = fixed number of contracts instead."],
   ["max_growth_pct", "Max growth per win (%)", "none, 10, 25", "With risk %: after a win the next order may be at most this much larger. Never grows after a loss."],
   ["contracts", "Fixed contracts", "5, 10", "Used when risk % is blank."],
@@ -1256,6 +1259,7 @@ const LAB_FIELDS = [
 const LAB_PRESETS = {
   "Entry timing": { max_tau_sec: "480, 600, 780", min_tau_sec: "30, 60, 120, 300" },
   "Entry price": { min_price: "none, 0.15, 0.30", max_price: "none, 0.50, 0.60, 0.70" },
+  "Multi-timeframe": { trend_mode: "aligned4", min_price: "0.55", max_price: "0.65", min_tau_sec: "480", max_tau_sec: "600", min_stake_pct: "5" },
   "Trend": { trend_mode: "off, with, against", trend_lookback_sec: "60, 180", trend_min_move_usd: "0, 10, 25" },
   "Risk sizing": { risk_pct: "1, 2, 5, 10" },
   "Edge and spread": { min_edge: "0.01, 0.02, 0.04, 0.06", max_spread: "0.02, 0.04, 0.06" },
@@ -1281,7 +1285,7 @@ function renderLabDbs(databases) {
   const usable = databases.filter((d) => d.kind !== "unknown");
   $("lab-dbs").innerHTML = usable.length ? usable.map((d) => {
     const demo = /-demo-/.test(d.name);
-    return `<label><input type="checkbox" value="${esc(d.name)}" ${demo ? "" : "checked"}> ${esc(dbLabel(d))}${demo ? ' <span class="orange">(demo, synthetic)</span>' : ""}</label>`;
+    return `<label><input type="checkbox" value="${esc(d.name)}" ${demo ? "disabled" : "checked"}> ${esc(dbLabel(d))}${demo ? ' <span class="orange">(demo, synthetic)</span>' : ""}</label>`;
   }).join("") : '<div class="empty">No recordings yet. Run <code>btcbot paper</code> or <code>btcbot record</code> first.</div>';
   document.querySelectorAll("#lab-dbs input").forEach((i) => i.addEventListener("change", labPreviewSoon));
 }

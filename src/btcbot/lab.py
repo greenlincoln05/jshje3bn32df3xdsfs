@@ -77,6 +77,7 @@ class LabParams:
     risk_pct: Decimal | None = None   # percent of bankroll risked per trade; None = fixed contracts
     max_growth_pct: Decimal | None = None  # with risk_pct: a win may raise the next order by at most this percent
     contracts: int = 5
+    min_stake_pct: Decimal = Decimal(5)  # minimum order premium as % of initial account
 
     @classmethod
     def from_config(cls, config: BotConfig) -> LabParams:
@@ -108,12 +109,15 @@ class AccountSettings:
     max_trades_per_hour: int = 12
 
 
-_DECIMAL_KEYS = {"min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_p_side", "max_growth_pct"}
+_DECIMAL_KEYS = {
+    "min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_stake_pct",
+    "min_p_side", "max_growth_pct",
+}
 _INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "contracts", "persist_steps"}
 _FLOAT_KEYS = {"model_blend"}
 _OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct", "min_p_side", "max_growth_pct"}
 TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode"}))
-_TREND_MODES = ("off", "with", "against")
+_TREND_MODES = ("off", "with", "against", "aligned4")
 
 
 def _check(key: str, value: Any) -> Any:
@@ -127,6 +131,7 @@ def _check(key: str, value: Any) -> Any:
         "max_growth_pct": lambda v: v is None or 0 <= v <= 500,
         "persist_steps": lambda v: 1 <= v <= 300,
         "trend_min_move_usd": lambda v: v >= 0,
+        "min_stake_pct": lambda v: 0 <= v <= 100,
         "risk_pct": lambda v: v is None or 0 < v <= 100,
         "min_tau_sec": lambda v: 0 <= v <= 900,
         "max_tau_sec": lambda v: 0 < v <= 900,
@@ -280,7 +285,7 @@ def _metrics(result: ReplayResult, account_usd: Decimal) -> Metrics:
 def _config_for(base: BotConfig, params: LabParams, account: AccountSettings) -> BotConfig:
     exposure = account.account_usd * account.max_exposure_pct / 100
     risk = RiskLimits(
-        max_contracts_per_trade=max(1, int(account.account_usd * 100)) if params.risk_pct is not None else max(params.contracts, 1),
+        max_contracts_per_trade=max(1, int(account.account_usd * 100)) if params.risk_pct is not None or params.min_stake_pct > 0 else max(params.contracts, 1),
         max_open_exposure_usd=max(exposure, Decimal("0.01")),
         daily_loss_limit_usd=max(account.account_usd * account.daily_loss_pct / 100, Decimal("0.01")),
         max_consecutive_losses=account.max_consecutive_losses,
@@ -304,6 +309,7 @@ def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
         min_p_side=params.min_p_side, trend_mode=params.trend_mode,
         trend_lookback_sec=params.trend_lookback_sec, trend_min_move_usd=params.trend_min_move_usd,
         account_usd=account.account_usd,
+        min_stake_usd=account.account_usd * params.min_stake_pct / 100,
         risk_pct_per_trade=None if params.risk_pct is None else params.risk_pct / 100,
         max_growth_pct=params.max_growth_pct,
     )
@@ -326,6 +332,8 @@ def evaluate(
 def load_lab_data(paths: Sequence[Path]) -> ReplayData:
     """Load and merge recordings. A file with no order-book table or no snapshots yet (for example a paper
     run that has only just started) is skipped rather than failing the whole request."""
+    if any("demo" in path.name.lower() for path in paths):
+        raise LabError("Strategy Lab excludes demo/synthetic files. Use Demo orders to audit execution; select only production recordings here.")
     parts = []
     for path in paths:
         conn = sqlite3.connect(str(path))
@@ -479,7 +487,7 @@ def run_lab(
         warnings.insert(0, (
             "Fills use the OPTIMISTIC queue assumption: every drop in a price level's size counts as a trade that "
             "reached us, so fills and PnL here are a best case, not an expectation. The pessimistic assumption "
-            "never fills at all, so the truth is somewhere between; a recorded trade tape would narrow it."
+            "never fills at all, zero fills are not a lower bound on live losses; adverse selection can make live results worse. A recorded trade tape is needed to constrain fills."
         ))
     return LabReport(
         windows_total=len(ordered), windows_train=len(train), windows_test=len(test), combinations=total,
@@ -502,6 +510,8 @@ def _verdict(
         "chance alone; only the test columns mean anything, and even they are one sample.",
         "Replays use REST-polled books and simulated queue fills, with Coinbase standing in for BRTI. Treat "
         "fills and prices as approximate.",
+        "Minimum stake is an order-premium floor, not a guaranteed fill size; partial fills may be smaller. Fees are extra; cash and risk limits can skip orders.",
+        "aligned4 needs 24 hours of causal spot history; missing history blocks entries. This is an entry filter, not an 80/99-cent exit or side-switching strategy.",
         "Adverse selection is invisible here: with model weight below 1, part of the 'edge' is the gap between "
         "the market mid and your bid. That is only real if being filled does not tell you the price is about to "
         "move against you, and a replay cannot show that.",
@@ -511,9 +521,11 @@ def _verdict(
             "insufficient",
             f"No combination made at least {min_train_trades} resolved trades on the training windows, so nothing "
             "could be ranked. That usually means too little recorded data (or filters too strict). Record more "
-            "days, loosen the grid, or lower the minimum.",
+            "days. Lowering the minimum does not create evidence.",
             warnings,
         )
+    if min_train_trades < 20:
+        return "insufficient", "Exploratory ranking only: the training threshold is below 20. Collect more data before evaluating an edge.", warnings
     best = rows[0]
     if best.test.resolved < ENOUGH_TEST_TRADES:
         warnings.append(

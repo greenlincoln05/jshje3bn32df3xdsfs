@@ -308,3 +308,30 @@ shown separately; an open window is marked STALE if either is missing or at leas
 three seconds old. Book request latency is displayed separately from data age.
 Historical spot charts and prices are limited to the selected market window.
 Restart the recorder and dashboard on the updated version to use these changes.
+
+## Strategy Lab audit safeguards
+
+Strategy Lab rejects demo-named recordings (including mixed demo/production selections)
+and disables their checkboxes. Filename classification is not proof of provenance: do
+not rename synthetic files to look like production recordings.
+
+The `Multi-timeframe` preset requires the proposed entry side to agree with all four
+spot returns: 15 minutes, 30 minutes, one hour and 24 hours. It uses only ticks available
+at entry; missing/stale reference ticks block entries. `trend_missing_history` counts
+these exclusions. Record at least 24 hours of spot history first. The preset covers
+55–65 cent entries with 8–10 minutes left. It still holds to settlement; 80/99 cent
+profit targets and side switching are not implemented by this entry filter.
+
+The default `min_stake_pct=5` means minimum ORDER premium of $5 on $100, $25 on
+$500, $50 on $1,000, or $250 on $5,000. It is based on initial account size, rounds
+up to whole contracts, and adds a conservative fee allowance when checking cash.
+Partial fills can be smaller. Cash/risk limits and the existing no-size-increase-after-
+loss rule can block an order; the minimum does not bypass those limits. Set the floor
+to zero explicitly for legacy fixed-contract comparisons. Increasing account size
+is not evidence that liquidity can support the larger orders.
+
+Pessimistic zero fills are NOT a bound on live losses. Optimistic fills count book
+size reductions that may instead be cancellations; real execution needs validation.
+The normal minimum remains 20 training trades and 30 test trades. Lower training
+thresholds allow exploratory inspection but always produce an insufficient verdict.
+No threshold change creates new observations.

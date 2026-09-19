@@ -221,3 +221,38 @@ class TestLabReplay:
         filters = EntryFilters(account_usd=D(20), risk_pct_per_trade=D("0.10"))
         sizes, _ = self.spied_sizes(tmp_path, ["yes", "yes", "yes"], filters, cfg)
         assert sizes[0] == 6 and sizes[-1] >= sizes[0]
+
+
+class TestMinimumStakeComposesWithPercentSizing:
+    """The minimum order premium (a floor) and the percent rule (growth ramp, no increase after a loss) both exist
+    now; the floor is applied AFTER the percent rule and the cash check still applies on top."""
+
+    def cfg(self):
+        return BotConfig(risk=RiskLimits(max_contracts_per_trade=1000, max_trades_per_hour=100, max_consecutive_losses=100,
+                                         max_open_exposure_pct=D(80), daily_loss_limit_pct=D(80)))
+
+    def test_a_percent_stake_too_small_for_one_contract_is_lifted_to_the_minimum_premium(self, tmp_path):
+        # 1% of $20 = $0.20 buys 0 contracts at 0.30; a $3 minimum premium lifts it to ceil(3 / 0.30) = 10 contracts
+        filters = EntryFilters(account_usd=D(20), risk_pct_per_trade=D("0.01"), min_stake_usd=D(3))
+        sizes, result = TestLabReplay().spied_sizes(tmp_path, ["yes"], filters, self.cfg())
+        assert sizes == [10] and result.filter_counts["too_small"] == 0
+
+    def test_without_a_floor_that_same_stake_is_skipped_as_too_small(self, tmp_path):
+        filters = EntryFilters(account_usd=D(20), risk_pct_per_trade=D("0.01"))
+        sizes, result = TestLabReplay().spied_sizes(tmp_path, ["yes"], filters, self.cfg())
+        assert sizes == [] and result.filter_counts["too_small"] > 0
+
+    def test_the_floor_cannot_overdraw_the_account(self, tmp_path):
+        filters = EntryFilters(account_usd=D(2), risk_pct_per_trade=D("0.10"), min_stake_usd=D(5))
+        sizes, result = TestLabReplay().spied_sizes(tmp_path, ["yes"], filters, self.cfg())
+        assert sizes == [] and result.filter_counts["too_small"] > 0
+
+    def test_the_growth_ramp_still_governs_when_the_percent_size_is_above_the_floor(self, tmp_path):
+        filters = EntryFilters(account_usd=D(20), risk_pct_per_trade=D("0.10"), max_growth_pct=D(20), min_stake_usd=D("0.5"))
+        sizes, _ = TestLabReplay().spied_sizes(tmp_path, ["yes", "yes", "yes"], filters, self.cfg())
+        assert sizes[0] == 6 and sizes[0] < sizes[1] <= sizes[0] + 2   # ramped, not jumped straight to the target
+
+    def test_persistence_and_the_floor_work_together(self, tmp_path):
+        filters = EntryFilters(account_usd=D(100), min_stake_usd=D(5), persist_steps=2)
+        sizes, result = TestLabReplay().spied_sizes(tmp_path, ["yes", "yes"], filters, self.cfg())
+        assert sizes and all(s * D("0.30") >= D(5) for s in sizes) and result.filter_counts["persistence"] > 0
