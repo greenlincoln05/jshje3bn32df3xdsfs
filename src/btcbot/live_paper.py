@@ -37,7 +37,7 @@ from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictio
 from btcbot.models import Market, OrderBook
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, decide
+from btcbot.strategy import Action, Decision, decide
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -120,10 +120,10 @@ class LivePaperTrader:
                 self._conn, Prediction(market.ticker, poll_ts, state, float(self._config.model_blend), p_model, p_blend)
             )
 
-        for fill in self._backend.sync_market(book, poll_ts):
+        for fill in await self._sync_fills(book, poll_ts):
             self.windows_traded.add(market.ticker)
             self._apply_fill(market.ticker, fill, poll_ts, p_blend)
-        if self._resting_order_id is not None and self._broker.get_order(self._resting_order_id).status == "filled":
+        if self._resting_order_id is not None and self._resting_order_filled():
             self._resting_order_id = None
 
         decision = decide(
@@ -147,8 +147,10 @@ class LivePaperTrader:
         if decision.action is Action.REST:
             approval = self._risk.check_new_order(size=decision.size, price=decision.price, now=poll_ts)
             if approval.approved:
-                self._resting_order_id = await self._backend.place_resting_order(decision.side, decision.price, decision.size)
-                self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
+                order_id = await self._place_resting(decision, poll_ts)
+                if order_id is not None:  # None: the exchange rejected it, so nothing rests and no exposure is taken
+                    self._resting_order_id = order_id
+                    self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
         elif decision.action is Action.CANCEL and self._resting_order_id is not None:
             await self._cancel_resting()
 
@@ -219,6 +221,18 @@ class LivePaperTrader:
             total_size = self._position.size + fill.size
             avg_price = (self._position.entry_price * self._position.size + fill.price * fill.size) / total_size
             self._position = replace(self._position, size=total_size, entry_price=avg_price, fee_paid=self._position.fee_paid + fill.fee)
+
+    # ---- execution hooks: the paper trader's versions here; ``btcbot.demo_trader.DemoTrader`` overrides them to
+    # ---- place real demo-environment orders while every decision above stays exactly the same code.
+
+    async def _sync_fills(self, book: OrderBook, poll_ts: datetime) -> list[Fill]:
+        return self._backend.sync_market(book, poll_ts)
+
+    def _resting_order_filled(self) -> bool:
+        return self._broker.get_order(self._resting_order_id).status == "filled"
+
+    async def _place_resting(self, decision: Decision, poll_ts: datetime) -> str | None:
+        return await self._backend.place_resting_order(decision.side, decision.price, decision.size)
 
     async def _cancel_resting(self) -> None:
         order = self._broker.get_order(self._resting_order_id)

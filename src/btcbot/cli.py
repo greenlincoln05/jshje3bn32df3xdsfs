@@ -43,6 +43,8 @@ from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.kalshi_client import KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.lab import DEFAULT_GRID, AccountSettings, LabError, load_lab_data, parse_values, render_lab_report, run_lab
+from btcbot.demo_trader import DemoTrader, render_demo_report
+from btcbot.execution import DemoExecutionBackend
 from btcbot.live_paper import LivePaperTrader
 from btcbot.market_discovery import find_current_market
 from btcbot.model import CalibrationSummary, compute_calibration_report
@@ -465,6 +467,82 @@ async def _cmd_lab(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_demo(args: argparse.Namespace) -> int:
+    """The paper trader's strategy placing REAL orders in Kalshi's DEMO environment (fake money). Needs the
+    owner's own demo key in .env. Always the demo environment: the client itself also refuses to sign an order
+    against prod, so this is a second lock, not the only one."""
+    config = load_config(args.config)
+    series_ticker = args.series or config.series_ticker
+    settings = KalshiSettings()
+    if settings.key_id is None or settings.private_key_path is None:
+        raise ConfigError(
+            "KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH must both be set (a DEMO key: see .env.example, or the "
+            "dashboard's Settings tab)"
+        )
+    auth = KalshiAuth.from_pem_file(settings.key_id.get_secret_value(), settings.private_key_path)
+    env = KalshiEnv.DEMO
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    db_path = data_dir / f"demo-{series_ticker}-{env.value}-{timestamp}.sqlite"
+    maker_fee_multiplier = Decimal(args.maker_fee_multiplier)
+
+    async with KalshiClient(env, auth=auth) as client:  # signs only the calls that need it; market data stays public
+        balance = await client.get_balance()  # proves the demo key works before anything is placed
+        reconcile = await DemoExecutionBackend(client, "").reconcile()
+        print(
+            f"Demo account: available ${balance.available:,.2f}. Cancelled {len(reconcile.cancelled_order_ids)} "
+            f"leftover resting order(s); {len(reconcile.open_positions)} open position(s) left alone.",
+            flush=True,
+        )
+        recorder = Recorder(
+            client, series_ticker=series_ticker, db_path=db_path, kill_file=args.kill_file,
+            poll_interval_sec=args.poll_interval,
+        )
+        trader_conn = sqlite3.connect(str(db_path))
+        spot_buffer = SpotBuffer()
+        trader = DemoTrader(
+            trader_conn, config, spot_buffer, client, maker_fee_multiplier=maker_fee_multiplier,
+            kill_file=args.kill_file,
+        )
+        recorder.on_orderbook = trader.on_orderbook_snapshot
+        recorder.on_settlement = trader.on_settlement
+
+        def on_tick(tick):
+            recorder.record_spot_tick(tick)
+            trader.on_spot_tick(tick.price, tick.receive_ts)
+
+        spot_feed = CoinbaseSpotFeed(spot_buffer, on_tick=on_tick)
+        spot_task = asyncio.ensure_future(spot_feed.run_forever())
+        print(
+            f"DEMO trading {series_ticker}: REAL orders, FAKE money, environment={env.value} -> {db_path}\n"
+            f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early (open orders are cancelled).",
+            flush=True,
+        )
+        summary = None
+        try:
+            summary = await recorder.run(duration_sec=args.hours * 3600)
+        finally:
+            spot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await spot_task
+            await spot_feed.aclose()
+            await trader.shutdown(summary.stopped_at if summary is not None else datetime.now(timezone.utc))
+            trader.close()
+            recorder.close()
+    print(render_recorder_summary(summary))
+    print()
+    print("Trading report (real demo fills; PnL only for windows that have settled):")
+    print(render_backtest_reports([trader.report()]))
+    print()
+    report_conn = sqlite3.connect(str(db_path))
+    try:
+        print(render_demo_report(report_conn, trader.stats))
+    finally:
+        report_conn.close()
+    return 0
+
+
 async def _cmd_calibrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db)
     if not db_path.is_file():
@@ -671,6 +749,20 @@ def build_parser() -> argparse.ArgumentParser:
     lab.add_argument("--max-combos", type=int, default=400, help="refuse grids larger than this (default: 400)")
     lab.set_defaults(handler=_cmd_lab)
 
+    demo = commands.add_parser(
+        "demo",
+        help="the paper strategy placing REAL orders in Kalshi's DEMO environment (fake money; needs your demo key)",
+    )
+    demo.add_argument("--series", help="override series_ticker from config.yaml")
+    demo.add_argument("--hours", type=float, default=2.0, help="stop after this many hours (default: 2)")
+    demo.add_argument("--data-dir", default="data", help="directory for the SQLite database (default: ./data)")
+    demo.add_argument(
+        "--kill-file", default="KILL", help="creating this file stops trading and cancels open orders (default: ./KILL)"
+    )
+    demo.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)")
+    demo.add_argument("--maker-fee-multiplier", default="0", help="fee multiplier for the SHADOW paper order only (default: 0)")
+    demo.set_defaults(handler=_cmd_demo)
+
     calibrate = commands.add_parser(
         "calibrate", help="Brier score + reliability table from predictions logged into a recorder database"
     )
@@ -772,6 +864,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         if args.top < 1 or args.min_train_trades < 1 or args.max_combos < 1:
             print("error: --top, --min-train-trades and --max-combos must be at least 1", file=sys.stderr)
+            return 2
+    if args.command == "demo":
+        if not math.isfinite(args.hours) or args.hours <= 0 or not math.isfinite(args.poll_interval) or args.poll_interval <= 0:
+            print("error: --hours and --poll-interval must be finite and greater than 0", file=sys.stderr)
+            return 2
+        if not _is_non_negative_decimal(args.maker_fee_multiplier):
+            print("error: --maker-fee-multiplier must be a non-negative number", file=sys.stderr)
             return 2
     if args.command == "calibrate" and args.bins <= 0:
         print("error: --bins must be greater than 0", file=sys.stderr)

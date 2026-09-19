@@ -140,6 +140,30 @@ result deserves any belief. The optimistic fill assumption is a best case (every
 trade), and a replay cannot see adverse selection, so a "good" result is a reason to forward paper-trade on new
 data, never a profitability claim.
 
+## 4d. Demo-environment orders (fake money, needs your demo key; Phase 6)
+
+Run these yourself, in this order, on your own machine, with a DEMO key in `.env` (demo and prod keys differ; the
+dashboard's Settings tab writes the same file). Nothing here can touch prod: the client refuses to sign an order
+against it.
+
+```powershell
+btcbot auth-check --env demo      # one signed balance read
+btcbot demo-check                 # places and cancels tiny orders, checks rejections, reads orders back
+btcbot demo --hours 2             # the paper strategy, placing real demo orders
+```
+
+`demo-check` uses Kalshi's V2 order endpoints, which quote everything from the YES side, so a NO order is sent as
+an `ask` on YES at `1 - price`. It places one tiny unfillable YES order and one NO order, **reads each back**,
+and FAILS if Kalshi recorded the wrong side or price. If that row fails, stop and send me the report: the field
+names and mapping are read from the docs, not yet proven against your account. Any other failing row is worth
+reading too (a rejected shape shows up as a parse or HTTP error naming the field).
+
+`demo` prints, at the end, each real order next to the paper broker's simulation of the same order: filled or
+not, price, fee, settled PnL, plus how many post-only bids the exchange rejected because the book moved. That gap
+is how far the backtest's fill assumptions are from a real exchange. The demo book is thin and largely
+synthetic, so read it as plumbing and fee validation, not as what prod fills would look like and not as evidence
+of an edge. Create a `KILL` file to stop it; it cancels its open orders on the way out.
+
 ## 5. Dashboard (optional, no credentials, no network needed)
 
 ```powershell

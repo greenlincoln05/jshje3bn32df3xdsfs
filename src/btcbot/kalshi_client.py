@@ -35,7 +35,20 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from btcbot import __version__
 from btcbot.config import KalshiEnv
-from btcbot.models import Balance, KalshiFill, KalshiOrder, Market, OrderBook, ParseError, Position, Series, Side, require
+from btcbot.models import (
+    Balance,
+    CancelAck,
+    KalshiFill,
+    KalshiOrder,
+    Market,
+    OrderAck,
+    OrderBook,
+    ParseError,
+    Position,
+    Series,
+    Side,
+    require,
+)
 
 log = logging.getLogger("btcbot.kalshi")
 
@@ -170,6 +183,17 @@ def _api_error(label: str, response: httpx.Response) -> KalshiAPIError:
 
 _RETRYABLE_SERVER_STATUSES = frozenset({500, 502, 503, 504})
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_ORDERS_V2 = "/portfolio/events/orders"  # the legacy POST/DELETE /portfolio/orders are deprecated (docs changelog)
+_MARKETABLE_PRICE = Decimal("0.99")  # a buy priced here crosses any resting order on the other side
+
+
+def _fixed(value: Decimal, places: int) -> str:
+    """Kalshi's fixed-point strings ("0.5600", "10.00"). A value with more precision than that is sent
+    exactly as given, NOT rounded: rounding would quietly turn an off-grid price into a valid one, and
+    ``demo-check`` sends one deliberately to prove the exchange rejects it."""
+    unit = Decimal(1).scaleb(-places)
+    quantized = value.quantize(unit)
+    return format(quantized if quantized == value else value, "f")
 _MAX_RETRY_AFTER_SEC = 60.0
 
 
@@ -294,8 +318,12 @@ class KalshiClient:
             seen_cursors.add(cursor)
             params["cursor"] = cursor
 
-    async def list_fills(self, *, ticker: str | None = None, order_id: str | None = None) -> list[KalshiFill]:
+    async def list_fills(
+        self, *, ticker: str | None = None, order_id: str | None = None, min_ts: int | None = None
+    ) -> list[KalshiFill]:
         params = {"limit": "1000"}
+        if min_ts is not None:
+            params["min_ts"] = str(min_ts)
         if ticker:
             params["ticker"] = ticker
         if order_id:
@@ -335,32 +363,51 @@ class KalshiClient:
         count: Decimal,
         price: Decimal | None = None,
         client_order_id: str | None = None,
-    ) -> KalshiOrder:
-        """Places a resting (limit, ``price`` given) or taker (market, ``price`` omitted) buy order. This
-        bot never sells to open or shorts a position (see execution.py/strategy.py), so ``action`` is
-        always ``"buy"``; closing early isn't implemented (spec: hold to settlement by default).
+        post_only: bool = True,
+    ) -> OrderAck:
+        """Places a buy of ``side`` (``"yes"`` or ``"no"``): a resting limit order when ``price`` (in that
+        side's own dollars) is given, otherwise a marketable immediate-or-cancel order.
 
+        Kalshi's V2 endpoint (``POST /portfolio/events/orders``) quotes everything from the YES side:
+        ``bid`` buys YES, ``ask`` sells YES, and selling YES at ``p`` is buying NO at ``1 - p``. So buying
+        NO at 0.68 is sent as an ``ask`` at a YES price of 0.32. (Read from docs.kalshi.com on 2026-09-19;
+        ``btcbot demo-check`` verifies it against the real demo account by reading the order back.)
+
+        Resting orders are ``post_only`` by default: a bid meant to join the queue must never cross the
+        spread and pay a taker fee, so a book that moved is rejected instead of silently crossed.
         ``client_order_id`` defaults to a fresh UUID so an application-level retry after an ambiguous
-        failure can't double-place -- Kalshi is expected to deduplicate on this field (per the Phase 6 plan;
-        unverified, see the module docstring)."""
+        failure cannot double-place."""
         self._require_demo("create_order")
+        if count <= 0:
+            raise ValueError("count must be positive")
+        if price is not None and not (Decimal(0) < price < Decimal(1)):
+            raise ValueError("price must be strictly between 0 and 1 dollars")
+        marketable = price is None
+        own_price = _MARKETABLE_PRICE if marketable else price
+        book_side, yes_price = ("bid", own_price) if side == "yes" else ("ask", Decimal(1) - own_price)
         body: dict[str, Any] = {
             "ticker": ticker,
+            "side": book_side,
+            "count": _fixed(count, 2),
+            "price": _fixed(yes_price, 4),
+            "time_in_force": "immediate_or_cancel" if marketable else "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
             "client_order_id": client_order_id or str(uuid.uuid4()),
-            "side": side,
-            "action": "buy",
-            "type": "limit" if price is not None else "market",
-            "count": str(count),
         }
-        if price is not None:
-            body[f"{side}_price_dollars"] = str(price)
-        data = await self._request("POST", "/portfolio/orders", authenticated=True, json_body=body)
-        return KalshiOrder.from_api(require(data, "order", "create-order response"))
+        if not marketable and post_only:
+            body["post_only"] = True
+        data = await self._request("POST", _ORDERS_V2, authenticated=True, json_body=body)
+        return OrderAck.from_api(data)
 
-    async def cancel_order(self, order_id: str) -> KalshiOrder:
+    async def cancel_order(self, order_id: str, *, market_ticker: str | None = None) -> CancelAck:
+        """``market_ticker`` is needed for Kalshi's auto-routing: an order id alone cannot identify the
+        exchange shard (docs: DELETE /portfolio/events/orders/{order_id})."""
         self._require_demo("cancel_order")
-        data = await self._request("DELETE", f"/portfolio/orders/{quote(order_id, safe='')}", authenticated=True)
-        return KalshiOrder.from_api(require(data, "order", "cancel-order response"))
+        params = {"market_ticker": market_ticker} if market_ticker else None
+        data = await self._request(
+            "DELETE", f"{_ORDERS_V2}/{quote(order_id, safe='')}", params=params, authenticated=True
+        )
+        return CancelAck.from_api(data)
 
     def _require_demo(self, action: str) -> None:
         if self.env is not KalshiEnv.DEMO:

@@ -131,6 +131,7 @@ def list_databases(data_dir: Path) -> list[dict[str, Any]]:
             "paper" if name.startswith("paper-")
             else "recorder" if name.startswith("recorder-")
             else "stream" if name.startswith("stream-")
+            else "demo" if name.startswith("demo-")
             else "unknown"
         )
         stat = path.stat()
@@ -928,7 +929,7 @@ function drawSeries(canvas, points, opts) {
 
 let market = null, side = "yes";
 
-const KIND_LABELS = { paper: "Paper trading", recorder: "Data recording", stream: "BRTI + book stream", unknown: "Data file" };
+const KIND_LABELS = { paper: "Paper trading", recorder: "Data recording", stream: "BRTI + book stream", demo: "Demo orders (fake money)", unknown: "Data file" };
 function dbLabel(db) {
   const m = /^[a-z]+-[A-Z0-9]+-(demo|prod)-/.exec(db.name);
   const env = m ? m[1].toUpperCase() : "";

@@ -48,7 +48,7 @@ class DemoCheckClient(Protocol):
     async def create_order(
         self, ticker: str, side: str, *, count: Decimal, price: Decimal | None = None, client_order_id: str | None = None
     ) -> object: ...
-    async def cancel_order(self, order_id: str) -> object: ...
+    async def cancel_order(self, order_id: str, *, market_ticker: str | None = None) -> object: ...
     async def get_positions(self) -> list[object]: ...
     async def list_orders(self, *, ticker: str | None = None, status: str | None = None) -> list[object]: ...
 
@@ -160,7 +160,8 @@ async def run_demo_check(
     results.append(CheckResult("market discovery", True, market.ticker))
 
     backend = DemoExecutionBackend(client, market.ticker)
-    results.append(await _check_resting_order_and_cancel(client, backend))
+    results.append(await _check_resting_order_and_cancel(client, backend, "yes"))
+    results.append(await _check_resting_order_and_cancel(client, backend, "no"))
     fillable_result, observed_fills = await _check_fillable_order_and_position(client, backend, market)
     results.append(fillable_result)
     if wait_for_settlement:
@@ -180,19 +181,31 @@ async def run_demo_check(
 # --------------------------------------------------------------------------- individual checks
 
 
-async def _check_resting_order_and_cancel(client: DemoCheckClient, backend: DemoExecutionBackend) -> CheckResult:
-    """A tiny, deliberately unfillable order (deep off the current market) then a cancel."""
-    name = "resting order + cancel"
+async def _check_resting_order_and_cancel(client: DemoCheckClient, backend: DemoExecutionBackend, side: Side) -> CheckResult:
+    """A tiny, deliberately unfillable order (deep off the current market) then a cancel. Run once per side
+    because Kalshi's V2 endpoint only speaks YES: a NO order is sent as an ask on YES at ``1 - price``, and
+    reading the order back is what proves that mapping did what was intended. If the order comes back as the
+    wrong outcome or at the wrong price, this FAILS: trading on a wrong side mapping would be the worst bug
+    this whole phase could ship."""
+    name = f"resting {side.upper()} order + cancel"
+    price = Decimal("0.01")
     try:
-        order_id = await backend.place_resting_order("yes", Decimal("0.01"), Decimal(1))
+        order_id = await backend.place_resting_order(side, price, Decimal(1))
         placed = await client.get_order(order_id)
         if placed.is_done:
             return CheckResult(name, False, f"order {order_id} was already done ({placed.status}) right after placing it")
+        if placed.side != side or (placed.price is not None and placed.price != price):
+            await backend.cancel_order(order_id)
+            return CheckResult(
+                name, False,
+                f"asked for {side.upper()} at {price} but Kalshi recorded {placed.side.upper()} at {placed.price}: "
+                "the side/price mapping in kalshi_client.create_order is WRONG; do not trade until fixed",
+            )
         await backend.cancel_order(order_id)
         cancelled = await client.get_order(order_id)
         if not cancelled.is_done:
             return CheckResult(name, False, f"order {order_id} still shows {cancelled.status} after cancel")
-        return CheckResult(name, True, f"order {order_id}: placed then {cancelled.status}")
+        return CheckResult(name, True, f"order {order_id}: {side.upper()} at {price} read back correctly, then {cancelled.status}")
     except KalshiError as exc:
         return CheckResult(name, False, str(exc))
 
