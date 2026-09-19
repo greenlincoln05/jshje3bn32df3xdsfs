@@ -1,24 +1,28 @@
-"""Order placement, cancel/replace and fill tracking (Phase 4), per docs/btc15m-bot-spec.md sections 3 and 7.
+"""Order placement, cancel/replace and fill tracking, per docs/btc15m-bot-spec.md sections 3 and 7.
 
-One interface a strategy drives without knowing whether it is paper or live. Only the paper backend exists:
-the demo and live backends arrive in Phases 6 and 7, and live stays behind all four gates in section 7.
-CLAUDE.md is explicit that no order-placing code against Kalshi itself gets added before the owner approves
-Phase 6, so :class:`ExecutionBackend` has no implementation here that talks to the network.
+One interface a strategy drives without knowing whether it is paper or demo (live stays behind all four
+gates in section 7 and has no backend here at all -- :class:`btcbot.kalshi_client.KalshiClient` itself
+refuses to sign a write call against anything but the demo environment, so :class:`DemoExecutionBackend`
+cannot become a live backend just by pointing it at a different `KalshiEnv`).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from btcbot.models import OrderBook, Side
+from btcbot.models import KalshiFill, KalshiOrder, OrderBook, Position, Side
 from btcbot.paper_broker import Fill, PaperBroker
+
+if TYPE_CHECKING:
+    from btcbot.kalshi_client import KalshiClient
 
 
 class ExecutionBackend(Protocol):
-    """Shared by every backend (paper now; demo and live later). A strategy that only calls these methods
-    cannot tell which one it is talking to."""
+    """Shared by every backend (paper and demo). A strategy that only calls these methods cannot tell
+    which one it is talking to."""
 
     async def place_resting_order(self, side: Side, price: Decimal, size: Decimal) -> str: ...
     async def cancel_order(self, order_id: str) -> None: ...
@@ -56,3 +60,81 @@ class PaperExecutionBackend:
     async def place_taker_order(self, side: Side, size: Decimal) -> list[Fill]:
         book, now = self._require_market()
         return self._broker.place_taker_order(side, size, book=book, ts=now)
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationReport:
+    """What :meth:`DemoExecutionBackend.reconcile` found and did, for a caller (``btcbot demo-check``) to
+    log rather than silently drop."""
+
+    cancelled_order_ids: list[str]
+    open_positions: list[Position]
+
+
+class DemoExecutionBackend:
+    """Places real orders against Kalshi's demo environment (fake money; the demo order book is thin and
+    synthetic -- see the README's "Verified Kalshi API facts"). Every write goes through
+    :class:`btcbot.kalshi_client.KalshiClient`, whose own hard assertion refuses to sign a write call
+    against anything but ``KalshiEnv.DEMO`` -- this class adds no gate of its own and cannot become a live
+    backend just by pointing it at a different client.
+
+    Fills come from polling :meth:`btcbot.kalshi_client.KalshiClient.list_fills`, not a push channel (an
+    authenticated WebSocket fill/order channel is a later addition, only if polling proves too slow).
+    Converted to :class:`btcbot.paper_broker.Fill`'s exact shape, so a run that feeds the same book
+    snapshots to both this backend and :class:`PaperExecutionBackend` produces two directly comparable fill
+    streams -- this is what Phase 6d's fidelity report compares.
+    """
+
+    def __init__(self, client: KalshiClient, ticker: str) -> None:
+        self._client = client
+        self._ticker = ticker
+        self._seen_trade_ids: set[str] = set()
+
+    async def reconcile(self) -> ReconciliationReport:
+        """Call once at startup, before placing anything. A freshly started process has no legitimate
+        resting orders yet, so every open order this account holds is by definition a leftover from a
+        previous crashed run; cancel all of them. Open positions cannot be cancelled -- they are already
+        filled contracts, and this bot does not exit early (spec: hold to settlement by default) -- so they
+        are only reported, never acted on."""
+        open_orders: list[KalshiOrder] = [order for order in await self._client.list_orders() if not order.is_done]
+        cancelled: list[str] = []
+        for order in open_orders:
+            await self._client.cancel_order(order.order_id)
+            cancelled.append(order.order_id)
+        positions = [position for position in await self._client.get_positions() if position.count > 0]
+        return ReconciliationReport(cancelled_order_ids=cancelled, open_positions=positions)
+
+    async def place_resting_order(self, side: Side, price: Decimal, size: Decimal) -> str:
+        order = await self._client.create_order(self._ticker, side, count=size, price=price)
+        return order.order_id
+
+    async def cancel_order(self, order_id: str) -> None:
+        await self._client.cancel_order(order_id)
+
+    async def place_taker_order(self, side: Side, size: Decimal) -> list[Fill]:
+        order = await self._client.create_order(self._ticker, side, count=size)  # no price -> market order
+        fills = await self._client.list_fills(ticker=self._ticker, order_id=order.order_id)
+        return [self._to_fill(f) for f in fills if self._mark_seen(f.trade_id)]
+
+    async def poll_fills(self) -> list[Fill]:
+        """Call once per polled snapshot (the same cadence :meth:`PaperExecutionBackend.sync_market` is fed
+        at). Returns only fills not already returned by an earlier call."""
+        fills = await self._client.list_fills(ticker=self._ticker)
+        return [self._to_fill(f) for f in fills if self._mark_seen(f.trade_id)]
+
+    def _mark_seen(self, trade_id: str) -> bool:
+        if trade_id in self._seen_trade_ids:
+            return False
+        self._seen_trade_ids.add(trade_id)
+        return True
+
+    @staticmethod
+    def _to_fill(kalshi_fill: KalshiFill) -> Fill:
+        return Fill(
+            side=kalshi_fill.side,
+            price=kalshi_fill.price,
+            size=kalshi_fill.count,
+            fee=kalshi_fill.fee_usd,
+            maker=not kalshi_fill.is_taker,
+            ts=kalshi_fill.created_time,
+        )

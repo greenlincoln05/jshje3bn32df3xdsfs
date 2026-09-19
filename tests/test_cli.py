@@ -115,6 +115,47 @@ class TestMain:
         assert cli.main(["auth-check"]) == 1
         assert "absent.key" in capsys.readouterr().err
 
+    def test_demo_check_needs_credentials(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.chdir(tmp_path)
+        for var in ("KALSHI_ENV", "KALSHI_KEY_ID", "KALSHI_PRIVATE_KEY_PATH"):
+            monkeypatch.delenv(var, raising=False)
+        assert cli.main(["demo-check"]) == 1
+        assert "KALSHI_KEY_ID" in capsys.readouterr().err
+
+    def test_demo_check_has_no_env_flag_at_all(self, capsys):
+        # demo-check always targets the demo environment (see kalshi_client.py's write gate); there is no
+        # --env flag to override that, and argparse itself is what enforces this (by exiting directly),
+        # not a runtime check this test could otherwise bypass.
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["demo-check", "--env", "prod"])
+        assert excinfo.value.code == 2
+        assert "unrecognized arguments" in capsys.readouterr().err
+
+
+class TestDemoCheckReportRendering:
+    def test_marks_each_row_pass_fail_or_skip(self):
+        from btcbot.demo_check import CheckResult, DemoCheckReport
+
+        report = DemoCheckReport(
+            "T",
+            [
+                CheckResult("a", True, "fine"),
+                CheckResult("b", False, "broken"),
+                CheckResult("c", None, "not attempted"),
+            ],
+        )
+        text = cli.render_demo_check_report(report)
+        assert "[PASS] a: fine" in text
+        assert "[FAIL] b: broken" in text
+        assert "[SKIP] c: not attempted" in text
+        assert "Overall: FAILED" in text  # the one False row fails the whole run, regardless of the skip
+
+    def test_all_pass_or_skip_is_an_overall_ok(self):
+        from btcbot.demo_check import CheckResult, DemoCheckReport
+
+        report = DemoCheckReport("T", [CheckResult("a", True, "fine"), CheckResult("b", None, "skipped")])
+        assert "Overall: OK" in cli.render_demo_check_report(report)
+
 
 def install_mock_api(monkeypatch, handler):
     real_client = KalshiClient

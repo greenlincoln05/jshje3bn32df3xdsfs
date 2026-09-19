@@ -1,6 +1,8 @@
 import base64
 import itertools
+import json
 import random
+import uuid
 from decimal import Decimal
 
 import httpx
@@ -16,6 +18,7 @@ from btcbot.kalshi_client import (
     KalshiClient,
     KalshiConnectionError,
     KalshiError,
+    KalshiWriteNotAllowedError,
 )
 from btcbot.models import ParseError
 
@@ -381,3 +384,168 @@ class TestMarketDataEndpoints:
             await client.get_market("A/B?x")
 
         assert script.requests[0].url.raw_path == b"/trade-api/v2/markets/A%2FB%3Fx"
+
+
+# --------------------------------------------------------------------------- Phase 6: account endpoints
+#
+# These payloads are this project's own best-effort guess at Kalshi's order/fill/position shape (see
+# kalshi_client.py's module docstring): unlike tests/fixtures/*.json, they were never captured from a real
+# Kalshi response, so they are inlined here rather than added to that directory of verified payloads.
+
+ORDER_PAYLOAD = {
+    "order": {
+        "order_id": "ord-1", "client_order_id": "coid-1", "ticker": "KXBTC15M-26SEP182145-45",
+        "side": "yes", "action": "buy", "type": "limit", "status": "resting",
+        "yes_price_dollars": "0.30", "initial_count": "5", "remaining_count": "5",
+        "created_time": "2026-09-19T00:00:00Z",
+    }
+}
+
+
+class TestAccountReadOnlyEndpoints:
+    """get_order/list_orders/list_fills/get_positions are signed but read-only, so -- like get_balance --
+    they are allowed against either environment; only create_order/cancel_order are demo-gated."""
+
+    async def test_get_order_parses_price_and_counts(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            order = await client.get_order("ord-1")
+
+        assert script.requests[0].url.path == "/trade-api/v2/portfolio/orders/ord-1"
+        assert order.side == "yes" and order.price == Decimal("0.30")
+        assert order.initial_count == Decimal("5") and order.remaining_count == Decimal("5")
+        assert order.is_done is False
+
+    async def test_order_is_done_for_terminal_statuses(self, rsa_key):
+        for status_value in ("canceled", "executed"):
+            payload = {"order": {**ORDER_PAYLOAD["order"], "status": status_value}}
+            script = Script(ok(payload))
+            client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+            async with client:
+                order = await client.get_order("ord-1")
+            assert order.is_done is True
+
+    async def test_list_orders_builds_the_query_and_paginates(self, rsa_key):
+        script = Script(
+            ok({"orders": [ORDER_PAYLOAD["order"]], "cursor": "next"}),
+            ok({"orders": [{**ORDER_PAYLOAD["order"], "order_id": "ord-2"}], "cursor": ""}),
+        )
+        client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            orders = await client.list_orders(ticker="KXBTC15M-26SEP182145-45", status="resting")
+
+        assert dict(script.requests[0].url.params) == {
+            "limit": "1000", "ticker": "KXBTC15M-26SEP182145-45", "status": "resting",
+        }
+        assert [o.order_id for o in orders] == ["ord-1", "ord-2"]
+
+    async def test_list_orders_rejects_a_repeated_cursor(self, rsa_key):
+        script = Script(ok({"orders": [], "cursor": "loop"}))
+        client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            with pytest.raises(KalshiError, match="repeated.*cursor"):
+                await client.list_orders()
+
+    async def test_list_fills_parses_side_and_price(self, rsa_key):
+        fill = {
+            "trade_id": "t-1", "order_id": "ord-1", "ticker": "KXBTC15M-26SEP182145-45",
+            "side": "no", "action": "buy", "no_price_dollars": "0.68", "count": "3",
+            "is_taker": False, "created_time": "2026-09-19T00:00:05Z",
+        }
+        script = Script(ok({"fills": [fill], "cursor": ""}))
+        client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            fills = await client.list_fills(order_id="ord-1")
+
+        assert script.requests[0].url.params["order_id"] == "ord-1"
+        assert fills[0].side == "no" and fills[0].price == Decimal("0.68") and fills[0].count == Decimal("3")
+
+    async def test_get_positions_derives_side_from_the_signed_position_field(self, rsa_key):
+        payload = {
+            "market_positions": [
+                {"ticker": "A", "position": "5", "market_exposure_dollars": "1.50"},
+                {"ticker": "B", "position": "-3"},
+            ]
+        }
+        script = Script(ok(payload))
+        client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            positions = await client.get_positions()
+
+        assert positions[0].side == "yes" and positions[0].count == Decimal("5")
+        assert positions[0].market_exposure_usd == Decimal("1.50")
+        assert positions[1].side == "no" and positions[1].count == Decimal("3")  # sign strips to a positive count
+
+
+class TestWriteEndpointsAreDemoOnly:
+    async def test_create_order_refuses_against_prod_without_sending_anything(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            with pytest.raises(KalshiWriteNotAllowedError):
+                await client.create_order("KXBTC15M-26SEP182145-45", "yes", count=Decimal("5"), price=Decimal("0.30"))
+        assert script.requests == []  # refused before any request was built, let alone signed
+
+    async def test_cancel_order_refuses_against_prod_without_sending_anything(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.PROD, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            with pytest.raises(KalshiWriteNotAllowedError):
+                await client.cancel_order("ord-1")
+        assert script.requests == []
+
+    async def test_create_order_against_demo_is_allowed(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            order = await client.create_order("T", "yes", count=Decimal("1"), price=Decimal("0.5"))
+        assert order.order_id == "ord-1"
+
+
+class TestCreateAndCancelOrder:
+    async def test_create_order_sends_a_limit_buy_with_a_generated_client_order_id(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            order = await client.create_order(
+                "KXBTC15M-26SEP182145-45", "yes", count=Decimal("5"), price=Decimal("0.30")
+            )
+
+        assert script.requests[0].url.path == "/trade-api/v2/portfolio/orders"
+        body = json.loads(script.requests[0].content)
+        assert body["ticker"] == "KXBTC15M-26SEP182145-45"
+        assert body["side"] == "yes" and body["action"] == "buy" and body["type"] == "limit"
+        assert body["count"] == "5" and body["yes_price_dollars"] == "0.30"
+        uuid.UUID(body["client_order_id"])  # a real UUID was generated, not left blank
+        assert order.order_id == "ord-1"
+
+    async def test_create_order_honors_an_explicit_client_order_id(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            await client.create_order("T", "no", count=Decimal("2"), price=Decimal("0.6"), client_order_id="my-id")
+
+        body = json.loads(script.requests[0].content)
+        assert body["client_order_id"] == "my-id"
+        assert body["no_price_dollars"] == "0.6"
+
+    async def test_create_order_without_a_price_is_a_market_order(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            await client.create_order("T", "yes", count=Decimal("1"))
+
+        body = json.loads(script.requests[0].content)
+        assert body["type"] == "market"
+        assert "yes_price_dollars" not in body and "no_price_dollars" not in body
+
+    async def test_cancel_order_sends_delete_to_the_order_path(self, rsa_key):
+        script = Script(ok(ORDER_PAYLOAD))
+        client, _ = make_client(script, env=KalshiEnv.DEMO, auth=KalshiAuth("test-key", rsa_key))
+        async with client:
+            order = await client.cancel_order("ord-1")
+
+        assert script.requests[0].method == "DELETE"
+        assert script.requests[0].url.path == "/trade-api/v2/portfolio/orders/ord-1"
+        assert order.order_id == "ord-1"

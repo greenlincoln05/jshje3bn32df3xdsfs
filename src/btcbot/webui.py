@@ -9,9 +9,12 @@ The "Settings" panel edits the same local ``.env`` file every other command alre
 owner's own browser to their own disk -- the same file `docs/running-live.md` already tells the owner to
 edit by hand for `auth-check`. This module never transmits a key anywhere, never logs one (a POST body
 is not part of the request line `BaseHTTPRequestHandler` logs), and a GET of the current settings always
-masks the key id. There is still no order-placing code anywhere in this repo (CLAUDE.md's Phase 6 gate):
-this dashboard cannot place, cancel, or modify a Kalshi order, in demo or prod, no matter what is entered
-in Settings -- it only ever reads local SQLite databases and rewrites three lines of a local text file.
+masks the key id. This dashboard has no path to `kalshi_client.py`'s order endpoints at all, so it cannot
+place, cancel, or modify a Kalshi order, in demo or prod, no matter what is entered in Settings -- it only
+ever reads local SQLite databases and rewrites three lines of a local text file. (Phase 6 did add real,
+demo-only order-placing code elsewhere in this repo -- `kalshi_client.py`/`execution.py`/`demo_check.py` --
+but nothing here calls any of it; entering a key just lets the owner run `auth-check`/`demo-check`
+themselves, exactly as if they'd edited `.env` directly.)
 """
 
 from __future__ import annotations
@@ -612,7 +615,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="row"><label for="key-id-input">Key ID</label><input id="key-id-input" type="password" placeholder="leave blank to keep current value" size="36"></div>
       <div class="row"><label for="key-path-input">Private key path</label><input id="key-path-input" placeholder="/path/to/key.pem" size="36"></div>
-      <div class="warn" id="prod-warn">Live (prod) is selected. Nothing in this repo can place orders yet, but keep this on Demo until Phase 6 is done and you mean it.</div>
+      <div class="warn" id="prod-warn">Live (prod) is selected. This dashboard still cannot place, cancel, or modify any order -- but Phase 6 did add real (demo-only) order-placing code elsewhere in this repo (`btcbot demo-check`), so a key entered here now lets you run that yourself. Keep this on Demo unless you mean to.</div>
       <div class="row"><button class="action" id="save-settings">Save</button></div>
       <div id="settings-status"></div>
     </div>
