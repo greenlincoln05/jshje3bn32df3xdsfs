@@ -469,3 +469,15 @@ class TestStrategyLabEndpoints:
 
     def test_unknown_run_id_is_404(self, dashboard):
         assert _get(dashboard.base_url, "/api/lab/status?id=nope")[0] == 404
+
+def test_market_spot_is_bounded_to_selected_window(tmp_path):
+    from btcbot.webui import market_view
+    db = make_db(tmp_path)
+    with sqlite3.connect(db) as conn:
+        insert_market(conn, TICKER, strike=80000, close_time=T0 + timedelta(seconds=3), open_time=T0)
+        insert_snapshot(conn, TICKER, T0)
+        insert_spot_run(conn, T0, 10)
+    view = market_view(db, TICKER)
+    assert len(view['spot_series']) == 4
+    assert view['spot_ts'] == (T0 + timedelta(seconds=3)).isoformat()
+    assert view['book_latency_ms'] == 10.0

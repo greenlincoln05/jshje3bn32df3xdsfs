@@ -226,3 +226,18 @@ failed -- a `[SKIP]` does not fail the run.
   fine to use instead of editing the file by hand -- but don't run it with `--port` forwarded or exposed to
   another machine, since anyone who can reach it could read the masked settings status or overwrite `.env`.
   The dashboard itself still has no path to `kalshi_client.py`'s order endpoints, Phase 6 or not.
+
+## Data cadence and dashboard freshness
+
+The public recorder treats `--poll-interval` as the target start-to-start interval
+on successful polls, including time spent discovering the market, fetching its book,
+and following settlements. An overrun retains a full interval cooldown; failures
+also retain their existing cooldown. This removes additive request-time delay without
+catch-up request bursts. This is still REST sampling, not streaming order-book data.
+
+The dashboard refreshes visible market/monitor tabs every 500 ms, with at most one
+refresh in flight and a five-second fetch timeout. Book and Coinbase spot ages are
+shown separately; an open window is marked STALE if either is missing or at least
+three seconds old. Book request latency is displayed separately from data age.
+Historical spot charts and prices are limited to the selected market window.
+Restart the recorder and dashboard on the updated version to use these changes.

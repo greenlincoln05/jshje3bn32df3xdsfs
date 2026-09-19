@@ -443,7 +443,11 @@ class Recorder:
                         await self.on_orderbook(market, book, poll_ts)
 
                 await self._finalize_pending(pending_settlement, stats)
-                await self._sleep(self._poll_interval_sec)
+                # Start-to-start cadence: request time is part of the interval.
+                # On an overrun, retain a full cooldown rather than burst-catching up.
+                elapsed = (self._clock() - now).total_seconds()
+                delay = self._poll_interval_sec - elapsed
+                await self._sleep(delay if delay > 0 else self._poll_interval_sec)
         except asyncio.CancelledError:
             self._log("info", "stop", "cancelled: task cancelled")
             raise
