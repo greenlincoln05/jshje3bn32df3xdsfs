@@ -12,7 +12,7 @@ min_tau_sec: 30
 max_tau_sec: 780
 cancel_before_close_sec: 20
 min_price: 0.15               # refuse to enter outside [min_price, max_price]; null disables one side
-max_price: 0.85                # a reasoned starting guardrail, not backtested -- tune with `btcbot lab`
+max_price: 0.65                # lowered from 0.85 on 2026-09-20: prod paper entries above 0.65 won ~60% while the model said 80-85% (20 trades, -$19.49); an in-sample finding, forward-test it
 sizing:
   contracts_per_trade: 5
   mode: percent                # fixed | ramp | percent | kelly (fractional Kelly on risk.max_open_exposure_usd)
