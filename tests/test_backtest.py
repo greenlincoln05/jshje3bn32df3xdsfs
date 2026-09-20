@@ -7,6 +7,7 @@ import pytest
 
 from btcbot.backtest import (
     BacktestError,
+    Settlement,
     load_settlements,
     load_snapshots,
     load_spot_ticks,
@@ -65,11 +66,12 @@ def insert_spot_run(conn, start_ts, count, *, base_price=Decimal("80000")):
     conn.commit()
 
 
-def insert_settlement(conn, ticker, result, *, strike, close_time):
+def insert_settlement(conn, ticker, result, *, strike, close_time, available_ts=None):
     conn.execute(
         """INSERT INTO settlements (ticker, event_ticker, result, settled_avg, strike, close_time, finalized_poll_ts)
            VALUES (?,?,?,?,?,?,?)""",
-        (ticker, ticker.rsplit("-", 1)[0], result, str(strike), str(strike), close_time.isoformat(), close_time.isoformat()),
+        (ticker, ticker.rsplit("-", 1)[0], result, str(strike), str(strike), close_time.isoformat(),
+         (available_ts or close_time).isoformat()),
     )
     conn.commit()
 
@@ -118,7 +120,7 @@ class TestLoaders:
     def test_load_settlements_excludes_unresolved(self, tmp_path):
         conn = make_db(tmp_path)
         insert_settlement(conn, TICKER, "yes", strike=Decimal("80000"), close_time=T0)
-        assert load_settlements(conn) == {TICKER: "yes"}
+        assert load_settlements(conn) == {TICKER: Settlement("yes", T0)}
 
     def test_load_spot_ticks_round_trips_price(self, tmp_path):
         conn = make_db(tmp_path)
@@ -200,6 +202,48 @@ class TestUnresolvedSettlement:
 
 
 class TestRollover:
+    def test_settlement_announcement_controls_when_exposure_is_released(self, tmp_path):
+        conn = make_db(tmp_path)
+        ticker_2 = "KXBTC15M-26SEP190015-15"
+        close_1 = seed_fillable_window(conn, TICKER, start_ts=T0)
+        start_2 = T0 + timedelta(seconds=10)
+        close_2 = seed_fillable_window(conn, ticker_2, start_ts=start_2)
+        # Window 1 is announced only after all window-2 snapshots. Its filled
+        # exposure must still occupy the tight risk cap, blocking window 2.
+        insert_settlement(
+            conn, TICKER, "yes", strike=Decimal("80000"), close_time=close_1,
+            available_ts=start_2 + timedelta(seconds=30),
+        )
+        insert_settlement(conn, ticker_2, "yes", strike=Decimal("80000"), close_time=close_2)
+        config = BotConfig(risk={"max_contracts_per_trade": 10, "max_open_exposure_usd": Decimal("1.5"),
+                                 "daily_loss_limit_usd": Decimal("20"), "max_consecutive_losses": 5,
+                                 "max_trades_per_hour": 12})
+
+        report = run_backtest(conn, config)
+
+        assert report.trades == 1
+        assert report.wins == 1
+
+    def test_announcement_before_next_entry_releases_exposure(self, tmp_path):
+        conn = make_db(tmp_path)
+        ticker_2 = "KXBTC15M-26SEP190015-15"
+        close_1 = seed_fillable_window(conn, TICKER, start_ts=T0)
+        start_2 = T0 + timedelta(seconds=10)
+        close_2 = seed_fillable_window(conn, ticker_2, start_ts=start_2)
+        insert_settlement(
+            conn, TICKER, "yes", strike=Decimal("80000"), close_time=close_1,
+            available_ts=start_2,
+        )
+        insert_settlement(conn, ticker_2, "yes", strike=Decimal("80000"), close_time=close_2)
+        config = BotConfig(risk={"max_contracts_per_trade": 10, "max_open_exposure_usd": Decimal("1.5"),
+                                 "daily_loss_limit_usd": Decimal("20"), "max_consecutive_losses": 5,
+                                 "max_trades_per_hour": 12})
+
+        report = run_backtest(conn, config)
+
+        assert report.trades == 2
+        assert report.wins == 2
+
     def test_an_unfilled_resting_order_is_cancelled_at_rollover_and_frees_exposure(self, tmp_path):
         conn = make_db(tmp_path)
         # window 1: depth never shrinks, so the order rests but is never filled
