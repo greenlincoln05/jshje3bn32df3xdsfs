@@ -602,6 +602,19 @@ async def _cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_disagree(args: argparse.Namespace) -> int:
+    """Calibration and model-vs-market disagreement report on a features CSV. Offline: no network, no key."""
+    from btcbot.calibration_report import build_report, render
+    from btcbot.features import read_csv
+
+    try:
+        print(render(build_report(read_csv(args.features), at_tau_sec=args.at_tau, field=args.field, min_n=args.min_n)))
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     """Evaluate a frozen set of named candidates against shared recorded data."""
     config = load_config(args.config)
@@ -1074,6 +1087,14 @@ def build_parser() -> argparse.ArgumentParser:
     features.add_argument("--step-sec", type=float, default=5.0, help="keep at most one row per window per this many seconds (default: 5)")
     features.add_argument("--output", default="data/research/features.csv")
     features.set_defaults(handler=_cmd_features)
+
+    disagree = commands.add_parser(
+        "disagree", help="calibration + model-vs-market disagreement report on a features CSV (offline)")
+    disagree.add_argument("--features", default="data/research/features.csv")
+    disagree.add_argument("--field", choices=["p_model", "p_blend"], default="p_model")
+    disagree.add_argument("--at-tau", type=float, default=300.0, help="read each window this many seconds before close (default: 300)")
+    disagree.add_argument("--min-n", type=int, default=10, help="buckets with fewer windows are marked small (default: 10)")
+    disagree.set_defaults(handler=_cmd_disagree)
 
     validate_cmd = commands.add_parser(
         "validate", help="time-split validation of the bot's recorded model on a features CSV (offline)")
