@@ -615,6 +615,19 @@ async def _cmd_disagree(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_watch(args: argparse.Namespace) -> int:
+    """Health check and summary of the newest recorder/demo databases. Read-only; no network, no key."""
+    from btcbot.watch import render, summarize
+
+    try:
+        items = summarize(args.data_dir, stale_min=args.stale_min)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(render(items))
+    return 2 if any(i.stale for i in items) else 0
+
+
 async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     """Evaluate a frozen set of named candidates against shared recorded data."""
     config = load_config(args.config)
@@ -1095,6 +1108,11 @@ def build_parser() -> argparse.ArgumentParser:
     disagree.add_argument("--at-tau", type=float, default=300.0, help="read each window this many seconds before close (default: 300)")
     disagree.add_argument("--min-n", type=int, default=10, help="buckets with fewer windows are marked small (default: 10)")
     disagree.set_defaults(handler=_cmd_disagree)
+
+    watch = commands.add_parser("watch", help="health check + summary of the newest paper/demo databases (read-only)")
+    watch.add_argument("--data-dir", default="data")
+    watch.add_argument("--stale-min", type=float, default=5.0, help="flag a database not written for this many minutes (default: 5)")
+    watch.set_defaults(handler=_cmd_watch)
 
     validate_cmd = commands.add_parser(
         "validate", help="time-split validation of the bot's recorded model on a features CSV (offline)")
