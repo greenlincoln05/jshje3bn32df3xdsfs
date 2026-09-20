@@ -298,7 +298,7 @@ class LivePaperTrader:
         self._last_result = "loss" if pnl < 0 else "win"
         if self._config.sizing.mode is SizingMode.RAMP:
             self._ramp_size = ramp_next_size(
-                pending.size, pnl >= 0, base=Decimal(self._config.sizing.contracts_per_trade),
+                pending.size, pnl > 0, base=Decimal(self._config.sizing.contracts_per_trade),
                 growth_pct=self._config.sizing.ramp_growth_pct,
                 max_contracts=Decimal(self._config.risk.max_contracts_per_trade))
         if self._config.sizing.mode is SizingMode.PERCENT:

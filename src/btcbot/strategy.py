@@ -81,7 +81,7 @@ def ramp_next_size(settled_size: Decimal, won: bool, *, base: Decimal, growth_pc
     drops it straight back to ``base``. Never above ``max_contracts``. Growth comes only from settled wins."""
     if not won:
         return min(base, max_contracts)
-    step = max(Decimal(1), (settled_size * growth_pct / 100).to_integral_value(rounding=ROUND_FLOOR))
+    step = Decimal(0) if growth_pct == 0 else max(Decimal(1), (settled_size * growth_pct / 100).to_integral_value(rounding=ROUND_FLOOR))
     return min(max(settled_size, base) + step, max_contracts)
 
 
