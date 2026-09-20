@@ -82,7 +82,8 @@ def _recorded_starting_balance(conn: sqlite3.Connection, tables: set[str]) -> tu
     try:
         info = json.loads(row[0])
         if info.get("kind") == "demo":
-            return _decimal(info["available_usd"]), "demo account balance when the run started"
+            # cash plus positions when the run started (the larger of cash and reported portfolio value)
+            return max(_decimal(info["available_usd"]), _decimal(info.get("portfolio_value_usd", 0))),                 "demo account balance when the run started"
         return _decimal(info["account_usd"]), "configured paper account"
     except (ValueError, KeyError, TypeError, ArithmeticError):
         return None, None
@@ -115,7 +116,9 @@ def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None =
         balance_source = "entered" if balance is not None else None
         if balance is None:
             balance, balance_source = _recorded_starting_balance(conn, tables)
-        if balance is None and default_balance is not None:
+        # A DEMO run that recorded no account_start has an unknown real balance: show "not recorded" rather than
+        # measuring its growth against the config's paper account.
+        if balance is None and default_balance is not None and "demo_orders" not in tables:
             balance, balance_source = _decimal(default_balance), "config sizing.account_usd (assumed for this run)"
         source = "demo" if "demo_orders" in tables else "paper_or_backtest" if "trades" in tables else "none"
         last_snapshot = None
