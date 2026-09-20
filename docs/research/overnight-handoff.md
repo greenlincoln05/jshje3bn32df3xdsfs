@@ -60,7 +60,21 @@ regardless of order size, which would hide any sizing-mode bug), `tests/test_lab
 end-to-end check, plus `from_config()`'s auto-detection and the grid-axis wiring). All new assertions verified
 to fail against a deliberately broken build first. Full suite: 823 passed, offline only, no key used.
 
+**Item 3, stop-loss lab replay -- the grid axis now exists, no sweep has been run:** `docs/research/
+stop-loss-handoff.md` step 3 asked for `stop_loss_pct`/`take_profit_pct` to be a grid axis judged on the
+train/test split, same as any other lab parameter; until tonight it only ever came from whatever `--config`
+YAML the whole run used, fixed for every combination (that doc's own "Not done" note). Added
+`LabParams.stop_loss_pct` / `take_profit_pct` / `stop_min_hold_sec` / `stop_min_tau_sec`, wired into
+`_config_for`'s `config.exit` (independent of sizing, unlike ramp/percent) and picked up automatically by
+`from_config()` from whatever `config.exit` already says. `tests/test_lab.py::TestExitRulesGrid` covers
+parsing/range-checking, the grid sweep, `_config_for`'s wiring, and an end-to-end replay (a seeded price-drop
+window closes early with a tight stop configured, and does not without one) -- each assertion verified to
+fail first against a deliberately broken build. This makes a real sweep possible in one `btcbot lab --grid
+stop_loss_pct=...` call; running that sweep against real recorded data, and reading the result, is still
+undone and still needs data this sandbox does not have. See `docs/research/stop-loss-handoff.md`'s own
+Progress section for the full picture across both nights.
+
 **Still open from this list:** item 1 (candidate suite forward check) and item 2 (Codex's data pipeline) need
-real recorded data this sandbox does not have; item 3 (stop-loss lab replay/sweep) has its mechanism built
-(PR #32) but running an actual sweep also needs real recorded data. `btcbot backtest`'s own ramp parity
-(above) is a real, separate follow-up if wanted.
+real recorded data this sandbox does not have; item 3's actual sweep (above) also needs real recorded data,
+though the mechanism to run it now exists end to end. `btcbot backtest`'s own ramp parity (above) is a real,
+separate follow-up if wanted.

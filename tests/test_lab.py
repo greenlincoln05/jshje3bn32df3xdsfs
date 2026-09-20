@@ -1,5 +1,6 @@
 """Offline tests for the strategy lab: synthetic windows in a real recorder-schema SQLite file, no network."""
 
+import dataclasses
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,7 @@ from btcbot.backtest import (
     replay_prepared,
     run_backtest,
 )
-from btcbot.config import BotConfig, Sizing
+from btcbot.config import BotConfig, ExitRules, Sizing
 from btcbot.candidate_suite import load_candidate_suite, render_candidate_suite, run_candidate_suite
 from btcbot.lab import (
     AccountSettings,
@@ -30,7 +31,7 @@ from btcbot.lab import (
 )
 from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder
-from test_backtest import FULL_FILL_SIZES
+from test_backtest import FULL_FILL_SIZES, seed_window_with_price_drop
 
 T0 = datetime(2026, 9, 19, 0, 0, 0, tzinfo=timezone.utc)
 WIN = 1000  # seconds between window starts
@@ -254,6 +255,71 @@ class TestRampSizing:
         base = LabParams.from_config(BotConfig())
         combos = expand_grid(base, {"ramp_growth_pct": [Decimal(0), Decimal(20), None]})
         assert {c.ramp_growth_pct for c in combos} == {Decimal(0), Decimal(20), None}
+
+
+class TestExitRulesGrid:
+    """Stop-loss/take-profit (btcbot.config.ExitRules, docs/research/stop-loss-handoff.md step 3) only ever
+    came from whatever --config file was passed to a whole btcbot lab/backtest run -- fixed for every
+    combination, so sweeping it needed separate runs compared by hand (the handoff doc's "Not done" note).
+    Exposed as LabParams.stop_loss_pct/take_profit_pct/stop_min_hold_sec/stop_min_tau_sec, independent of
+    sizing, so a single `--grid stop_loss_pct=...` run ranks it against everything else on the same
+    train/test split as any other parameter."""
+
+    def test_the_lab_baseline_has_exits_off_by_default(self):
+        params = LabParams.from_config(BotConfig())
+        assert params.stop_loss_pct is None and params.take_profit_pct is None
+        assert params.stop_min_hold_sec == 0 and params.stop_min_tau_sec == 0
+
+    def test_lab_baseline_inherits_exit_rules_from_config(self):
+        config = BotConfig(exit=ExitRules(
+            stop_loss_pct=Decimal("15"), take_profit_pct=Decimal("30"),
+            stop_min_hold_sec=20, stop_min_tau_sec=10,
+        ))
+
+        params = LabParams.from_config(config)
+
+        assert params.stop_loss_pct == Decimal("15")
+        assert params.take_profit_pct == Decimal("30")
+        assert params.stop_min_hold_sec == 20
+        assert params.stop_min_tau_sec == 10
+
+    def test_stop_loss_and_take_profit_are_sweepable_grid_axes(self):
+        assert parse_values("stop_loss_pct", "none, 10, 20") == [None, Decimal(10), Decimal(20)]
+        assert parse_values("take_profit_pct", "none, 15") == [None, Decimal(15)]
+        assert parse_values("stop_min_hold_sec", "0, 30") == [0, 30]
+        assert parse_values("stop_min_tau_sec", "0, 60") == [0, 60]
+        base = LabParams.from_config(BotConfig())
+        combos = expand_grid(base, {"stop_loss_pct": [None, Decimal(10), Decimal(20)]})
+        assert {c.stop_loss_pct for c in combos} == {None, Decimal(10), Decimal(20)}
+
+    def test_config_for_wires_the_swept_params_into_config_exit(self):
+        from btcbot.lab import _config_for
+        base = LabParams.from_config(BotConfig())
+        params = dataclasses.replace(base, stop_loss_pct=Decimal("15"), take_profit_pct=Decimal("30"),
+                                      stop_min_hold_sec=20, stop_min_tau_sec=10)
+
+        config = _config_for(BotConfig(), params, AccountSettings())
+
+        assert config.exit == ExitRules(stop_loss_pct=Decimal("15"), take_profit_pct=Decimal("30"),
+                                         stop_min_hold_sec=20, stop_min_tau_sec=10)
+
+    def test_sweeping_a_tight_stop_loss_closes_a_dropped_position_early(self, tmp_path):
+        from btcbot.lab import _config_for
+        conn = make_db(tmp_path)
+        seed_window_with_price_drop(conn, "KXBTC15M-LAB000-00", start_ts=T0)  # no settlement inserted
+        data = load_replay_data(conn)
+        account = AccountSettings()
+        base = LabParams.from_config(BotConfig())
+        tight_stop = dataclasses.replace(base, stop_loss_pct=Decimal("20"))
+
+        held = replay(data, _config_for(BotConfig(), base, account))
+        stopped = replay(data, _config_for(BotConfig(), tight_stop, account))
+
+        assert len(held.trades) == 1
+        assert held.trades[0].exit_reason is None and held.trades[0].pnl_usd is None  # still pending, unresolved
+        assert len(stopped.trades) == 1
+        assert stopped.trades[0].exit_reason == "stop_loss"
+        assert stopped.trades[0].pnl_usd is not None  # closed early, PnL known without the market settling
 
 
 # --------------------------------------------------------------------------- merge

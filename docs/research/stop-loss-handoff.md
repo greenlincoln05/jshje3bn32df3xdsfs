@@ -69,12 +69,22 @@ share it, and treat stop parameters as one more grid axis judged only on the lat
   ever settling (same one-line fix applied in `webui.py`). A partial exit fill (thin book) splits the
   position: the sold part becomes a closed `stop_loss`/`take_profit` trade, the rest keeps its original entry
   price and rides to settlement like before.
-- **Not done**: `lab.py`'s `LabParams`/grid system has no `stop_loss_pct`/`take_profit_pct` axis yet -- sweep
-  it today by pointing `--config` at a YAML with `exit:` set and comparing separate `btcbot lab` runs, not via
-  `--grid`. Steps 4-5 (execution.py demo backend, live_paper.py wiring, Codex pipeline hookup) are untouched;
-  `btcbot demo`'s real order path cannot exit early yet. No real recorded data was used -- all of the tests
-  below are synthetic fixtures, same caveat as every other phase before a real run.
+- **Update (2026-09-20, overnight): `lab.py`'s grid now has the axis.** `LabParams.stop_loss_pct` /
+  `take_profit_pct` / `stop_min_hold_sec` / `stop_min_tau_sec` wire straight into `config.exit`
+  (`_config_for`), independent of sizing -- `LabParams.from_config()` picks up whatever `config.exit` already
+  says (off by default, matching `config.yaml`), and all four are sweepable (`--grid stop_loss_pct=none,10,20`).
+  A single `btcbot lab` run can now rank a stop against everything else on the train/test split instead of
+  comparing separate runs by hand. New tests: `tests/test_lab.py::TestExitRulesGrid` (baseline inherits
+  `config.exit`, values parse/range-check, `expand_grid` sweeps them, `_config_for` actually carries them into
+  the replayed config, and an end-to-end replay of a seeded price-drop window closes early with a tight stop
+  but not without one) -- each assertion verified to fail against a deliberately broken build first, same
+  method as steps 1-3. Still no real sweep has been RUN against recorded data (see
+  `docs/research/overnight-handoff.md` item 3); this only makes that sweep possible in one `--grid` call.
+- **Not done**: steps 4-5 (execution.py demo backend, live_paper.py wiring, Codex pipeline hookup) are
+  untouched; `btcbot demo`'s real order path cannot exit early yet. No real recorded data was used -- all of
+  the tests below are synthetic fixtures, same caveat as every other phase before a real run.
 - Tests: `tests/test_strategy.py::TestShouldExit`/`TestExit`, `tests/test_paper_broker.py::TestExitOrders`,
   `tests/test_backtest.py::TestStopLoss` (closes early without settlement, off-by-default holds to
   settlement as before, a partial fill leaves the remainder tracked to settlement), `tests/test_config.py`'s
-  `exit:` cases. Full suite: 814 passed, offline only, no key used.
+  `exit:` cases, `tests/test_lab.py::TestExitRulesGrid` (added overnight, see above). Full suite: 828 passed,
+  offline only, no key used.

@@ -44,7 +44,7 @@ from btcbot.backtest import (
     prepare_replay,
     replay_prepared,
 )
-from btcbot.config import BotConfig, RiskLimits, Sizing, SizingMode
+from btcbot.config import BotConfig, ExitRules, RiskLimits, Sizing, SizingMode
 from btcbot.paper_broker import QueueAssumption
 
 DEFAULT_MAX_COMBOS = 400
@@ -85,6 +85,13 @@ class LabParams:
     # are the percent-of-account mode). A settled win grows the next order by max(1, ramp_growth_pct%)
     # contracts from `contracts` above; any loss drops it straight back there. None: off, flat `contracts` size.
     ramp_growth_pct: Decimal | None = None
+    # Early exit (btcbot.config.ExitRules / btcbot.strategy.should_exit, docs/research/stop-loss-handoff.md):
+    # off by default, same as config.yaml. current_bid is the best bid of the side HELD. None for either
+    # threshold means that side of should_exit never fires; both can be set together.
+    stop_loss_pct: Decimal | None = None    # exit if the mark falls this % below entry
+    take_profit_pct: Decimal | None = None  # exit if the mark rises this % above entry
+    stop_min_hold_sec: int = 0              # do not exit before holding a position at least this long
+    stop_min_tau_sec: int = 0               # do not exit within this many seconds of close; hold to settlement
 
     @classmethod
     def from_config(cls, config: BotConfig) -> LabParams:
@@ -97,6 +104,10 @@ class LabParams:
             # percent/kelly sizing stay opt-in only via an explicit --grid, as before (they are not the
             # default and layer on a bankroll concept EntryFilters/LabParams treat as its own axis).
             ramp_growth_pct=config.sizing.ramp_growth_pct if config.sizing.mode is SizingMode.RAMP else None,
+            # Exit rules are independent of sizing mode, so the baseline always reflects config.exit exactly
+            # (off by default, same as a plain btcbot backtest/paper run would use).
+            stop_loss_pct=config.exit.stop_loss_pct, take_profit_pct=config.exit.take_profit_pct,
+            stop_min_hold_sec=config.exit.stop_min_hold_sec, stop_min_tau_sec=config.exit.stop_min_tau_sec,
         )
 
     def describe(self, base: LabParams) -> str:
@@ -123,11 +134,17 @@ class AccountSettings:
 
 _DECIMAL_KEYS = {
     "min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_stake_pct",
-    "min_p_side", "max_growth_pct", "book_move_min", "ramp_growth_pct",
+    "min_p_side", "max_growth_pct", "book_move_min", "ramp_growth_pct", "stop_loss_pct", "take_profit_pct",
 }
-_INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "book_move_lookback_sec", "contracts", "persist_steps"}
+_INT_KEYS = {
+    "min_tau_sec", "max_tau_sec", "trend_lookback_sec", "book_move_lookback_sec", "contracts", "persist_steps",
+    "stop_min_hold_sec", "stop_min_tau_sec",
+}
 _FLOAT_KEYS = {"model_blend"}
-_OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct", "min_p_side", "max_growth_pct", "ramp_growth_pct"}
+_OPTIONAL_KEYS = {
+    "min_price", "max_price", "risk_pct", "min_p_side", "max_growth_pct", "ramp_growth_pct",
+    "stop_loss_pct", "take_profit_pct",
+}
 TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode", "book_move_mode"}))
 _TREND_MODES = ("off", "with", "against", "aligned4")
 _BOOK_MOVE_MODES = ("off", "with", "against")
@@ -143,6 +160,10 @@ def _check(key: str, value: Any) -> Any:
         "min_p_side": lambda v: v is None or 0 < v < 1,
         "max_growth_pct": lambda v: v is None or 0 <= v <= 500,
         "ramp_growth_pct": lambda v: v is None or 0 <= v <= 500,
+        "stop_loss_pct": lambda v: v is None or 0 < v <= 100,
+        "take_profit_pct": lambda v: v is None or v > 0,
+        "stop_min_hold_sec": lambda v: 0 <= v <= 900,
+        "stop_min_tau_sec": lambda v: 0 <= v <= 900,
         "persist_steps": lambda v: 1 <= v <= 300,
         "trend_min_move_usd": lambda v: v >= 0,
         "book_move_min": lambda v: 0 <= v < 1,
@@ -316,6 +337,10 @@ def _config_for(base: BotConfig, params: LabParams, account: AccountSettings) ->
         min_edge=params.min_edge, max_spread=params.max_spread, min_depth=params.min_depth,
         min_tau_sec=params.min_tau_sec, max_tau_sec=params.max_tau_sec, model_blend=params.model_blend,
         sizing=Sizing(contracts_per_trade=params.contracts).model_dump(), risk=risk.model_dump(),
+        exit=ExitRules(
+            stop_loss_pct=params.stop_loss_pct, take_profit_pct=params.take_profit_pct,
+            stop_min_hold_sec=params.stop_min_hold_sec, stop_min_tau_sec=params.stop_min_tau_sec,
+        ).model_dump(),
     )
     return BotConfig(**data)
 
