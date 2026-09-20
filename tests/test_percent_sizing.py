@@ -67,7 +67,7 @@ class TestAccountRelativeRiskLimits:
         return RiskManager(self.limits(**kw), kill_file=NO_KILL_FILE, clock=lambda: T0)
 
     def test_the_dollar_limit_applies_when_no_percent_is_configured(self):
-        r = self.manager()
+        r = self.manager(max_open_exposure_pct=None)
         r.set_account_value(D("10000"))  # ignored: no percent configured
         assert r.check_new_order(size=D(100), price=D("0.5"), now=T0).approved is False  # $50 > $25
 
@@ -99,7 +99,7 @@ class TestAccountRelativeRiskLimits:
 class TestConfig:
     def test_percent_mode_and_its_defaults_are_valid(self):
         cfg = BotConfig(sizing=Sizing(mode="percent"))
-        assert cfg.sizing.mode is SizingMode.PERCENT and cfg.sizing.risk_pct_per_trade == 2
+        assert cfg.sizing.mode is SizingMode.PERCENT and cfg.sizing.risk_pct_per_trade == Decimal("0.5")
         assert cfg.sizing.account_usd == 500 and cfg.sizing.max_growth_per_win_pct == 20
 
     @pytest.mark.parametrize("kw", [{"risk_pct_per_trade": 0}, {"risk_pct_per_trade": 11}, {"account_usd": 0},
@@ -108,8 +108,9 @@ class TestConfig:
         with pytest.raises(ValidationError):
             Sizing(mode="percent", **kw)
 
-    def test_the_default_mode_is_ramp(self):
-        assert BotConfig().sizing.mode is SizingMode.RAMP
+    def test_the_default_mode_is_percent(self):
+        assert BotConfig().sizing.mode is SizingMode.PERCENT
+        assert BotConfig().risk.max_open_exposure_pct == 5 and BotConfig().risk.daily_loss_limit_pct == 4
 
 
 def percent_config():

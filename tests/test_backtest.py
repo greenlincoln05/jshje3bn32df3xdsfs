@@ -18,7 +18,7 @@ from btcbot.backtest import (
     replay_prepared,
     run_backtest,
 )
-from btcbot.config import BotConfig, ExitRules
+from btcbot.config import BotConfig, ExitRules, Sizing
 from btcbot.ml_model import LogisticModel
 from btcbot.models import ParseError
 from btcbot.paper_broker import QueueAssumption, taker_fee
@@ -363,9 +363,10 @@ class TestStopLoss:
 
 
 class TestRampSizingInBacktest:
-    """sizing.mode "ramp" is the shipped default, but replay_prepared's core loop only sizes flat contracts
-    unless EntryFilters.ramp_growth_pct is explicitly set -- so btcbot backtest/lab did not reflect live
-    sizing until this filter was added (see docs/research/overnight-handoff.md). FULL_FILL_SIZES (unlike
+    """sizing.mode "ramp" is still fully supported (no longer the shipped default -- see
+    test_percent_sizing.py), but replay_prepared's core loop only sizes flat contracts unless
+    EntryFilters.ramp_growth_pct is explicitly set -- so btcbot backtest/lab never reflected ramp sizing on
+    its own, even while it WAS the default (see docs/research/overnight-handoff.md). FULL_FILL_SIZES (unlike
     seed_fillable_window's own default, deliberately-partial sequence) fills whatever size is actually
     ordered, up to 9 contracts, so TradeRecord.size below reflects the ramped ORDER size exactly."""
 
@@ -378,7 +379,7 @@ class TestRampSizingInBacktest:
             # settlement's ramp effect is in place before the next window's own entry decision.
             insert_settlement(conn, f"T{i}", result, strike=Decimal("80000"),
                                close_time=start + timedelta(seconds=500), available_ts=start + timedelta(seconds=12))
-        config = BotConfig()  # default sizing: ramp, contracts_per_trade=5, ramp_growth_pct=20
+        config = BotConfig(sizing=Sizing(mode="ramp"))  # contracts_per_trade=5, ramp_growth_pct=20
 
         result = replay(conn, config, filters=EntryFilters(ramp_growth_pct=config.sizing.ramp_growth_pct))
 

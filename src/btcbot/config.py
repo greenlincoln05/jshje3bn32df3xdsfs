@@ -46,7 +46,14 @@ class _Strict(BaseModel):
 
 class Sizing(_Strict):
     contracts_per_trade: int = Field(5, gt=0)
-    mode: SizingMode = SizingMode.RAMP
+    # Percent-of-account is the shipped default (see risk_pct_per_trade below): it grows bets only from real
+    # settled profit and never grows them after a loss, unlike "ramp" (still fully supported, opt-in), whose
+    # settled-win-streak-then-reset-to-base shape means the trade that finally loses a streak is, by
+    # construction, sized at the streak's peak -- bigger than every win that built the streak. Percent still
+    # grows during a streak too (any scheme that grows on wins shares that geometry), but a loss only holds
+    # the next order's size rather than snapping it back to base, and the following order tracks the
+    # now-smaller account immediately instead of a fixed contract count.
+    mode: SizingMode = SizingMode.PERCENT
     # Fraction of full Kelly to actually stake when mode is "kelly" -- see kelly_fraction()'s docstring for
     # why staking full Kelly against an uncalibrated model is dangerous, especially near a price of 0 or 1.
     kelly_fraction_multiplier: float = Field(0.2, gt=0.0, le=1.0)
@@ -62,7 +69,12 @@ class Sizing(_Strict):
     ramp_max_price_floor: Decimal = Field(Decimal("0.60"), gt=0, le=1)
     ramp_idle_reset_windows: int = Field(2, ge=0)
     account_usd: Decimal = Field(Decimal("500"), gt=0)
-    risk_pct_per_trade: Decimal = Field(Decimal("2"), gt=0, le=10)
+    # 0.5% of a $500 account is a $2.50 stake -- about 5 contracts at a 0.50 price (the middle of the
+    # min_price/max_price band), the same as the old flat contracts_per_trade base, so switching to percent
+    # sizing does not itself jump the very first order's risk. It then tracks account_usd up or down from
+    # there. A flat 2% pinned this at risk.max_contracts_per_trade (10) for nearly every price in the band --
+    # never actually varying with the account -- so 2% was never a workable default at this account size.
+    risk_pct_per_trade: Decimal = Field(Decimal("0.5"), gt=0, le=10)
     max_growth_per_win_pct: Decimal = Field(Decimal("20"), ge=0, le=100)
 
 
@@ -75,9 +87,12 @@ class RiskLimits(_Strict):
     # Optional account-relative versions of the two dollar limits above. When set (and the trader knows the
     # account value, as in sizing mode "percent") the limit is that percent of the CURRENT account, so the caps
     # rise and fall with it; the dollar value is then only the fallback. Without this a fixed dollar cap would stop
-    # bets from ever growing with the account.
-    max_open_exposure_pct: Decimal | None = Field(None, gt=0, le=100)
-    daily_loss_limit_pct: Decimal | None = Field(None, gt=0, le=100)
+    # bets from ever growing with the account. Defaulted on (5% / 4%) to pair with sizing.mode "percent": the
+    # same proportions the old flat $25/$20 caps were of the $500 starting account_usd, so this is not a change
+    # in risk tolerance at today's account size, only in what the caps do as that size changes. Both are inert
+    # for every other sizing mode, since only "percent" ever calls RiskManager.set_account_value.
+    max_open_exposure_pct: Decimal | None = Field(Decimal("5"), gt=0, le=100)
+    daily_loss_limit_pct: Decimal | None = Field(Decimal("4"), gt=0, le=100)
 
 
 class ExitRules(_Strict):

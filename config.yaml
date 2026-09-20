@@ -15,15 +15,20 @@ min_price: 0.15               # refuse to enter outside [min_price, max_price]; 
 max_price: 0.85                # a reasoned starting guardrail, not backtested -- tune with `btcbot lab`
 sizing:
   contracts_per_trade: 5
-  mode: ramp                   # fixed | ramp | percent | kelly (fractional Kelly on risk.max_open_exposure_usd)
+  mode: percent                # fixed | ramp | percent | kelly (fractional Kelly on risk.max_open_exposure_usd)
   kelly_fraction_multiplier: 0.2
-  # mode: percent  -> stake risk_pct_per_trade % of the CURRENT account per order. The account starts at
-  # account_usd and moves only with SETTLED profit and loss; after a win the next order may grow by at most
-  # max_growth_per_win_pct %, after a loss it can never grow. Pair it with the two account-relative risk limits
-  # below so the caps rise and fall with the account. (Defaults shown; percent mode is off unless you set it.)
+  # mode: percent (the shipped default) -> stake risk_pct_per_trade % of the CURRENT account per order. The
+  # account starts at account_usd and moves only with SETTLED profit and loss; after a win the next order may
+  # grow by at most max_growth_per_win_pct %, after a loss it can never grow. Paired below with the two
+  # account-relative risk limits so the caps rise and fall with the account too. 0.5% of $500 is a $2.50
+  # stake, about the same first-order risk as the old flat contracts_per_trade=5 base at a 0.50 price -- tune
+  # both once there is real out-of-sample paper/demo data to tune them against (btcbot lab).
+  # mode: ramp -> still fully supported (below), but no longer the default: a win-streak-then-reset-to-base
+  # scheme means the trade that finally loses a streak is, by construction, sized at the streak's peak --
+  # bigger than any win that built it.
   ramp_growth_pct: 20          # mode ramp: +max(1, 20%) contracts after each settled win, back to base after a loss
   account_usd: 500
-  risk_pct_per_trade: 2
+  risk_pct_per_trade: 0.5
   max_growth_per_win_pct: 20
 risk:
   max_contracts_per_trade: 10
@@ -31,6 +36,8 @@ risk:
   daily_loss_limit_usd: 20
   max_consecutive_losses: 5
   max_trades_per_hour: 12
+  max_open_exposure_pct: 5     # pairs with sizing.mode: percent -- same proportion the $25 cap is of $500
+  daily_loss_limit_pct: 4      # pairs with sizing.mode: percent -- same proportion the $20 cap is of $500
 # Optional early exit (default: hold to settlement, as always). Off unless stop_loss_pct or take_profit_pct
 # is set. Wired into `btcbot backtest`/`btcbot lab` only so far -- not yet into `btcbot paper`/`btcbot demo`;
 # see docs/research/stop-loss-handoff.md.

@@ -228,9 +228,11 @@ class TestFilters:
 
 
 class TestRampSizing:
-    """sizing.mode "ramp" is the shipped live default, but the lab's replay only ever sized flat contracts
-    unless a caller passed EntryFilters.ramp_growth_pct explicitly -- so btcbot lab did not reflect live
-    sizing (docs/research/overnight-handoff.md). FULL_FILL_SIZES (unlike seed_window's own default, a
+    """sizing.mode "ramp" is still fully supported but no longer the shipped live default (percent-of-account
+    is -- see TestPercentDefaultInLab below), and the lab's replay only ever sized flat contracts unless a
+    caller passed EntryFilters.ramp_growth_pct explicitly -- so btcbot lab did not reflect ramp sizing on its
+    own (docs/research/overnight-handoff.md) even while it WAS the default; it still needs it passed
+    explicitly now that trying it is opt-in. FULL_FILL_SIZES (unlike seed_window's own default, a
     deliberately partial fill) fills whatever is actually ordered, so trade sizes below are the true ramped
     order sizes, not a fixed partial-fill amount."""
 
@@ -238,26 +240,45 @@ class TestRampSizing:
         conn = make_db(tmp_path)
         for i, result in enumerate(["yes", "no", "yes", "yes"]):
             seed_window(conn, i, result, sizes=FULL_FILL_SIZES)
-        config = BotConfig()  # default sizing: ramp, contracts_per_trade=5, ramp_growth_pct=20
+        config = BotConfig(sizing=Sizing(mode="ramp"))  # contracts_per_trade=5, ramp_growth_pct=20
 
         result = replay(load_replay_data(conn), config, filters=EntryFilters(ramp_growth_pct=config.sizing.ramp_growth_pct))
 
         sizes = [t.size for t in sorted(result.trades, key=lambda t: t.entry_ts)]
         assert sizes == [Decimal(5), Decimal(6), Decimal(5), Decimal(6)]
 
-    def test_the_lab_baseline_reflects_the_shipped_ramp_default(self):
+    def test_the_lab_baseline_does_not_auto_apply_ramp_now_that_it_is_not_the_default(self):
         params = LabParams.from_config(BotConfig())
-        assert params.ramp_growth_pct == Decimal(20)
+        assert params.ramp_growth_pct is None
 
-    def test_from_config_does_not_apply_ramp_for_other_sizing_modes(self):
+    def test_from_config_applies_ramp_only_when_it_is_the_configured_mode(self):
+        params = LabParams.from_config(BotConfig(sizing=Sizing(mode="ramp")))
+        assert params.ramp_growth_pct == Decimal(20)
         params = LabParams.from_config(BotConfig(sizing=Sizing(mode="fixed")))
         assert params.ramp_growth_pct is None
 
     def test_ramp_growth_pct_is_a_sweepable_grid_axis(self):
         assert parse_values("ramp_growth_pct", "0, 20, none") == [Decimal(0), Decimal(20), None]
-        base = LabParams.from_config(BotConfig())
+        base = LabParams.from_config(BotConfig(sizing=Sizing(mode="ramp")))
         combos = expand_grid(base, {"ramp_growth_pct": [Decimal(0), Decimal(20), None]})
         assert {c.ramp_growth_pct for c in combos} == {Decimal(0), Decimal(20), None}
+
+
+class TestPercentDefaultInLab:
+    """Percent-of-account is now the shipped live default (test_percent_sizing.py), so -- the same reasoning
+    TestRampSizing above documents for ramp when IT was the default -- the lab's baseline should reflect it
+    automatically too, without asking for it explicitly via --grid."""
+
+    def test_the_lab_baseline_reflects_the_shipped_percent_default(self):
+        params = LabParams.from_config(BotConfig())
+        assert params.risk_pct == Decimal("0.5")
+        assert params.max_growth_pct == Decimal(20)
+
+    def test_from_config_does_not_apply_percent_for_other_sizing_modes(self):
+        params = LabParams.from_config(BotConfig(sizing=Sizing(mode="fixed")))
+        assert params.risk_pct is None and params.max_growth_pct is None
+        params = LabParams.from_config(BotConfig(sizing=Sizing(mode="ramp")))
+        assert params.risk_pct is None and params.max_growth_pct is None
 
 
 class TestExitRulesGrid:

@@ -27,11 +27,13 @@ class TestBotConfig:
         assert (cfg.min_tau_sec, cfg.max_tau_sec, cfg.cancel_before_close_sec) == (30, 780, 20)
         assert (cfg.min_price, cfg.max_price) == (Decimal("0.15"), Decimal("0.85"))
         assert cfg.sizing.contracts_per_trade == 5
-        assert cfg.sizing.mode is SizingMode.RAMP
+        assert cfg.sizing.mode is SizingMode.PERCENT
         assert cfg.sizing.kelly_fraction_multiplier == 0.2
         assert cfg.risk.max_contracts_per_trade == 10
         assert cfg.risk.max_open_exposure_usd == Decimal(25)
         assert cfg.risk.daily_loss_limit_usd == Decimal(20)
+        assert cfg.risk.max_open_exposure_pct == Decimal(5)
+        assert cfg.risk.daily_loss_limit_pct == Decimal(4)
         assert cfg.risk.max_consecutive_losses == 5
         assert cfg.risk.max_trades_per_hour == 12
         assert cfg.exit.stop_loss_pct is None and cfg.exit.take_profit_pct is None

@@ -51,21 +51,40 @@ truth for scope and phases; the README has the phase status and a dated table of
   prints it alongside the existing per-order dump, and `btcbot demo-report --db <demo db>` re-renders the whole
   report offline from an already-recorded database (read-only, no key) -- no need to re-run `btcbot demo` just
   to review last night's numbers.
-- Sizing modes (`sizing.mode`): `fixed` (default), `kelly`, and `percent`. `percent` stakes a small percent of the
-  CURRENT account per order; the account is the starting `account_usd` plus SETTLED profit and loss only, so bets
-  grow after wins and shrink after losses (fixed-fractional, the opposite of a martingale). After a settled win the
-  next order may grow by at most `max_growth_per_win_pct`; after a loss it can never exceed the order that lost
-  (`strategy.percent_size` builds that in, `risk.RiskManager` still vetoes it as a backstop, and the "no size
-  increase after a loss" rule is unchanged). `risk.max_open_exposure_pct` / `risk.daily_loss_limit_pct` make the
-  two dollar caps follow the account, otherwise a fixed cap stops bets from growing. `risk_pct_per_trade` is capped
-  at 10 in the config on purpose. Percent sizing does not create an edge; do not enable it for real money on the
-  strength of a paper or demo result, and never raise a size to recover a loss.
-- Ramp sizing (`sizing.mode: ramp`, the shipped default): `contracts_per_trade` (5), +max(1, `ramp_growth_pct`%) after
-  each SETTLED win, back to base after any loss or breakeven, capped by `risk.max_contracts_per_trade`. Ramp risk
+- Sizing modes (`sizing.mode`): `fixed`, `kelly`, `percent` (the shipped default as of 2026-09-20, changed from
+  `ramp` at the owner's request -- see the Ramp sizing bullet below for why), and `ramp`. `percent` stakes a
+  small percent of the CURRENT account per order; the account is the starting `account_usd` plus SETTLED
+  profit and loss only, so bets grow after wins and shrink after losses (fixed-fractional, the opposite of a
+  martingale). After a settled win the next order may grow by at most `max_growth_per_win_pct`; after a loss
+  it can never exceed the order that lost (`strategy.percent_size` builds that in, `risk.RiskManager` still
+  vetoes it as a backstop, and the "no size increase after a loss" rule is unchanged). `risk.max_open_exposure_pct`
+  / `risk.daily_loss_limit_pct` make the two dollar caps follow the account (defaulted on now, at 5%/4%, the
+  same proportion the old flat $25/$20 caps were of the $500 `account_usd` default -- inert for every other
+  sizing mode, since only `percent` ever calls `RiskManager.set_account_value`), otherwise a fixed cap stops
+  bets from growing. `risk_pct_per_trade` defaults to 0.5 (not 2 -- see below) and is capped at 10 in the
+  config on purpose. `lab.LabParams.from_config()` auto-applies `risk_pct`/`max_growth_pct` from config
+  whenever `sizing.mode` is `percent`, so a plain `btcbot lab` run reflects live sizing without asking for it
+  explicitly -- the same treatment `ramp_growth_pct` gets for `ramp` below, now on whichever mode is actually
+  the default. Percent sizing does not create an edge; do not enable it for real money on the strength of a
+  paper or demo result, and never raise a size to recover a loss. Growing size after a win is still not fully
+  free of the problem below: a trade that ends an unbroken winning streak is, by construction, sized at that
+  streak's peak, so it can still be bigger than the wins that built it -- `percent`'s real improvement over
+  `ramp` is that a loss only holds the next order's size (never snaps it back to a fixed base) and the
+  following order tracks the now-smaller account immediately.
+- Ramp sizing (`sizing.mode: ramp`, the default until 2026-09-20, still fully supported but opt-in now): the
+  owner reported it was making the single biggest loser larger than the single biggest winner, which is a
+  real, structural property of "grow after each settled win, snap back to a fixed base after any loss" sizing
+  -- the trade that finally loses a streak is placed at the streak's peak, always at least as large as every
+  win that built it, then the very next order (after JUST that one loss) falls all the way back to base
+  regardless of how far the account actually moved. `percent` (above) is now the default instead; `ramp`
+  itself is unchanged and still exactly: `contracts_per_trade` (5), +max(1, `ramp_growth_pct`%) after each
+  SETTLED win, back to base after any loss or breakeven, capped by `risk.max_contracts_per_trade`. Ramp risk
   rules (`live_paper.py`): each win-level lowers the highest entry price by `ramp_max_price_step` (floor
   `ramp_max_price_floor`), and `ramp_idle_reset_windows` (2) consecutive windows without opening a position reset
   the ramp to base. `strategy.ramp_stop_loss_pct` tightens the stop per level; that stop is wired into the
-  lab/backtest only until paper/demo exits land.
+  lab/backtest only until paper/demo exits land. `lab.LabParams.from_config()` only auto-applies
+  `ramp_growth_pct` when `sizing.mode` is actually `ramp`; request it explicitly (`--grid ramp_growth_pct=...`
+  or `BotConfig(sizing=Sizing(mode="ramp"))`) to evaluate it now that it is not the default.
 - `btcbot demo --plumbing`: thin-demo-book TEST mode (max_spread 1.0, min_depth 1, `bid_improve_ticks: 5`, i.e. bid up to 5
   cents inside the spread, never onto the ask). The demo book's median spread is ~14 cents and depth ~100 contracts, so the
   normal filters reject most of it. Plumbing mode exercises placement, fills, settlement and sizing; it says nothing about the
@@ -97,10 +116,10 @@ truth for scope and phases; the README has the phase status and a dated table of
   model has no calibration check at the extremes yet (`btcbot calibrate`) -- tune it with `btcbot lab`.
   `sizing.mode: kelly` sizes by that fraction (times `kelly_fraction_multiplier`, default 0.2 -- full Kelly
   is most aggressive exactly where the model is least trustworthy, near a price of 0 or 1) against
-  `risk.max_open_exposure_usd`, instead of a flat `contracts_per_trade`; default is `fixed` (unchanged
-  behavior). Wired into `live_paper.py` only, so `btcbot paper` and `btcbot demo` (same decision loop) both
-  get it; `btcbot backtest`/`btcbot lab` are untouched and keep their own separate `EntryFilters`/`risk_pct`
-  mechanism.
+  `risk.max_open_exposure_usd`, instead of a flat `contracts_per_trade`; `kelly` is opt-in, not the sizing
+  default (see the Sizing modes bullet above for what is). Wired into `live_paper.py` only, so `btcbot paper`
+  and `btcbot demo` (same decision loop) both get it; `btcbot backtest`/`btcbot lab` are untouched and keep
+  their own separate `EntryFilters`/`risk_pct` mechanism.
 - ML entry/exit layers (`ml_model.py`, `ml_features.py`, `ml_pipeline.py`, `market_level_pipeline.py`,
   `history_pipeline.py`, `coinbase_history.py`, `docs/research/ml-layers-handoff.md`), owner-driven, not a
   numbered phase: a hand-rolled, dependency-free `LogisticModel` (no numpy/scikit-learn) re-scores entries

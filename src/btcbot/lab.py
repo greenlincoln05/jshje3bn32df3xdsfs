@@ -109,9 +109,12 @@ class LabParams:
             min_tau_sec=config.min_tau_sec, max_tau_sec=config.max_tau_sec,
             min_price=config.min_price, max_price=config.max_price, model_blend=config.model_blend,
             contracts=config.sizing.contracts_per_trade,
-            # Ramp is the shipped default live sizing mode, so the lab's baseline reflects it automatically;
-            # percent/kelly sizing stay opt-in only via an explicit --grid, as before (they are not the
-            # default and layer on a bankroll concept EntryFilters/LabParams treat as its own axis).
+            # Percent-of-account is the shipped default live sizing mode, so the lab's baseline reflects it
+            # automatically, the same way ramp did when IT was the default; kelly sizing stays opt-in only via
+            # an explicit --grid (it has no EntryFilters/LabParams equivalent at all). Ramp itself is still
+            # fully supported, just no longer auto-applied -- see TestRampSizing.
+            risk_pct=config.sizing.risk_pct_per_trade if config.sizing.mode is SizingMode.PERCENT else None,
+            max_growth_pct=config.sizing.max_growth_per_win_pct if config.sizing.mode is SizingMode.PERCENT else None,
             ramp_growth_pct=config.sizing.ramp_growth_pct if config.sizing.mode is SizingMode.RAMP else None,
             # Exit rules are independent of sizing mode, so the baseline always reflects config.exit exactly
             # (off by default, same as a plain btcbot backtest/paper run would use).
