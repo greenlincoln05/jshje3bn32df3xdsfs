@@ -26,8 +26,16 @@ def test_price_band_boost_doubles_only_inside_band_and_never_after_loss():
     from test_percent_sizing import run_windows
     cfg = BotConfig(sizing=Sizing(mode="fixed", boost_multiplier=D(2), boost_min_price=D("0.01"), boost_max_price=D("0.99")))
     trader, buffer = make_trader(sqlite3.connect(":memory:"), config=cfg)
-    rows = asyncio.run(run_windows(trader, buffer, ["yes"] * 2))
-    assert rows[0][1] == 10  # 5 doubled, at the cap
+    placed = []
+    original = trader._place_resting
+
+    async def spy(decision, poll_ts):
+        placed.append(decision.size)
+        return await original(decision, poll_ts)
+
+    trader._place_resting = spy
+    asyncio.run(run_windows(trader, buffer, ["yes"] * 2))
+    assert placed and placed[0] == 10  # 5 doubled, at the cap
 
 
 def test_boost_band_must_be_ordered():
