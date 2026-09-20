@@ -288,6 +288,34 @@ class TestSettlement:
         assert summary.unresolved_settlements == (active.ticker,)
 
 
+class TestDeterminedSettlement:
+    def _client(self):
+        active = make_market("KXBTC15M-26SEP190015-15", status="active")
+        determined = make_market("KXBTC15M-26SEP190015-15", status="determined",
+                                 raw_extra={"result": "no", "expiration_value": "80100"})
+        return active, FakeKalshiSource(markets=[[active], []], orderbooks=[make_orderbook(active.ticker)],
+                                        market_detail={active.ticker: [determined]})
+
+    async def test_default_waits_for_finalized_like_prod(self, tmp_path):
+        _, client = self._client()
+        recorder, _ = make_recorder(tmp_path, client)
+        try:
+            summary = await recorder.run(duration_sec=3.0)
+        finally:
+            recorder.close()
+        assert summary.settlements == 0
+
+    async def test_demo_opt_in_settles_on_a_determined_result(self, tmp_path):
+        active, client = self._client()
+        recorder, _ = make_recorder(tmp_path, client, settle_on_determined=True)
+        try:
+            summary = await recorder.run(duration_sec=3.0)
+        finally:
+            recorder.close()
+        assert summary.settlements == 1
+        assert rows(tmp_path / "recorder.sqlite", "settlements")[0]["result"] == "no"
+
+
 class TestFailureHandling:
     async def test_transient_kalshi_errors_are_counted_and_do_not_stop_the_run(self, tmp_path):
         market = make_market("KXBTC15M-26SEP190015-15")

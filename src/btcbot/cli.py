@@ -945,7 +945,7 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
         )
         recorder = Recorder(
             client, series_ticker=series_ticker, db_path=db_path, kill_file=args.kill_file,
-            poll_interval_sec=args.poll_interval,
+            poll_interval_sec=args.poll_interval, settle_on_determined=True,
         )
         trader_conn = sqlite3.connect(str(db_path))
         spot_buffer = SpotBuffer()
