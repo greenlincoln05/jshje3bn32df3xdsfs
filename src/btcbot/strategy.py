@@ -90,6 +90,22 @@ def ramp_next_size(settled_size: Decimal, won: bool, *, base: Decimal, growth_pc
     return min(max(settled_size, base) + step, max_contracts)
 
 
+def ramp_max_price(base_max: Decimal | None, level: int, *, step: Decimal, floor: Decimal) -> Decimal | None:
+    """Highest entry price at ramp ``level``: ``base_max - step * level``, never below ``floor`` (and never above
+    ``base_max``). Level 0 is the unchanged base cap. None means no cap configured, and stays None."""
+    if base_max is None or level <= 0:
+        return base_max
+    return min(base_max, max(floor, base_max - step * level))
+
+
+def ramp_stop_loss_pct(base_pct: Decimal | None, level: int, *, tighten_per_level: Decimal, floor_pct: Decimal) -> Decimal | None:
+    """Stop-loss percent at ramp ``level``: the bigger the ramped order, the tighter the stop
+    (``base - tighten * level``, never below ``floor_pct``). None (no stop configured) stays None."""
+    if base_pct is None or level <= 0:
+        return base_pct
+    return min(base_pct, max(floor_pct, base_pct - tighten_per_level * level))
+
+
 def percent_size(
     price: Decimal,
     *,
