@@ -76,6 +76,15 @@ def kelly_size(
     return max(Decimal(1), min(contracts, max_contracts))
 
 
+def ramp_next_size(settled_size: Decimal, won: bool, *, base: Decimal, growth_pct: Decimal, max_contracts: Decimal) -> Decimal:
+    """Size of the next order after a trade settles: a win grows it by ``max(1, growth_pct%)`` contracts, a loss
+    drops it straight back to ``base``. Never above ``max_contracts``. Growth comes only from settled wins."""
+    if not won:
+        return min(base, max_contracts)
+    step = max(Decimal(1), (settled_size * growth_pct / 100).to_integral_value(rounding=ROUND_FLOOR))
+    return min(max(settled_size, base) + step, max_contracts)
+
+
 def percent_size(
     price: Decimal,
     *,

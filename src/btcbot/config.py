@@ -35,6 +35,7 @@ class KalshiEnv(StrEnum):
 class SizingMode(StrEnum):
     FIXED = "fixed"  # always contracts_per_trade
     KELLY = "kelly"  # fractional Kelly on max_open_exposure_usd; see btcbot.strategy.kelly_size
+    RAMP = "ramp"  # contracts_per_trade, +max(1, ramp_growth_pct%) after each settled win, back to base after a loss
     PERCENT = "percent"  # a percent of the current account per order, growing with settled wins; see percent_size
 
 
@@ -45,13 +46,14 @@ class _Strict(BaseModel):
 
 class Sizing(_Strict):
     contracts_per_trade: int = Field(5, gt=0)
-    mode: SizingMode = SizingMode.FIXED
+    mode: SizingMode = SizingMode.RAMP
     # Fraction of full Kelly to actually stake when mode is "kelly" -- see kelly_fraction()'s docstring for
     # why staking full Kelly against an uncalibrated model is dangerous, especially near a price of 0 or 1.
     kelly_fraction_multiplier: float = Field(0.2, gt=0.0, le=1.0)
     # mode "percent": stake risk_pct_per_trade percent of the CURRENT account per order. The account starts at
     # account_usd and moves only with SETTLED profit and loss. After a win the next order may grow by at most
     # max_growth_per_win_pct percent; after a loss it can never grow (btcbot.strategy.percent_size).
+    ramp_growth_pct: Decimal = Field(Decimal("20"), ge=0, le=100)  # mode "ramp": growth per settled win (min +1)
     account_usd: Decimal = Field(Decimal("500"), gt=0)
     risk_pct_per_trade: Decimal = Field(Decimal("2"), gt=0, le=10)
     max_growth_per_win_pct: Decimal = Field(Decimal("20"), ge=0, le=100)

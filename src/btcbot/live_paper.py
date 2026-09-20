@@ -38,7 +38,7 @@ from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictio
 from btcbot.models import Market, OrderBook
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, Decision, decide, kelly_size, percent_size
+from btcbot.strategy import Action, Decision, decide, kelly_size, percent_size, ramp_next_size
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -82,6 +82,7 @@ class LivePaperTrader:
         # sizing mode "percent": the account grows and shrinks only with SETTLED results (see strategy.percent_size)
         self._bankroll: Decimal = config.sizing.account_usd
         self._last_order_size: Decimal | None = None
+        self._ramp_size: Decimal | None = None  # sizing mode "ramp": next order size, moved only by settlements
         self._last_result: str | None = None  # "win" or "loss" of the most recent settled trade
         if config.sizing.mode is SizingMode.PERCENT:
             self._risk.set_account_value(self._bankroll)
@@ -166,6 +167,9 @@ class LivePaperTrader:
                 max_contracts=Decimal(self._config.risk.max_contracts_per_trade),
             )
             decision = replace(decision, size=size)
+        elif decision.action is Action.REST and self._config.sizing.mode is SizingMode.RAMP:
+            size = self._ramp_size or Decimal(self._config.sizing.contracts_per_trade)
+            decision = replace(decision, size=min(size, Decimal(self._config.risk.max_contracts_per_trade)))
         elif decision.action is Action.REST and self._config.sizing.mode is SizingMode.PERCENT:
             size = percent_size(
                 decision.price, cash_usd=self._bankroll - self._risk.open_exposure_usd,
@@ -292,6 +296,11 @@ class LivePaperTrader:
         log_trade(self._conn, resolved)
         self._bankroll += pnl
         self._last_result = "loss" if pnl < 0 else "win"
+        if self._config.sizing.mode is SizingMode.RAMP:
+            self._ramp_size = ramp_next_size(
+                pending.size, pnl >= 0, base=Decimal(self._config.sizing.contracts_per_trade),
+                growth_pct=self._config.sizing.ramp_growth_pct,
+                max_contracts=Decimal(self._config.risk.max_contracts_per_trade))
         if self._config.sizing.mode is SizingMode.PERCENT:
             self._risk.set_account_value(self._bankroll)
         self._risk.record_trade_closed(
