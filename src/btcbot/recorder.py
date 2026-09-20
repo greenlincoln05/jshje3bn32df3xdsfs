@@ -192,10 +192,15 @@ class Recorder:
         disk_free_bytes: Callable[[str], int] = lambda path: shutil.disk_usage(path).free,
         on_orderbook: Callable[[Market, OrderBook, datetime], Awaitable[None]] | None = None,
         on_settlement: Callable[[Market], Awaitable[None]] | None = None,
+        settle_on_determined: bool = False,
     ) -> None:
         if poll_interval_sec <= 0:
             raise ValueError("poll_interval_sec must be positive")
         self._client = client
+        # Kalshi's DEMO exchange leaves BTC markets in status "determined" (result and expiration_value already
+        # set) and never moves them to "finalized" (observed 2026-09-20: nothing after 12:15 ET finalized). Prod
+        # finalizes within seconds. Only `btcbot demo` opts in; everywhere else waits for "finalized".
+        self._settle_on_determined = settle_on_determined
         self._series_ticker = series_ticker
         self._db_path = Path(db_path)
         self._kill_file = Path(kill_file)
@@ -337,7 +342,11 @@ class Recorder:
                 stats.errors += 1
                 self._log("warning", "poll_error", f"settlement check {ticker}: {exc}")
                 continue
-            if market.status == "finalized":
+            determined = (
+                self._settle_on_determined and market.status == "determined"
+                and market.raw.get("result") in ("yes", "no")
+            )
+            if market.status == "finalized" or determined:
                 self._record_settlement(market, poll_ts=self._clock(), resolved=True)
                 stats.settlements += 1
                 pending.discard(ticker)
