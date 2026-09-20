@@ -8,7 +8,7 @@ every position to settlement. No exit logic exists (`strategy.py` mentions take-
   `risk.max_contracts_per_trade` (10). Not modeled in `lab`/`backtest` yet (they use `percent`/`EntryFilters`).
 - Demo runs (`btcbot demo`) place real orders on Kalshi DEMO only. Write gate: `KalshiClient.create_order/cancel_order`
   refuse anything but `KalshiEnv.DEMO`. Do not loosen it. No Claude session uses a key; the owner runs demo commands.
-- Candidate A (frozen, `candidate-a.config.yaml`) is negative on the post-freeze forward windows (3 trades, 1 win,
+- Candidate A (frozen, `docs/research/candidate-a.config.yaml`) is negative on the post-freeze forward windows (3 trades, 1 win,
   -$21.58). Nothing here is a profitability claim.
 
 ## Design to build (proposal, owner approved "build stop loss next")
@@ -20,11 +20,20 @@ every position to settlement. No exit logic exists (`strategy.py` mentions take-
    `stop_loss_pct` with the train/test split. Expect: thin books make exits fill badly; a stop may lose more than
    holding on binary 15-min markets. Report that honestly.
 4. Then `execution.py` demo backend: `place_exit_order`, position reconcile, `demo_events` rows, paper-twin parity,
-   fee via the existing formula (`fee_cost` strict). Risk: exposure released only by the actual exit fill.
+   fee via the repo's fee formula in `paper_broker.py`/`btcbot.fees` (exchange `fee_cost` on fills is parsed strictly). Risk: exposure released only by the actual exit fill.
 5. Tests offline with fake client (`tests/test_demo_trader.py` pattern); regression: exit never increases size, never
    fires after settlement, partial exit fill leaves remainder tracked.
 
-## Repo rules that bind this work
+## Codex's backtest pipeline (in progress; the stop-loss work must plug into it, owner message 2026-09-19)
+1. Download ~20,000-30,000 market outcomes plus one-minute candles; add Coinbase 1-minute BTC history.
+2. Train only on earlier complete markets; validate on later months, grouped by whole market (no window split).
+3. Simulate exits at the recorded bid with taker fees and adverse candle assumptions (worst case inside a candle).
+4. Send the strongest few models through the local one-second order-book replay (`lab`).
+5. Forward-paper-test survivors without real orders (`btcbot paper`), before any demo order.
+So: define the stop as a pure function of (entry, current best bid, tau) so Codex's simulator and the live trader
+share it, and treat stop parameters as one more grid axis judged only on the later-month validation.
+
+## Rules that bind this work (repo CLAUDE.md, plus owner workflow: push each commit, review gate, merge not rebase)
 - No martingale / no size increase after a loss (ramp already resets to base). No profitability claims without
   out-of-sample results. Lab verdicts never say "profitable". Prices/counts `Decimal`. ASCII console output.
 - Commit and push separately (review-gate hook: run a repo review, then `mark-reviewed.mjs repo-reviewer`).
