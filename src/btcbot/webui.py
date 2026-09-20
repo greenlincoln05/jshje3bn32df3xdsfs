@@ -446,7 +446,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, self._paper_summary(query))
             elif parsed.path == "/api/portfolio":
                 try:
-                    result = portfolio_view(self._require_db(query), query.get("starting_balance"))
+                    result = portfolio_view(self._require_db(query), query.get("starting_balance"),
+                                            self._configured_account())
                 except (ValueError, ArithmeticError, sqlite3.Error) as exc:
                     raise _ApiError(400, f"portfolio error: {exc}") from exc
                 self._send_json(200, result)
@@ -596,6 +597,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (BacktestError, sqlite3.OperationalError, ParseError) as exc:
             raise _ApiError(400, f"backtest error: {exc}") from exc
         return {"reports": reports}
+
+    def _configured_account(self) -> Any:
+        """The config's account size, the last-resort starting balance for a run that did not record its own."""
+        try:
+            return load_config(str(self.server.config_path)).sizing.account_usd
+        except (ConfigError, OSError):
+            return None
 
     def _require_db(self, query: dict[str, str]) -> Path:
         name = query.get("db")

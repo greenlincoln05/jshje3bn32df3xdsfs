@@ -70,11 +70,32 @@ def _sample_curve(points: list[dict]) -> list[dict]:
     return [points[i] for i in sorted(indices)]
 
 
-def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None = None) -> dict[str, Any]:
+def _recorded_starting_balance(conn: sqlite3.Connection, tables: set[str]) -> tuple[Decimal | None, str | None]:
+    """The account this run started with, from the ``account_start`` row the paper/demo commands log into ``run_log``:
+    a demo run records the demo account's balance, a paper run records its configured account. (Runs recorded before
+    that row existed have none.)"""
+    if "run_log" not in tables:
+        return None, None
+    row = conn.execute("SELECT detail FROM run_log WHERE event = 'account_start' ORDER BY id LIMIT 1").fetchone()
+    if row is None:
+        return None, None
+    try:
+        info = json.loads(row[0])
+        if info.get("kind") == "demo":
+            return _decimal(info["available_usd"]), "demo account balance when the run started"
+        return _decimal(info["account_usd"]), "configured paper account"
+    except (ValueError, KeyError, TypeError, ArithmeticError):
+        return None, None
+
+
+def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None = None,
+                   default_balance: Decimal | str | int | None = None) -> dict[str, Any]:
     """Summarize every ledger row, with bounded history and chart payloads.
 
-    ``starting_balance`` is an optional user/config assumption, never inferred
-    from the trades. Growth percentages use percentage units (5 means 5%);
+    The starting balance is found automatically, in this order: an explicit ``starting_balance`` (API use only; the
+    dashboard no longer asks for one), the ``account_start`` row the run itself logged, then ``default_balance``
+    (the config's ``sizing.account_usd``). It is never inferred from the trades; ``starting_balance_source`` says
+    which one was used. Growth percentages use percentage units (5 means 5%);
     ``win_rate`` is a ratio (0.5 means 50%). A demo database uses ``demo_orders``
     alone, since ``trades`` can contain those same demo fills again.
 
@@ -91,6 +112,11 @@ def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None =
     try:
         conn.execute("BEGIN")  # Keep all reads on one consistent snapshot.
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        balance_source = "entered" if balance is not None else None
+        if balance is None:
+            balance, balance_source = _recorded_starting_balance(conn, tables)
+        if balance is None and default_balance is not None:
+            balance, balance_source = _decimal(default_balance), "config sizing.account_usd (assumed for this run)"
         source = "demo" if "demo_orders" in tables else "paper_or_backtest" if "trades" in tables else "none"
         last_snapshot = None
         if "orderbook_snapshots" in tables:
@@ -244,7 +270,7 @@ def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None =
         "profit_factor_note": "No recorded losses" if gross_loss == 0 and wins else "No settled trades" if not resolved_count else None,
         "avg_trade_pnl_usd": pnl_total / resolved_count if resolved_count else None,
         "avg_win_usd": gross_profit / wins if wins else None, "avg_loss_usd": -gross_loss / losses if losses else None,
-        "starting_balance_usd": balance, "equity_usd": balance + pnl_total if balance is not None else None,
+        "starting_balance_usd": balance, "starting_balance_source": balance_source, "equity_usd": balance + pnl_total if balance is not None else None,
         "growth_pct": pnl_total / balance * HUNDRED if balance is not None else None,
         "max_drawdown_usd": max_dd, "max_drawdown_pct": max_dd_pct,
         "open_exposure_usd": exposure, "recorded_resting_notional_usd": resting_notional,
