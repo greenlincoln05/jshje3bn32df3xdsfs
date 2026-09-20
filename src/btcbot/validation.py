@@ -56,7 +56,7 @@ class Policy:
     min_tau_sec: float = 30
     max_tau_sec: float = 780
     min_price: float = 0.15
-    max_price: float = 0.85
+    max_price: float = 0.65  # matches BotConfig.max_price
     maker_fee_multiplier: Decimal = Decimal(0)
 
 
