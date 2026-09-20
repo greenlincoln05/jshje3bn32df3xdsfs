@@ -11,7 +11,7 @@ from test_execution import make_fill
 from test_live_paper import NO_KILL_FILE, T0, TICKER, feed_fresh_spot, make_book, make_market
 
 from btcbot.config import BotConfig, KalshiEnv
-from btcbot.demo_trader import DemoTrader, render_demo_report
+from btcbot.demo_trader import DemoTrader, compute_fill_gap, render_demo_report
 from btcbot.kalshi_client import KalshiAPIError, KalshiConnectionError, KalshiWriteNotAllowedError
 from btcbot.models import ParseError
 from btcbot.spot_feed import SpotBuffer
@@ -256,3 +256,54 @@ class TestSettlementAndReport:
         conn = sqlite3.connect(":memory:")
         trader = DemoTrader(conn, BotConfig(), SpotBuffer(), FakeDemoClient(), kill_file=NO_KILL_FILE)
         assert "no orders were placed" in render_demo_report(conn, trader.stats)
+
+
+class TestFillGapSummary:
+    """`compute_fill_gap` is the milestone this project's roadmap calls "a paper-vs-demo fill gap we
+    understand": a pure function of `demo_orders` rows, tested independently of a live DemoTrader run."""
+
+    def test_empty_rows_report_no_data_not_a_zero_gap(self):
+        gap = compute_fill_gap([])
+        assert gap.orders == 0
+        assert gap.mean_fill_rate_gap is None
+        assert gap.mean_price_gap is None
+        assert gap.mean_pnl_gap is None
+
+    def test_counts_both_demo_only_paper_only_and_neither(self):
+        rows = [
+            ("T0", "yes", "0.30", "5", "5", "1.50", "0", None, "5", "1.50", "0", None, None),  # both filled
+            ("T1", "yes", "0.30", "5", "5", "1.50", "0", None, "0", "0", "0", None, None),  # demo only
+            ("T2", "yes", "0.30", "5", "0", "0", "0", None, "5", "1.50", "0", None, None),  # paper only
+            ("T3", "yes", "0.30", "5", "0", "0", "0", None, "0", "0", "0", None, None),  # neither
+        ]
+        gap = compute_fill_gap(rows)
+        assert (gap.orders, gap.both_filled, gap.demo_only, gap.paper_only, gap.neither) == (4, 1, 1, 1, 1)
+
+    def test_mean_fill_rate_gap_is_positive_when_the_paper_twin_overfills(self):
+        rows = [("T0", "yes", "0.30", "10", "2", "0.60", "0", None, "10", "3.00", "0", None, None)]
+        gap = compute_fill_gap(rows)
+        assert gap.mean_fill_rate_gap == pytest.approx(0.8)  # paper filled 100%, demo only 20%
+
+    def test_mean_price_gap_only_counts_orders_where_both_sides_filled(self):
+        rows = [
+            ("T0", "yes", "0.30", "5", "5", "1.75", "0", None, "5", "1.50", "0", None, None),  # demo avg 0.35, paper 0.30
+            ("T1", "yes", "0.30", "5", "0", "0", "0", None, "5", "1.50", "0", None, None),  # paper-only, excluded
+        ]
+        gap = compute_fill_gap(rows)
+        assert gap.both_filled == 1
+        assert gap.mean_price_gap == pytest.approx(0.30 - 0.35)
+
+    def test_mean_pnl_gap_only_counts_settled_orders(self):
+        rows = [
+            ("T0", "yes", "0.30", "5", "5", "1.5", "0", "1.0", "5", "1.5", "0", "1.5", "yes"),  # settled: paper +0.5
+            ("T1", "yes", "0.30", "5", "5", "1.5", "0", None, "5", "1.5", "0", None, None),  # unsettled, excluded
+        ]
+        gap = compute_fill_gap(rows)
+        assert gap.settled == 1
+        assert gap.mean_pnl_gap == pytest.approx(0.5)
+
+    async def test_render_demo_report_includes_the_fill_gap_line(self):
+        trader, buffer, client, conn = make_trader()
+        await drive(trader, buffer, client)  # the exchange never reports a fill: a paper-only case
+        report = render_demo_report(conn, trader.stats)
+        assert "fill gap: mean fill-rate gap (paper - demo)" in report

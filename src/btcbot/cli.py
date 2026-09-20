@@ -21,7 +21,8 @@ Phase 6:
               order/cancel/fill handling; never targets prod (see kalshi_client.py's demo-only write gate)
 
 Not a phase (a monitoring tool):
-  dashboard   local web UI for backtests, live paper PnL/trades, and local Kalshi settings
+  dashboard    local web UI for backtests, live paper PnL/trades, and local Kalshi settings
+  demo-report  re-render the demo-vs-paper fill-gap report from an existing demo database (read-only, no key)
 
 ML entry/exit layers (docs/research/ml-layers-handoff.md), owner-driven, not a numbered phase:
   download-history  ONE-TIME backfill of settled markets + Coinbase candles (public data, no key --
@@ -659,6 +660,25 @@ async def _cmd_watch(args: argparse.Namespace) -> int:
     return 2 if any(i.stale for i in items) else 0
 
 
+async def _cmd_demo_report(args: argparse.Namespace) -> int:
+    """Re-render the demo-vs-paper fill-gap report (the same one `btcbot demo` prints when it finishes) from
+    an already-recorded demo database, without re-running it -- the roadmap milestone "a paper-vs-demo fill
+    gap we understand" needs no live run to check the next morning. Offline, read-only; no key, no network."""
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        print(f"error: no such database: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        print(render_demo_report(conn))
+    except sqlite3.OperationalError as exc:
+        print(f"error: {db_path} does not look like a demo database: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    return 0
+
+
 async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     """Evaluate a frozen set of named candidates against shared recorded data."""
     config = load_config(args.config)
@@ -1207,6 +1227,13 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--data-dir", default="data")
     watch.add_argument("--stale-min", type=float, default=5.0, help="flag a database not written for this many minutes (default: 5)")
     watch.set_defaults(handler=_cmd_watch)
+
+    demo_report = commands.add_parser(
+        "demo-report",
+        help="re-render the demo-vs-paper fill-gap report from an existing demo database (read-only, no key)",
+    )
+    demo_report.add_argument("--db", required=True, help="a demo-*.sqlite database from a previous `btcbot demo` run")
+    demo_report.set_defaults(handler=_cmd_demo_report)
 
     validate_cmd = commands.add_parser(
         "validate", help="time-split validation of the bot's recorded model on a features CSV (offline)")

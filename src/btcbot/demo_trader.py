@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -347,9 +348,62 @@ CAVEATS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class FillGapSummary:
+    """The single number milestone this project's roadmap calls "a paper-vs-demo fill gap we understand":
+    how far the paper broker's queue-model assumptions (what the lab/backtest/percent-sizing math all use)
+    diverge from what a real demo-exchange fill actually did, on the SAME orders at the SAME moment. Every
+    mean is `None` when its denominator is empty (no orders, or none where a price/PnL comparison applies) --
+    never silently reported as 0, which would look like "no gap" instead of "no data yet"."""
+
+    orders: int
+    both_filled: int  # filled >0 contracts on BOTH sides -- a price/fee comparison is meaningful here
+    demo_only: int  # demo filled, the paper twin did not
+    paper_only: int  # the paper twin filled, demo did not -- the "twin is optimistic" case the handoff docs flag
+    neither: int
+    mean_fill_rate_gap: float | None  # mean(paper_filled/size - demo_filled/size); positive = paper over-fills
+    mean_price_gap: float | None  # mean(paper_avg_price - demo_avg_price) over `both_filled` orders
+    settled: int  # orders whose window has settled (a PnL comparison is possible)
+    mean_pnl_gap: float | None  # mean(paper_pnl - demo_pnl) over settled orders; positive = paper looked better
+
+
+def compute_fill_gap(rows: Sequence[tuple]) -> FillGapSummary:
+    """`rows` is exactly what :func:`render_demo_report`'s own query returns: one row per `demo_orders` record,
+    `(ticker, side, price, size, demo_filled, demo_cost, demo_fee, demo_pnl, paper_filled, paper_cost, paper_fee,
+    paper_pnl, result)`. A pure function of those rows so it is testable without a live sqlite connection."""
+    both = demo_only = paper_only = neither = settled = 0
+    fill_rate_gaps: list[float] = []
+    price_gaps: list[float] = []
+    pnl_gaps: list[float] = []
+    for _, _, _, size, demo_filled, demo_cost, _, demo_pnl, paper_filled, paper_cost, _, paper_pnl, result in rows:
+        size_d, demo_f, paper_f = Decimal(size), Decimal(demo_filled), Decimal(paper_filled)
+        demo_did, paper_did = demo_f > 0, paper_f > 0
+        if demo_did and paper_did:
+            both += 1
+            price_gaps.append(float(Decimal(paper_cost) / paper_f - Decimal(demo_cost) / demo_f))
+        elif demo_did:
+            demo_only += 1
+        elif paper_did:
+            paper_only += 1
+        else:
+            neither += 1
+        if size_d > 0:
+            fill_rate_gaps.append(float(paper_f / size_d - demo_f / size_d))
+        if result is not None and demo_pnl is not None and paper_pnl is not None:
+            settled += 1
+            pnl_gaps.append(float(Decimal(paper_pnl) - Decimal(demo_pnl)))
+    return FillGapSummary(
+        orders=len(rows), both_filled=both, demo_only=demo_only, paper_only=paper_only, neither=neither,
+        mean_fill_rate_gap=(sum(fill_rate_gaps) / len(fill_rate_gaps)) if fill_rate_gaps else None,
+        mean_price_gap=(sum(price_gaps) / len(price_gaps)) if price_gaps else None,
+        settled=settled, mean_pnl_gap=(sum(pnl_gaps) / len(pnl_gaps)) if pnl_gaps else None,
+    )
+
+
 def render_demo_report(conn: sqlite3.Connection, stats: DemoStats | None = None) -> str:
     rows = conn.execute(
-        """SELECT ticker, side, price, size, demo_filled, demo_fee, demo_pnl, paper_filled, paper_fee, paper_pnl, result
+        """SELECT ticker, side, price, size, demo_filled, demo_cost, demo_fee, demo_pnl,
+                  paper_filled, paper_cost, paper_fee, paper_pnl, result
            FROM demo_orders ORDER BY id"""
     ).fetchall()
     lines = ["Demo orders (real, fake money) vs the paper simulation of the same orders:"]
@@ -357,7 +411,7 @@ def render_demo_report(conn: sqlite3.Connection, stats: DemoStats | None = None)
         lines.append("  no orders were placed.")
     else:
         lines.append(f"  {'window':<10s} {'side':<4s} {'px':>6s} {'size':>5s} | {'demo fill':>9s} {'fee':>7s} {'pnl':>8s} | {'paper fill':>10s} {'fee':>7s} {'pnl':>8s} | result")
-        for ticker, side, price, size, df, dfee, dpnl, pf, pfee, ppnl, result in rows:
+        for ticker, side, price, size, df, _dcost, dfee, dpnl, pf, _pcost, pfee, ppnl, result in rows:
             def money(v):
                 return "--" if v is None else f"{Decimal(v):.4f}"
             lines.append(
@@ -366,15 +420,25 @@ def render_demo_report(conn: sqlite3.Connection, stats: DemoStats | None = None)
             )
         placed = len(rows)
         demo_filled = sum(1 for r in rows if Decimal(r[4]) > 0)
-        paper_filled = sum(1 for r in rows if Decimal(r[7]) > 0)
-        both = sum(1 for r in rows if Decimal(r[4]) > 0 and Decimal(r[7]) > 0)
+        paper_filled = sum(1 for r in rows if Decimal(r[8]) > 0)
+        both = sum(1 for r in rows if Decimal(r[4]) > 0 and Decimal(r[8]) > 0)
         lines.append(
             f"  orders {placed}: filled on demo {demo_filled}, filled in paper {paper_filled}, both {both} "
             f"(paper filled but demo did not: {paper_filled - both}; demo filled but paper did not: {demo_filled - both})"
         )
-        demo_total = sum((Decimal(r[6]) for r in rows if r[6] is not None), Decimal(0))
-        paper_total = sum((Decimal(r[9]) for r in rows if r[9] is not None), Decimal(0))
+        demo_total = sum((Decimal(r[7]) for r in rows if r[7] is not None), Decimal(0))
+        paper_total = sum((Decimal(r[11]) for r in rows if r[11] is not None), Decimal(0))
         lines.append(f"  settled PnL: demo ${demo_total:.4f}   paper ${paper_total:.4f}   (only orders whose window has settled)")
+
+        gap = compute_fill_gap(rows)
+        rate = "n/a" if gap.mean_fill_rate_gap is None else f"{gap.mean_fill_rate_gap:+.1%}"
+        price = "n/a" if gap.mean_price_gap is None else f"${gap.mean_price_gap:+.4f}"
+        pnl = "n/a" if gap.mean_pnl_gap is None else f"${gap.mean_pnl_gap:+.4f}"
+        lines.append(
+            f"  fill gap: mean fill-rate gap (paper - demo) {rate} over {gap.orders} orders; "
+            f"mean fill-price gap (paper - demo) {price} over {gap.both_filled} orders both sides filled; "
+            f"mean settled PnL gap (paper - demo) {pnl} over {gap.settled} settled orders"
+        )
     if stats is not None:
         lines.append(
             f"  rejected orders {stats.orders_rejected}, failed cancels {stats.cancel_failures}, "
