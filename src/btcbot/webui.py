@@ -1059,16 +1059,38 @@ function windowLabel(w, isLatest) {
   return `${time} close \u00b7 ${state}` + (w.trades ? ` \u00b7 ${w.trades} trade${w.trades > 1 ? "s" : ""}` : "");
 }
 
+let databaseList = [];
+const runSelections = {};
+let databaseRefresh = false;
+function runGroup() { return tab === "demo" ? "demo" : "paper"; }
+function selectRun() {
+  const select = $("db-select"), group = runGroup();
+  const candidates = databaseList.filter(d => group === "demo" ? d.kind === "demo" : d.kind === "paper" && /-prod-/.test(d.name));
+  // Filenames contain the run start time; writes/checkpoints must not reorder runs.
+  candidates.sort((a, b) => b.name.localeCompare(a.name));
+  const chosen = runSelections[group] || candidates[0]?.name || databaseList[0]?.name || "";
+  if (select.value !== chosen) {
+    select.value = chosen;
+    market = null;
+    $("ticker-select").innerHTML = "";
+  }
+}
 async function refreshDatabases() {
-  const { databases } = await getJson("/api/databases");
-  const select = $("db-select"), previous = select.value;
-  select.innerHTML = databases.length ? "" : '<option value="">(no data files yet - run btcbot paper or record)</option>';
-  databases.forEach((db, i) => {
-    const opt = document.createElement("option");
-    opt.value = db.name; opt.textContent = dbLabel(db) + (i === 0 ? "  (newest)" : ""); select.appendChild(opt);
-  });
-  if (databases.some((db) => db.name === previous)) select.value = previous;
-  return databases;
+  if (databaseRefresh) return databaseList;
+  databaseRefresh = true;
+  try {
+    const { databases } = await getJson("/api/databases");
+    databaseList = databases;
+    const select = $("db-select"), previous = select.value;
+    select.innerHTML = databases.length ? "" : '<option value="">(no data files yet)</option>';
+    databases.forEach(db => {
+      const opt = document.createElement("option");
+      opt.value = db.name; opt.textContent = dbLabel(db); select.appendChild(opt);
+    });
+    select.value = previous;
+    selectRun();
+    return databases;
+  } finally { databaseRefresh = false; }
 }
 
 function ladder(levels, isAsk) {
@@ -1128,7 +1150,13 @@ async function refreshMarket() {
   if (!db) { note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record, then click Refresh."; return; }
   try {
     const t = $("ticker-select").value;
-    market = await getJson(`/api/market?db=${encodeURIComponent(db)}` + (t ? `&ticker=${encodeURIComponent(t)}` : ""));
+    const response = await getJson(`/api/market?db=${encodeURIComponent(db)}` + (t ? `&ticker=${encodeURIComponent(t)}` : ""));
+    if (db !== $("db-select").value || t !== $("ticker-select").value || tab !== "market") return;
+    if (market?.ticker === response.ticker) {
+      if (market.book_ts > response.book_ts) Object.assign(response, {book: market.book, book_ts: market.book_ts, book_latency_ms: market.book_latency_ms});
+      if (market.spot_ts > response.spot_ts) Object.assign(response, {spot: market.spot, spot_ts: market.spot_ts});
+    }
+    market = response;
     note.className = "note"; note.textContent = "";
     const sel = $("ticker-select"), chosen = sel.value;
     sel.innerHTML = '<option value="">Latest window (follows automatically)</option>' +
@@ -1179,7 +1207,8 @@ async function refreshMonitor() {
   if (!db) { note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record first, then click Refresh."; return; }
   try {
     const s = await getJson(`/api/paper_summary?db=${encodeURIComponent(db)}`);
-    note.textContent = "";
+    if (db !== $("db-select").value || tab !== "monitor") return;
+    note.textContent = "Simulated paper results for this run only: " + db;
     $("summary-tiles").innerHTML = [
       ["Trades", s.trade_count], ["Resolved", s.resolved_count], ["Unresolved", s.unresolved_count],
       ["Win rate", fmtPct(s.win_rate)], ["Total PnL", fmtUsd(s.total_pnl_usd)],
@@ -1380,6 +1409,7 @@ async function refreshDemo() {
   if (!db) { note.className = "note"; note.textContent = "No data files yet. Start btcbot demo, then click Refresh."; return; }
   try {
     const d = await getJson(`/api/demo?db=${encodeURIComponent(db)}`);
+    if (db !== $("db-select").value || tab !== "demo") return;
     const s = d.summary, t = (iso) => (iso ? iso.slice(11, 19) : "--");
     const age = d.last_snapshot ? (Date.now() - new Date(d.last_snapshot).getTime()) / 1000 : null;
     $("demo-tiles").innerHTML = [
@@ -1388,7 +1418,7 @@ async function refreshDemo() {
       ["Paper PnL (settled)", fmtUsd(s.paper_pnl)], ["Data age", age === null ? "--" : (age < 60 ? age.toFixed(1) + "s" : "stale")],
     ].map(([label, value]) => `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
     note.className = "note";
-    note.textContent = d.orders.length || d.events.length ? "" : "No demo orders yet. Normal: the strategy only orders when it sees an edge. If this is not a demo file, pick the newest Demo orders file above.";
+    note.textContent = d.orders.length || d.events.length ? "Exchange demo fills vs simulated paper fills for this run only: " + db + ". Older/manual account trades are not included." : "No demo orders yet. Normal: the strategy only orders when it sees an edge. If this is not a demo file, pick the newest Demo orders file above.";
     $q("#demo-orders tbody").innerHTML = d.orders.length ? d.orders.map((o) => `<tr><td>${t(o.placed_ts)}</td><td>${esc(o.ticker.slice(-8))}</td>
       <td>${esc(o.side)}</td><td class="num">${cents(o.price)}</td><td class="num">${esc(o.size)}</td><td>${esc(o.state)}</td>
       <td class="num">${num(o.demo_filled)}</td><td class="num">${o.demo_avg_price === null ? "--" : cents(o.demo_avg_price)}</td>
@@ -1406,22 +1436,23 @@ async function refreshDemo() {
 let refreshing = false;
 let quoting = false;
 async function refreshQuote() {
-  if (quoting || refreshing || document.hidden || tab !== "market" || !market?.ticker) return;
+  if (quoting || document.hidden || tab !== "market" || !market?.ticker) return;
   const db = $("db-select").value, ticker = market.ticker, selection = $("ticker-select").value;
   if (selection && selection !== ticker) return;
   quoting = true;
   try {
     const q = await getJson(`/api/quote?db=${encodeURIComponent(db)}&ticker=${encodeURIComponent(ticker)}`);
-    if (refreshing || db !== $("db-select").value || selection !== $("ticker-select").value || ticker !== market?.ticker) return;
-    if (q.book_ts && (!market.book_ts || q.book_ts >= market.book_ts)) {
+    if (db !== $("db-select").value || selection !== $("ticker-select").value || ticker !== market?.ticker) return;
+    if (q.book_ts && (!market.book_ts || q.book_ts > market.book_ts)) {
       market.book = q.book; market.book_ts = q.book_ts; market.book_latency_ms = q.book_latency_ms;
       renderBook();
       $("st-ts").textContent = new Date(q.book_ts).toLocaleTimeString();
       $("st-latency").textContent = q.book_latency_ms == null ? "--" : q.book_latency_ms.toFixed(0) + " ms";
     }
-    if (q.spot_ts && (!market.spot_ts || q.spot_ts >= market.spot_ts)) {
+    if (q.spot_ts && (!market.spot_ts || q.spot_ts > market.spot_ts)) {
       market.spot = q.spot; market.spot_ts = q.spot_ts;
-      $("f-spot").textContent = "$" + num(Number(q.spot));
+      const spot = Number(q.spot), strike = Number(market.strike);
+      $("f-spot").innerHTML = `<span class="orange">$${num(spot)}</span>` + (strike ? ` <span class="${spot >= strike ? "green" : "red"}" style="font-size:11px">${spot >= strike ? "+" : "-"}$${num(Math.abs(spot - strike))}</span>` : "");
     }
     updateAge();
   } catch (e) { /* ages continue advancing when the local reader is unavailable */ }
@@ -1442,6 +1473,7 @@ document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("c
   $("db-row").style.display = noPicker ? "none" : "";
   $("pickhelp").style.display = noPicker ? "none" : "";
   $q("#ticker-select").parentElement.style.display = tab === "market" ? "" : "none";
+  selectRun();
   refreshTab();
 }));
 document.querySelectorAll("#side-toggle button").forEach((b) => b.addEventListener("click", () => {
@@ -1451,7 +1483,7 @@ document.querySelectorAll("#side-toggle button").forEach((b) => b.addEventListen
   renderBook();
 }));
 $("refresh-databases").addEventListener("click", async () => { const dbs = await refreshDatabases(); renderLabDbs(dbs); refreshTab(); });
-$("db-select").addEventListener("change", () => { $("ticker-select").innerHTML = ""; refreshTab(); });
+$("db-select").addEventListener("change", () => { runSelections[runGroup()] = $("db-select").value; market = null; $("ticker-select").innerHTML = ""; refreshTab(); });
 $("ticker-select").addEventListener("change", refreshTab);
 $("run-backtest").addEventListener("click", runBacktest);
 $("lab-run").addEventListener("click", labRun);
@@ -1468,7 +1500,8 @@ window.addEventListener("resize", () => { if (tab === "market" || tab === "monit
   buildLabForm(dbList);
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
-  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor" || tab === "demo")) refreshTab(); }, 1000);
+  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor" || tab === "demo")) refreshTab(); }, 3000);
+  setInterval(() => { if (!document.hidden) refreshDatabases().catch(() => {}); }, 10000);
   setInterval(refreshQuote, 50);
   setInterval(updateAge, 50);
 })();
