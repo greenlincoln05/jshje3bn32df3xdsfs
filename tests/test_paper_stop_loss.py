@@ -63,3 +63,17 @@ async def test_the_stop_tightens_with_the_ramp_level():
 def test_the_demo_trader_does_not_use_exits_until_real_exit_orders_exist():
     from btcbot.demo_trader import DemoTrader
     assert DemoTrader._supports_exits is False
+
+
+async def test_a_partial_exit_is_not_a_finished_trade_until_the_whole_position_is_closed():
+    from btcbot.models import OrderBook, PriceLevel
+    trader, buffer = make_trader(sqlite3.connect(":memory:"), config=cfg(30, mode="ramp"))
+    trader._ramp_level, trader._ramp_size = 3, D(4)
+    market = await held_position(trader, buffer)
+    thin = OrderBook("T", yes_bids=(PriceLevel(D("0.15"), D("1")),), no_bids=(PriceLevel(D("0.68"), D("15")),))
+    await trader.on_orderbook_snapshot(market, thin, T0 + timedelta(seconds=9))     # sells 1 of 4
+    assert trader._position is not None and trader._position.size == 3
+    assert trader._ramp_level == 3 and trader.risk._consecutive_losses == 0        # not a finished trade yet
+    await trader.on_orderbook_snapshot(market, make_book(yes_price="0.15", yes_size="15"), T0 + timedelta(seconds=10))
+    assert trader._position is None and trader._ramp_level == 0                    # now the loss counts, once
+    assert trader.risk._consecutive_losses == 1 and trader.risk.open_exposure_usd == 0

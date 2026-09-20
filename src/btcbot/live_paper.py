@@ -96,6 +96,8 @@ class LivePaperTrader:
         self._ramp_size: Decimal | None = None  # sizing mode "ramp": next order size, moved only by settlements
         self._ramp_level = 0  # consecutive settled wins in the current ramp (0 = base size)
         self._idle_windows = 0  # consecutive finished windows in which no position was opened
+        self._carried_pnl = Decimal(0)  # realized P&L of earlier PARTIAL early exits of the position still held
+        self._carried_size = Decimal(0)
         self._position_level = 0  # ramp level when the current position was opened (the stop tightens with it)
         self._last_result: str | None = None  # "win" or "loss" of the most recent settled trade
         if config.sizing.mode is SizingMode.PERCENT:
@@ -304,7 +306,7 @@ class LivePaperTrader:
         closed, remaining = _apply_exit(position, fills, decision.exit_reason or "exit")
         self._position = remaining
         if closed is not None:
-            self._book_result(closed, closed.pnl_usd, closed.entry_price * closed.size, poll_ts)
+            self._book_result(closed, closed.pnl_usd, closed.entry_price * closed.size, poll_ts, final=remaining is None)
 
     def _resting_order_filled(self) -> bool:
         return self._broker.get_order(self._resting_order_id).status == "filled"
@@ -374,21 +376,32 @@ class LivePaperTrader:
         pnl = payout - exposure - pending.fee_paid
         self._book_result(replace(pending, result=result, pnl_usd=pnl), pnl, exposure, settled_ts)
 
-    def _book_result(self, resolved: TradeRecord, pnl: Decimal, exposure: Decimal, settled_ts: datetime) -> None:
-        """Record a finished trade (settled OR closed early by an exit) and move the account, ramp and risk state."""
-        pending = resolved
+    def _book_result(self, resolved: TradeRecord, pnl: Decimal, exposure: Decimal, settled_ts: datetime,
+                     *, final: bool = True) -> None:
+        """Record a finished trade (settled OR closed early by an exit) and move the account, ramp and risk state.
+
+        A PARTIAL early exit (``final=False``: a thin book sold only part of the position) is recorded and its cash
+        and exposure are released, but it is not a win or a loss yet: the streak, ramp and last-result are decided
+        once, when the rest of the position settles or is sold, on the whole position's total P&L and size."""
         self.trades.append(resolved)
         log_trade(self._conn, resolved)
         self._bankroll += pnl
-        self._last_result = "loss" if pnl < 0 else "win"
+        if not final:
+            self._carried_pnl += pnl
+            self._carried_size += resolved.size
+            self._risk.release_exposure(exposure)
+            return
+        total_pnl, total_size = pnl + self._carried_pnl, resolved.size + self._carried_size
+        self._carried_pnl, self._carried_size = Decimal(0), Decimal(0)
+        self._last_result = "loss" if total_pnl < 0 else "win"
         if self._config.sizing.mode is SizingMode.RAMP:
-            self._ramp_level = self._ramp_level + 1 if pnl > 0 else 0
+            self._ramp_level = self._ramp_level + 1 if total_pnl > 0 else 0
             self._ramp_size = ramp_next_size(
-                pending.size, pnl > 0, base=Decimal(self._config.sizing.contracts_per_trade),
+                total_size, total_pnl > 0, base=Decimal(self._config.sizing.contracts_per_trade),
                 growth_pct=self._config.sizing.ramp_growth_pct,
                 max_contracts=Decimal(self._config.risk.max_contracts_per_trade))
         if self._config.sizing.mode is SizingMode.PERCENT:
             self._risk.set_account_value(self._bankroll)
         self._risk.record_trade_closed(
-            TradeOutcome(ts=settled_ts, size=pending.size, pnl_usd=pnl), exposure_released_usd=exposure
+            TradeOutcome(ts=settled_ts, size=total_size, pnl_usd=total_pnl), exposure_released_usd=exposure
         )
