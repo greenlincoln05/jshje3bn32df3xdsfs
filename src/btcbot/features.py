@@ -154,3 +154,22 @@ def write_csv(rows: Iterable[dict], path: str | Path) -> int:
             w.writerow({c: r.get(c) for c in COLUMNS})
             n += 1
     return n
+
+
+def read_csv(path: str | Path) -> list[dict]:
+    """Rows written by :func:`write_csv`, with numbers converted back (empty cells become None)."""
+    out = []
+    with open(path, newline="", encoding="ascii") as fh:
+        for raw in csv.DictReader(fh):
+            row: dict = {}
+            for k, v in raw.items():
+                if v == "" or v is None:
+                    row[k] = None
+                elif k in ("source", "ticker", "ts"):
+                    row[k] = v
+                elif k == "outcome_yes":
+                    row[k] = int(float(v))
+                else:
+                    row[k] = float(v)
+            out.append(row)
+    return out

@@ -518,6 +518,25 @@ async def _cmd_features(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_validate(args: argparse.Namespace) -> int:
+    """Time-split validation of the recorded model probabilities on a features CSV. Offline: no network, no key."""
+    from btcbot.features import read_csv
+    from btcbot.validation import ValidationError, blend_predictor, validate
+
+    try:
+        out = validate(read_csv(args.features), blend_predictor, train_frac=args.split, embargo=args.embargo,
+                       min_test_trades=args.min_test_trades)
+    except (ValidationError, OSError, ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for name, ev in out.items():
+        rate = "-" if ev.win_rate is None else f"{ev.win_rate:.0%} (95% {ev.ci95[0]:.0%}-{ev.ci95[1]:.0%})"
+        brier = "-" if ev.brier is None else f"{ev.brier:.4f}"
+        print(f"{name}: windows {ev.windows}, trades {ev.trades}, wins {ev.wins}, win rate {rate}, "
+              f"pnl/contract ${ev.pnl_per_contract:.2f}, brier {brier}\n  verdict: {ev.verdict}")
+    return 0
+
+
 async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     """Evaluate a frozen set of named candidates against shared recorded data."""
     config = load_config(args.config)
@@ -914,6 +933,14 @@ def build_parser() -> argparse.ArgumentParser:
     features.add_argument("--step-sec", type=float, default=5.0, help="keep at most one row per window per this many seconds (default: 5)")
     features.add_argument("--output", default="data/research/features.csv")
     features.set_defaults(handler=_cmd_features)
+
+    validate_cmd = commands.add_parser(
+        "validate", help="time-split validation of the bot's recorded model on a features CSV (offline)")
+    validate_cmd.add_argument("--features", default="data/research/features.csv", help="CSV from `btcbot features`")
+    validate_cmd.add_argument("--split", type=float, default=0.7)
+    validate_cmd.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (default: 1)")
+    validate_cmd.add_argument("--min-test-trades", type=int, default=30)
+    validate_cmd.set_defaults(handler=_cmd_validate)
 
     suite = commands.add_parser(
         "lab-suite",
