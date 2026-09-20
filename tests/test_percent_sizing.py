@@ -108,8 +108,8 @@ class TestConfig:
         with pytest.raises(ValidationError):
             Sizing(mode="percent", **kw)
 
-    def test_the_default_mode_is_still_fixed_size(self):
-        assert BotConfig().sizing.mode is SizingMode.FIXED
+    def test_the_default_mode_is_ramp(self):
+        assert BotConfig().sizing.mode is SizingMode.RAMP
 
 
 def percent_config():
@@ -180,9 +180,16 @@ class TestLiveTraderPercentMode:
         assert trader._resting_order_id is None and trader._position is None
 
     async def test_fixed_mode_is_untouched_by_all_of_this(self):
-        trader, buffer = make_trader(sqlite3.connect(":memory:"))
+        trader, buffer = make_trader(sqlite3.connect(":memory:"), config=BotConfig(sizing=Sizing(mode="fixed")))
         rows = await run_windows(trader, buffer, ["yes"] * 4)
         assert [r[1] for r in rows] == [5, 5]                     # contracts_per_trade, wins or not
+
+
+    async def test_ramp_mode_grows_after_wins(self):
+        trader, buffer = make_trader(sqlite3.connect(":memory:"), config=BotConfig(sizing=Sizing(mode="ramp")))
+        rows = await run_windows(trader, buffer, ["yes"] * 4)
+        sizes = [r[1] for r in rows]
+        assert sizes[0] == 5 and sizes[1] > sizes[0]
 
 
 class TestLabReplay:
