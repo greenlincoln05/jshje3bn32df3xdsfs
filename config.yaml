@@ -21,6 +21,9 @@ sizing:
   # account_usd and moves only with SETTLED profit and loss; after a win the next order may grow by at most
   # max_growth_per_win_pct %, after a loss it can never grow. Pair it with the two account-relative risk limits
   # below so the caps rise and fall with the account. (Defaults shown; percent mode is off unless you set it.)
+  boost_min_price: 0.20        # entries priced 20-40 cents get boost_multiplier x the normal size (1 = off);
+  boost_max_price: 0.40        # skipped right after a loss, capped by risk.max_contracts_per_trade
+  boost_multiplier: 2
   ramp_growth_pct: 20          # mode ramp: +max(1, 20%) contracts after each settled win, back to base after a loss
   account_usd: 500
   risk_pct_per_trade: 2

@@ -53,6 +53,11 @@ class Sizing(_Strict):
     # mode "percent": stake risk_pct_per_trade percent of the CURRENT account per order. The account starts at
     # account_usd and moves only with SETTLED profit and loss. After a win the next order may grow by at most
     # max_growth_per_win_pct percent; after a loss it can never grow (btcbot.strategy.percent_size).
+    # Order-size multiplier for entries priced in [boost_min_price, boost_max_price] (1 = off). Never applied right
+    # after a settled loss (repo rule: no size increase after a loss), always capped by risk.max_contracts_per_trade.
+    boost_min_price: Decimal = Field(Decimal("0.20"), gt=0, lt=1)
+    boost_max_price: Decimal = Field(Decimal("0.40"), gt=0, lt=1)
+    boost_multiplier: Decimal = Field(Decimal("1"), ge=1, le=5)
     ramp_growth_pct: Decimal = Field(Decimal("20"), ge=0, le=100)  # mode "ramp": growth per settled win (min +1)
     account_usd: Decimal = Field(Decimal("500"), gt=0)
     risk_pct_per_trade: Decimal = Field(Decimal("2"), gt=0, le=10)
