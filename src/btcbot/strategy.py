@@ -193,6 +193,8 @@ def decide(
     has_position: bool,
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
+    resting_side: Side | None = None,
+    resting_price: Decimal | None = None,
     position_side: Side | None = None,
     position_entry_price: Decimal | None = None,
     position_held_sec: float | None = None,
@@ -206,6 +208,18 @@ def decide(
             return Decision(Action.CANCEL, reason="cancelling because pricing inputs are unavailable")
         if tau_sec <= cancel_before_close_sec:
             return Decision(Action.CANCEL, reason="cancelling before close")
+        # A maker order can sit in the queue for minutes. Its original edge is
+        # insufficient once the current model probability no longer supports its
+        # limit price; leaving it live turns an adverse move into a stale fill.
+        if resting_side is not None and resting_price is not None:
+            if (min_price is not None and resting_price < min_price) or (
+                max_price is not None and resting_price > max_price
+            ):
+                return Decision(Action.CANCEL, reason="cancelling because resting price is outside price band")
+            p_side = p_yes if resting_side == "yes" else (1.0 - p_yes)
+            expected_fee = float(maker_fee(Decimal(1), resting_price, multiplier=maker_fee_multiplier))
+            if p_side - float(resting_price) - expected_fee < float(min_edge):
+                return Decision(Action.CANCEL, reason="cancelling because resting edge no longer clears min_edge")
         return Decision(Action.HOLD, reason="order already resting")
     if has_position:
         exit_reason = None
