@@ -426,6 +426,33 @@ class TestStrategyLabEndpoints:
         status, body = _get(dashboard.base_url, "/api/lab/defaults")
         assert status == 200 and "min_edge" in body["tunable"] and "risk_pct" in body["tunable"]
 
+    def test_defaults_account_matches_the_configured_shipped_defaults(self, dashboard):
+        # dashboard's own config.yaml is just "mode: paper", so this is BotConfig()'s own code defaults --
+        # the dashboard's "account size" field must never just be a hardcoded guess of its own.
+        status, body = _get(dashboard.base_url, "/api/lab/defaults")
+        assert status == 200
+        assert body["account"] == {"account_usd": "500", "max_exposure_pct": "5", "daily_loss_pct": "4"}
+
+    def test_defaults_account_follows_a_custom_configured_account_size(self, dashboard):
+        dashboard.config_path.write_text(
+            "mode: paper\nsizing:\n  account_usd: 1234\nrisk:\n  max_open_exposure_pct: 12\n  daily_loss_limit_pct: 8\n",
+            encoding="utf-8",
+        )
+        status, body = _get(dashboard.base_url, "/api/lab/defaults")
+        assert status == 200
+        assert body["account"] == {"account_usd": "1234", "max_exposure_pct": "12", "daily_loss_pct": "8"}
+
+    def test_defaults_account_falls_back_when_the_percent_caps_are_unset(self, dashboard):
+        # sizing.mode "fixed"/"ramp"/"kelly" may leave the two account-relative risk caps off (null) since
+        # they are inert there; lab_defaults() then has no live percentage to mirror and uses the lab's own
+        # AccountSettings research defaults instead of crashing or showing a blank/None field.
+        dashboard.config_path.write_text(
+            "mode: paper\nrisk:\n  max_open_exposure_pct: null\n  daily_loss_limit_pct: null\n", encoding="utf-8",
+        )
+        status, body = _get(dashboard.base_url, "/api/lab/defaults")
+        assert status == 200
+        assert body["account"] == {"account_usd": "500", "max_exposure_pct": "25", "daily_loss_pct": "10"}
+
     def test_preview_counts_combinations_and_windows(self, dashboard):
         name = self._seed(dashboard)
         status, body = _post(dashboard.base_url, "/api/lab/preview",
