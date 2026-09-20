@@ -74,9 +74,18 @@ def load_windows(conn: sqlite3.Connection) -> dict[str, tuple[Decimal, datetime]
     return {ticker: (Decimal(strike), parse_time(close_time)) for ticker, strike, close_time in rows}
 
 
-def load_settlements(conn: sqlite3.Connection) -> dict[str, Side]:
-    rows = conn.execute("SELECT ticker, result FROM settlements WHERE result IS NOT NULL").fetchall()
-    return dict(rows)
+@dataclass(frozen=True, slots=True)
+class Settlement:
+    result: Side
+    available_ts: datetime
+
+
+def load_settlements(conn: sqlite3.Connection) -> dict[str, Settlement]:
+    """Load outcomes together with when the recorder first learned them."""
+    rows = conn.execute(
+        "SELECT ticker, result, finalized_poll_ts FROM settlements WHERE result IN ('yes','no')"
+    ).fetchall()
+    return {ticker: Settlement(result, parse_time(available_ts)) for ticker, result, available_ts in rows}
 
 
 def load_spot_ticks(conn: sqlite3.Connection) -> list[tuple[datetime, Decimal]]:
@@ -199,7 +208,7 @@ class ReplayData:
 
     snapshots: list[Snapshot]
     windows: dict[str, tuple[Decimal, datetime]]
-    settlements: dict[str, Side]
+    settlements: dict[str, Settlement]
     spot_ticks: list[tuple[datetime, Decimal]]
 
 
@@ -229,10 +238,13 @@ def merge_replay_data(parts: Sequence[ReplayData]) -> ReplayData:
     snapshots.sort(key=lambda s: s.poll_ts)
 
     windows: dict[str, tuple[Decimal, datetime]] = {}
-    settlements: dict[str, Side] = {}
+    settlements: dict[str, Settlement] = {}
     for part in parts:
         windows.update(part.windows)
-        settlements.update(part.settlements)
+        for ticker, settlement in part.settlements.items():
+            previous = settlements.get(ticker)
+            if previous is None or settlement.available_ts < previous.available_ts:
+                settlements[ticker] = settlement
 
     spot: list[tuple[datetime, Decimal]] = []
     covered: list[tuple[datetime, datetime]] = []
@@ -264,7 +276,7 @@ class PreparedReplay:
     windows_seen: int
     first_ts: datetime
     last_ts: datetime
-    settlements: dict[str, Side]
+    settlements: dict[str, Settlement]
     spot_series: SpotSeries
 
 
@@ -327,7 +339,8 @@ def prepare_replay(
         windows_seen=len({s.ticker for s in snapshots}),
         first_ts=snapshots[0].poll_ts,
         last_ts=snapshots[-1].poll_ts,
-        settlements=data.settlements,
+        settlements={ticker: value for ticker, value in data.settlements.items()
+                     if tickers is None or ticker in tickers},
         spot_series=SpotSeries(spot_ticks),
     )
 
@@ -357,6 +370,9 @@ class EntryFilters:
     trend_mode: str = "off"
     trend_lookback_sec: int = 60
     trend_min_move_usd: Decimal = Decimal(0)
+    book_move_mode: str = "off"
+    book_move_lookback_sec: int = 60
+    book_move_min: Decimal = Decimal(0)
     account_usd: Decimal | None = None
     risk_pct_per_trade: Decimal | None = None
     min_stake_usd: Decimal = Decimal(0)
@@ -390,11 +406,12 @@ def replay_prepared(
     current_ticker: str | None = None
     resting_order_id: str | None = None
     position: TradeRecord | None = None
+    pending: dict[str, TradeRecord] = {}
     trades: list[TradeRecord] = []
     windows_traded: set[str] = set()
     counts = {
         "price_band": 0, "trend": 0, "trend_missing_history": 0, "too_small": 0, "risk_blocked": 0,
-        "persistence": 0, "low_confidence": 0,
+        "persistence": 0, "low_confidence": 0, "book_move": 0, "book_move_missing_history": 0,
     }
     rest_side: str | None = None  # the side the strategy has wanted on consecutive snapshots, and for how long
     rest_streak = 0
@@ -405,8 +422,32 @@ def replay_prepared(
     if bankroll is not None and filters.risk_pct_per_trade is not None:
         risk.set_account_value(bankroll)
 
+    def resolve_available(now: datetime) -> None:
+        nonlocal bankroll, last_result
+        available = sorted(
+            ((ticker, settlements.get(ticker)) for ticker in pending),
+            key=lambda item: item[1].available_ts if item[1] is not None else now,
+        )
+        for ticker, settlement in available:
+            if settlement is None or settlement.available_ts > now:
+                continue
+            held = pending.pop(ticker)
+            exposure = held.entry_price * held.size
+            pnl = settle(held.side, held.size, settlement.result) - exposure - held.fee_paid
+            trades.append(replace(held, result=settlement.result, pnl_usd=pnl))
+            risk.record_trade_closed(
+                TradeOutcome(ts=settlement.available_ts, size=held.size, pnl_usd=pnl),
+                exposure_released_usd=exposure,
+            )
+            last_result = "loss" if pnl < 0 else "win"
+            if bankroll is not None:
+                bankroll += pnl
+                equity.append((settlement.available_ts, bankroll))
+                if filters is not None and filters.risk_pct_per_trade is not None:
+                    risk.set_account_value(bankroll)
+
     def finalize_window(ticker: str, ts: datetime) -> None:
-        nonlocal resting_order_id, position, bankroll, last_result
+        nonlocal resting_order_id, position
         if resting_order_id is not None:
             order = broker.get_order(resting_order_id)
             unfilled = order.remaining_size
@@ -416,25 +457,21 @@ def replay_prepared(
                 risk.release_exposure(unfilled * order.price)
             resting_order_id = None
         if position is not None:
-            result = settlements.get(ticker)
-            exposure = position.entry_price * position.size
-            if result is None:
-                trades.append(position)
-                risk.release_exposure(exposure)
-            else:
-                payout = settle(position.side, position.size, result)
-                pnl = payout - exposure - position.fee_paid
-                trades.append(replace(position, result=result, pnl_usd=pnl))
-                risk.record_trade_closed(
-                    TradeOutcome(ts=ts, size=position.size, pnl_usd=pnl), exposure_released_usd=exposure
-                )
-                last_result = "loss" if pnl < 0 else "win"
-                if bankroll is not None:
-                    bankroll += pnl
-                    equity.append((ts, bankroll))
-                    if filters.risk_pct_per_trade is not None:
-                        risk.set_account_value(bankroll)
+            pending[ticker] = position
             position = None
+
+    book_times: list[float] = []
+    book_mids: list[Decimal] = []
+
+    def book_move(ts: datetime, lookback_sec: int) -> Decimal | None:
+        if not book_times:
+            return None
+        now = ts.timestamp()
+        hi = bisect_right(book_times, now) - 1
+        lo = bisect_right(book_times, now - lookback_sec) - 1
+        if hi < 0 or lo < 0 or now - book_times[hi] > 5 or (now - lookback_sec) - book_times[lo] > 5:
+            return None
+        return book_mids[hi] - book_mids[lo]
 
     def screen(decision: Decision, ts: datetime, p_yes: float, streak: int) -> Decision | None:
         """Apply the lab's filters and sizing to a proposed resting order; None means do not place it."""
@@ -468,6 +505,19 @@ def replay_prepared(
             if not wanted:
                 counts["trend"] += 1
                 return None
+        if filters.book_move_mode != "off":
+            move = book_move(ts, filters.book_move_lookback_sec)
+            if move is None:
+                counts["book_move_missing_history"] += 1
+                return None
+            toward_yes = move >= filters.book_move_min
+            toward_no = move <= -filters.book_move_min
+            wanted = toward_yes if decision.side == "yes" else toward_no
+            if filters.book_move_mode == "against":
+                wanted = toward_no if decision.side == "yes" else toward_yes
+            if not wanted:
+                counts["book_move"] += 1
+                return None
         if bankroll is not None:
             cash = bankroll - risk.open_exposure_usd
             if filters.risk_pct_per_trade is not None:
@@ -497,6 +547,13 @@ def replay_prepared(
                 finalize_window(current_ticker, snap.poll_ts)
             current_ticker = snap.ticker
             rest_side, rest_streak = None, 0  # a new window starts a new streak
+            book_times.clear()
+            book_mids.clear()
+        resolve_available(snap.poll_ts)
+        yes_mid = snap.book.mid("yes")
+        if yes_mid is not None:
+            book_times.append(snap.poll_ts.timestamp())
+            book_mids.append(yes_mid)
         if not step.active:
             continue
         p_blend = step.p_yes
@@ -566,13 +623,19 @@ def replay_prepared(
 
     if current_ticker is not None:
         finalize_window(current_ticker, prepared.last_ts)
+    relevant_announcements = [
+        settlements[ticker].available_ts for ticker in pending if ticker in settlements
+    ]
+    report_end = max([prepared.last_ts, *relevant_announcements])
+    resolve_available(report_end)
+    trades.extend(pending.values())
 
     return ReplayResult(
         trades=trades,
         windows_traded=windows_traded,
         windows_seen=prepared.windows_seen,
         first_ts=prepared.first_ts,
-        last_ts=prepared.last_ts,
+        last_ts=report_end,
         filter_counts=counts,
         final_bankroll=bankroll,
         equity_curve=equity,

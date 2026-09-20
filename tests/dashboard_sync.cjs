@@ -1,0 +1,13 @@
+const fs = require('fs'), vm = require('vm'), assert = require('node:assert/strict');
+const html = fs.readFileSync('src/btcbot/webui.py','utf8');
+const source = html.slice(html.indexOf('let databaseList = []'),html.indexOf('\nfunction ladder'));
+const elements={'db-select':{value:'prod-old'},'ticker-select':{innerHTML:'old'}};
+const context=vm.createContext({$:id=>elements[id],tab:'market',market:{ticker:'old'}});
+vm.runInContext(source,context);
+vm.runInContext(`databaseList=[{name:'demo-X-demo-20260102',kind:'demo'},{name:'paper-X-prod-20260101',kind:'paper'},{name:'paper-X-prod-20260103',kind:'paper'}];selectRun()`,context);
+assert.equal(elements['db-select'].value,'paper-X-prod-20260103');
+vm.runInContext(`tab='demo';selectRun()`,context);
+assert.equal(elements['db-select'].value,'demo-X-demo-20260102');
+vm.runInContext(`tab='market';runSelections.paper='paper-X-prod-20260101';selectRun()`,context);
+assert.equal(elements['db-select'].value,'paper-X-prod-20260101');
+console.log('Dashboard run selection: 3 checks passed');

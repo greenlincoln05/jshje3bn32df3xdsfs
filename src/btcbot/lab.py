@@ -73,6 +73,9 @@ class LabParams:
     trend_mode: str = "off"
     trend_lookback_sec: int = 60
     trend_min_move_usd: Decimal = Decimal(0)
+    book_move_mode: str = "off"
+    book_move_lookback_sec: int = 60
+    book_move_min: Decimal = Decimal(0)
     model_blend: float = 0.5
     risk_pct: Decimal | None = None   # percent of bankroll risked per trade; None = fixed contracts
     max_growth_pct: Decimal | None = None  # with risk_pct: a win may raise the next order by at most this percent
@@ -83,7 +86,8 @@ class LabParams:
     def from_config(cls, config: BotConfig) -> LabParams:
         return cls(
             min_edge=config.min_edge, max_spread=config.max_spread, min_depth=config.min_depth,
-            min_tau_sec=config.min_tau_sec, max_tau_sec=config.max_tau_sec, model_blend=config.model_blend,
+            min_tau_sec=config.min_tau_sec, max_tau_sec=config.max_tau_sec,
+            min_price=config.min_price, max_price=config.max_price, model_blend=config.model_blend,
             contracts=config.sizing.contracts_per_trade,
         )
 
@@ -111,13 +115,14 @@ class AccountSettings:
 
 _DECIMAL_KEYS = {
     "min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_stake_pct",
-    "min_p_side", "max_growth_pct",
+    "min_p_side", "max_growth_pct", "book_move_min",
 }
-_INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "contracts", "persist_steps"}
+_INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "book_move_lookback_sec", "contracts", "persist_steps"}
 _FLOAT_KEYS = {"model_blend"}
 _OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct", "min_p_side", "max_growth_pct"}
-TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode"}))
+TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode", "book_move_mode"}))
 _TREND_MODES = ("off", "with", "against", "aligned4")
+_BOOK_MOVE_MODES = ("off", "with", "against")
 
 
 def _check(key: str, value: Any) -> Any:
@@ -131,14 +136,17 @@ def _check(key: str, value: Any) -> Any:
         "max_growth_pct": lambda v: v is None or 0 <= v <= 500,
         "persist_steps": lambda v: 1 <= v <= 300,
         "trend_min_move_usd": lambda v: v >= 0,
+        "book_move_min": lambda v: 0 <= v < 1,
         "min_stake_pct": lambda v: 0 <= v <= 100,
         "risk_pct": lambda v: v is None or 0 < v <= 100,
         "min_tau_sec": lambda v: 0 <= v <= 900,
         "max_tau_sec": lambda v: 0 < v <= 900,
         "trend_lookback_sec": lambda v: 5 <= v <= 900,
+        "book_move_lookback_sec": lambda v: 5 <= v <= 900,
         "contracts": lambda v: v >= 1,
         "model_blend": lambda v: 0 <= v <= 1,
         "trend_mode": lambda v: v in _TREND_MODES,
+        "book_move_mode": lambda v: v in _BOOK_MOVE_MODES,
     }[key]
     if not ok(value):
         raise LabError(f"{key}: {value!r} is out of range")
@@ -308,6 +316,8 @@ def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
         min_price=params.min_price, max_price=params.max_price, persist_steps=params.persist_steps,
         min_p_side=params.min_p_side, trend_mode=params.trend_mode,
         trend_lookback_sec=params.trend_lookback_sec, trend_min_move_usd=params.trend_min_move_usd,
+        book_move_mode=params.book_move_mode, book_move_lookback_sec=params.book_move_lookback_sec,
+        book_move_min=params.book_move_min,
         account_usd=account.account_usd,
         min_stake_usd=account.account_usd * params.min_stake_pct / 100,
         risk_pct_per_trade=None if params.risk_pct is None else params.risk_pct / 100,
@@ -324,6 +334,21 @@ def evaluate(
         maker_fee_multiplier=maker_fee_multiplier, filters=_filters_for(params, account),
     )
     return _metrics(result, account.account_usd)
+
+
+def _evaluate_with_signature(
+    prepared: PreparedReplay, base: BotConfig, params: LabParams, account: AccountSettings, *,
+    queue: QueueAssumption, maker_fee_multiplier: Decimal,
+) -> tuple[Metrics, tuple[tuple[Any, ...], ...]]:
+    result = replay_prepared(
+        prepared, _config_for(base, params, account), queue_assumption=queue,
+        maker_fee_multiplier=maker_fee_multiplier, filters=_filters_for(params, account),
+    )
+    signature = tuple(
+        (t.ticker, t.side, t.size, t.entry_price, t.entry_ts, t.fee_paid, t.result, t.pnl_usd)
+        for t in result.trades
+    )
+    return _metrics(result, account.account_usd), signature
 
 
 # --------------------------------------------------------------------------- data
@@ -441,34 +466,36 @@ def run_lab(
             cache[key] = prepare_replay(data, base_config, tickers=tickers, model_blend=blend)
         return cache[key]
 
-    def run(params: LabParams, part: str) -> Metrics:
-        return evaluate(prepared_for(part, params.model_blend), base_config, params, account,
-                        queue=queue, maker_fee_multiplier=maker_fee_multiplier)
+    def run(params: LabParams, part: str) -> tuple[Metrics, tuple[tuple[Any, ...], ...]]:
+        return _evaluate_with_signature(
+            prepared_for(part, params.model_blend), base_config, params, account,
+            queue=queue, maker_fee_multiplier=maker_fee_multiplier,
+        )
 
     try:
-        baseline_train, baseline_test = run(base, "train"), run(base, "test")
+        baseline_train, _ = run(base, "train")
+        baseline_test, _ = run(base, "test")
     except BacktestError as exc:
         raise LabError(str(exc)) from None
 
-    scored: list[tuple[float, LabParams, Metrics]] = []
+    scored: list[tuple[float, LabParams, Metrics, tuple[tuple[Any, ...], ...]]] = []
     total = len(combos)
     for i, params in enumerate(combos, 1):
         if cancelled():
             raise LabError("cancelled")
         if progress is not None:
             progress(i - 1, total, params.describe(base))
-        m = run(params, "train")
+        m, signature = run(params, "train")
         if m.resolved >= min_train_trades and m.t_stat is not None:
-            scored.append((m.t_stat, params, m))
+            scored.append((m.t_stat, params, m, signature))
     if progress is not None:
         progress(total, total, "evaluating the top combinations on the test windows")
 
     scored.sort(key=lambda item: item[0], reverse=True)
     # Settings whose filters never bound make identical trades; show one row and count the rest.
     unique: list[tuple[float, LabParams, Metrics, int]] = []
-    index: dict[tuple[int, int, Decimal], int] = {}
-    for score, params, m in scored:
-        signature = (m.trades, m.wins, m.pnl)
+    index: dict[tuple[tuple[Any, ...], ...], int] = {}
+    for score, params, m, signature in scored:
         if signature in index:
             score0, p0, m0, n0 = unique[index[signature]]
             unique[index[signature]] = (score0, p0, m0, n0 + 1)
@@ -476,7 +503,7 @@ def run_lab(
             index[signature] = len(unique)
             unique.append((score, params, m, 0))
     rows = [
-        LabRow(rank=i, params=_jsonable(asdict(p)), description=p.describe(base), train=m, test=run(p, "test"),
+        LabRow(rank=i, params=_jsonable(asdict(p)), description=p.describe(base), train=m, test=run(p, "test")[0],
                equivalent=n)
         for i, (_, p, m, n) in enumerate(unique[:top_k], 1)
     ]
