@@ -87,6 +87,7 @@ def evaluate(rows: Sequence[dict], tickers: Sequence[str], predict: Predictor, p
         if r["ticker"] in want:
             by.setdefault(r["ticker"], []).append(r)
     pairs: list[tuple[float, bool]] = []
+    settled = 0
     pnls: list[float] = []
     wins = 0
     for rs in by.values():
@@ -94,13 +95,16 @@ def evaluate(rows: Sequence[dict], tickers: Sequence[str], predict: Predictor, p
         label = next((r["outcome_yes"] for r in rs if r["outcome_yes"] is not None), None)
         if label is None:
             continue  # unsettled: no outcome, no score, no trade
+        settled += 1
         entered = False
         for r in rs:
             p = predict(r)
             if p is None:
                 continue
+            if not (policy.min_tau_sec <= r["tau_sec"] <= policy.max_tau_sec):
+                continue  # Brier and entries only where a bot could act, not in the last seconds
             pairs.append((p, bool(label)))
-            if entered or not (policy.min_tau_sec <= r["tau_sec"] <= policy.max_tau_sec):
+            if entered:
                 continue
             for side, p_side, bid in (("yes", p, r["yes_bid"]), ("no", 1 - p, r["no_bid"])):
                 if bid is None or not (policy.min_price <= bid <= policy.max_price):
@@ -125,7 +129,7 @@ def evaluate(rows: Sequence[dict], tickers: Sequence[str], predict: Predictor, p
         verdict = "evidence consistent with an edge on held-out windows (optimistic fills); needs forward paper confirmation"
     else:
         verdict = "no evidence of an edge on held-out windows"
-    return Evaluation(len(by), len(pairs), brier, n, wins, None if n == 0 else wins / n, wilson(wins, n),
+    return Evaluation(settled, len(pairs), brier, n, wins, None if n == 0 else wins / n, wilson(wins, n),
                       sum(pnls), mean, t, verdict)
 
 
