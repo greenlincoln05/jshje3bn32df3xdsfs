@@ -35,7 +35,7 @@ from btcbot.backtest import BacktestReport, TradeRecord, build_report, init_trad
 from btcbot.config import SizingMode
 from btcbot.execution import PaperExecutionBackend
 from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictions_schema, log_prediction, predict
-from btcbot.models import Market, OrderBook
+from btcbot.models import Market, OrderBook, Side
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
 from btcbot.strategy import Action, Decision, decide, kelly_size, percent_size, ramp_next_size
@@ -74,6 +74,8 @@ class LivePaperTrader:
 
         self._current_ticker: str | None = None
         self._resting_order_id: str | None = None
+        self._resting_order_side: Side | None = None
+        self._resting_order_price: Decimal | None = None
         self._position: TradeRecord | None = None
         self._pending_settlements: dict[str, TradeRecord] = {}
 
@@ -138,6 +140,8 @@ class LivePaperTrader:
             self._apply_fill(market.ticker, fill, poll_ts, p_blend)
         if self._resting_order_id is not None and self._resting_order_filled():
             self._resting_order_id = None
+            self._resting_order_side = None
+            self._resting_order_price = None
 
         decision = decide(
             book=book,
@@ -158,6 +162,8 @@ class LivePaperTrader:
             has_position=self._position is not None,
             min_price=self._config.min_price,
             max_price=self._config.max_price,
+            resting_side=self._resting_order_side,
+            resting_price=self._resting_order_price,
         )
         if decision.action is Action.REST and decision.kelly_fraction is not None and self._config.sizing.mode is SizingMode.KELLY:
             size = kelly_size(
@@ -187,6 +193,8 @@ class LivePaperTrader:
                 order_id = await self._place_resting(decision, poll_ts)
                 if order_id is not None:  # None: the exchange rejected it, so nothing rests and no exposure is taken
                     self._resting_order_id = order_id
+                    self._resting_order_side = decision.side
+                    self._resting_order_price = decision.price
                     self._last_order_size = decision.size
                     self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
         elif decision.action is Action.CANCEL and self._resting_order_id is not None:
@@ -279,6 +287,8 @@ class LivePaperTrader:
         if unfilled > 0:
             self._risk.release_exposure(unfilled * order.price)
         self._resting_order_id = None
+        self._resting_order_side = None
+        self._resting_order_price = None
 
     async def _roll_over(self, poll_ts: datetime) -> None:
         if self._resting_order_id is not None:

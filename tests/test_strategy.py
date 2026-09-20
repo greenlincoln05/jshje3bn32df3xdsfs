@@ -46,6 +46,25 @@ class TestGuards:
         d = decide_with(has_resting_order=True, tau_sec=300, cancel_before_close_sec=20)
         assert d.action is Action.HOLD
 
+    def test_cancels_a_resting_order_when_its_edge_decays(self):
+        d = decide_with(
+            has_resting_order=True,
+            resting_side="yes",
+            resting_price=Decimal("0.50"),
+            p_yes=0.52,
+        )
+        assert d.action is Action.CANCEL
+        assert "edge" in d.reason
+
+    def test_holds_a_resting_order_when_its_current_edge_still_clears(self):
+        d = decide_with(
+            has_resting_order=True,
+            resting_side="yes",
+            resting_price=Decimal("0.50"),
+            p_yes=0.60,
+        )
+        assert d.action is Action.HOLD
+
     def test_cancels_a_resting_order_near_the_close(self):
         d = decide_with(has_resting_order=True, tau_sec=15, cancel_before_close_sec=20)
         assert d.action is Action.CANCEL
