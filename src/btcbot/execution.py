@@ -62,6 +62,11 @@ class PaperExecutionBackend:
         book, now = self._require_market()
         return self._broker.place_taker_order(side, size, book=book, ts=now)
 
+    async def place_exit_order(self, side: Side, size: Decimal) -> list[Fill]:
+        """Simulated immediate SELL of a held position (stop-loss exit) into ``side``'s own best bids."""
+        book, now = self._require_market()
+        return self._broker.place_exit_order(side, size, book=book, ts=now)
+
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationReport:
