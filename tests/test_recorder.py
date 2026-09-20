@@ -456,3 +456,14 @@ async def test_poll_cadence_includes_request_duration(tmp_path):
         assert datetime.fromisoformat(rows[1][0]) - datetime.fromisoformat(rows[0][0]) == timedelta(seconds=1)
     finally:
         recorder.close()
+
+
+class TestLogEvent:
+    async def test_log_event_writes_a_run_log_row(self, tmp_path):
+        recorder, _ = make_recorder(tmp_path, FakeKalshiSource(markets=[[]], orderbooks=[]))
+        try:
+            recorder.log_event("account_start", '{"kind": "paper", "account_usd": "500"}')
+        finally:
+            recorder.close()
+        got = [r for r in rows(tmp_path / "recorder.sqlite", "run_log") if r["event"] == "account_start"]
+        assert got and "500" in got[0]["detail"]

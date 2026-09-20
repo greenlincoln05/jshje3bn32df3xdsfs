@@ -227,7 +227,7 @@
   </section>
 
   <section id="tab-monitor">
-    <div class="pad" style="padding-bottom:0"><div class="section-title"><h2>Portfolio performance</h2><span class="badge" id="portfolio-source">Selected run</span></div><div class="toolbar"><label for="starting-balance">Reference capital $</label><input id="starting-balance" type="number" min="1" value="500" step="100" style="width:120px"><span class="sub">For growth calculations; not an exchange balance.</span><div class="grow"></div><label for="portfolio-range">Chart range</label><select id="portfolio-range"><option value="all">All recorded</option><option value="1">24 hours</option><option value="7">7 days</option><option value="30">30 days</option></select></div></div>
+    <div class="pad" style="padding-bottom:0"><div class="section-title"><h2>Portfolio performance</h2><span class="badge" id="portfolio-source">Selected run</span></div><div class="toolbar"><span class="sub" id="account-note">Starting account: loading...</span><div class="grow"></div><label for="portfolio-range">Chart range</label><select id="portfolio-range"><option value="all">All recorded</option><option value="1">24 hours</option><option value="7">7 days</option><option value="30">30 days</option></select></div></div>
     <div class="tiles" id="summary-tiles"></div>
     <div class="chartwrap"><div class="chart-label"><b>Reference equity · settled PnL after fees</b><span>Unresolved exposure excluded</span></div><canvas id="pnl-chart" height="240"></canvas><div class="chart-label"><b>Drawdown from peak</b><span id="equity-times"></span></div><canvas id="drawdown-chart" height="110"></canvas></div>
     <div class="pad"><div class="section-title"><h2>Trade history</h2><div class="toolbar"><input id="trade-search" placeholder="Filter by ticker or side" aria-label="Filter trades"><select id="trade-filter" aria-label="Trade outcome"><option value="all">All outcomes</option><option value="wins">Wins</option><option value="losses">Losses</option><option value="pending">Pending</option></select><button class="action" id="export-trades">Export CSV</button></div></div><div class="table-scroll"><table id="trades-table">
@@ -631,13 +631,14 @@ function drawPortfolio() {
   if(!portfolio)return;
   const s=portfolio, m=s.metrics || s;
   $("portfolio-source").textContent=sourceLabel(s.source);
-  $("summary-tiles").innerHTML=tiles([['Reference equity',money(m.equity_usd),'Reference capital + settled PnL'],['Net PnL',fmtUsd(m.total_pnl_usd),'After recorded fees'],['Growth',m.growth_pct==null?'--':num(m.growth_pct)+'%','Against reference capital'],['Max drawdown',fmtUsd(-Number(m.max_drawdown_usd)),'From the settled equity peak'],['Win rate',fmtPct(m.win_rate),`${m.wins||0} wins / ${m.losses||0} losses`],['Fees paid',money(m.total_fees_usd),'All recorded filled activity'],['Profit factor',m.profit_factor==null?'--':num(m.profit_factor),m.profit_factor_note||'Gross gains / gross losses'],['Open exposure',money(m.open_exposure_usd),'Recorded cost at risk']]);
+  $("account-note").textContent=m.starting_balance_usd==null?'Starting account: not recorded for this run':`Starting account ${money(m.starting_balance_usd)} · ${m.starting_balance_source||'recorded'}`;
+  $("summary-tiles").innerHTML=tiles([['Account value',money(m.equity_usd),'Starting account + settled PnL'],['Net PnL',fmtUsd(m.total_pnl_usd),'After recorded fees'],['Growth',m.growth_pct==null?'--':num(m.growth_pct)+'%','Against the starting account'],['Max drawdown',fmtUsd(-Number(m.max_drawdown_usd)),'From the settled equity peak'],['Win rate',fmtPct(m.win_rate),`${m.wins||0} wins / ${m.losses||0} losses`],['Fees paid',money(m.total_fees_usd),'All recorded filled activity'],['Profit factor',m.profit_factor==null?'--':num(m.profit_factor),m.profit_factor_note||'Gross gains / gross losses'],['Open exposure',money(m.open_exposure_usd),'Recorded cost at risk']]);
   let curve=[...(s.equity_curve||[])];
   if(curve.length&&s.first_entry_ts&&s.starting_balance_usd!=null)curve.unshift({ts:s.first_entry_ts,equity_usd:s.starting_balance_usd,drawdown_usd:0});
   const range=$("portfolio-range").value;
   const dateOf=p=>new Date(p.ts).getTime();
   if(range!=='all'&&curve.length){const last=dateOf(curve.at(-1)),cutoff=last-Number(range)*86400000;curve=curve.filter(p=>dateOf(p)>=cutoff);}
-  drawSeries($("pnl-chart"),curve.filter(p=>p.equity_usd!=null).map(p=>[dateOf(p),Number(p.equity_usd)]),{color:css('--green'),fill:true,step:true,yfmt:v=>'$'+num(v),empty:s.starting_balance_usd==null?'Enter reference capital to chart equity.':'No resolved trades with timestamps yet.'});
+  drawSeries($("pnl-chart"),curve.filter(p=>p.equity_usd!=null).map(p=>[dateOf(p),Number(p.equity_usd)]),{color:css('--green'),fill:true,step:true,yfmt:v=>'$'+num(v),empty:'No resolved trades with timestamps yet.'});
   drawSeries($("drawdown-chart"),curve.map(p=>[dateOf(p),-Number(p.drawdown_usd||0)]),{color:css('--red'),fill:true,step:true,max:0,yfmt:v=>'$'+num(v),empty:'Drawdown appears after resolved trades.'});
   $("equity-times").textContent=s.equity_time_basis==='entry_time_proxy'?'Entry-time proxy · settlement timestamps incomplete':'Chart range ends at last recorded settlement';
   $("monitor-note").textContent=(s.limitations||[]).join(' ')+` Showing latest ${s.trade_history?.length||0} of ${s.trade_count||0} recorded trades. Metrics cover this selected run; filters do not change totals.`;
@@ -666,12 +667,12 @@ function drawOrders() {
 async function refreshMonitor() { await refreshPortfolio(); }
 async function refreshPortfolio() {
   if(portfolioBusy)return;
-  const db=$("db-select").value,capital=$("starting-balance").value;
+  const db=$("db-select").value;
   if(!db){portfolio=null;$("monitor-note").textContent='Select a recording to view portfolio performance.';$("orders-note").textContent='Select a recording to view orders.';return;}
   portfolioBusy=true;
   try {
-    const response=await getJson(`/api/portfolio?db=${encodeURIComponent(db)}${capital?'&starting_balance='+encodeURIComponent(capital):''}`);
-    if(db!==$("db-select").value||capital!==$("starting-balance").value)return;
+    const response=await getJson(`/api/portfolio?db=${encodeURIComponent(db)}`);
+    if(db!==$("db-select").value)return;
     portfolio=response;portfolioDb=db;
     if(tab==='monitor')drawPortfolio(); if(tab==='orders')drawOrders();
   } catch(err){$(tab==='orders'?'orders-note':'monitor-note').textContent='Error: '+err.message;}
@@ -986,7 +987,6 @@ function clearMarket() {
   $('quote-rtt').textContent='--';$('quote-p95').textContent='--';$('bid-depth').textContent='Bid depth --';$('ask-depth').textContent='Ask depth --';$('imbalance-fill').style.width='50%';
 }
 ['book-levels','book-group','impact-size'].forEach(id=>$(id).addEventListener('input',renderBook));
-$("starting-balance").addEventListener('change',refreshPortfolio);
 $("portfolio-range").addEventListener('change',drawPortfolio);
 $("trade-search").addEventListener('input',renderTrades);$("trade-filter").addEventListener('change',renderTrades);
 $("bt-compare").addEventListener('click',()=>{$("queue-select").value='both';$("fee-input").value='both';});
