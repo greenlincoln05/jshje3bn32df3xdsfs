@@ -70,7 +70,7 @@ def compare(demo_db: str | Path, prod_db: str | Path) -> dict:
             "demo_spread": d[t]["spread"], "prod_spread": p[t]["spread"],
             "demo_depth": d[t]["depth"], "prod_depth": p[t]["depth"],
             "median_abs_mid_gap": _med(gaps), "demo_trades": len(dt.get(t, [])), "prod_trades": len(pt.get(t, [])),
-            "demo_pnl": pnl(dt.get(t)), "prod_pnl": pnl(pt.get(t)), "outcome_yes": p[t]["outcome"] if p[t]["outcome"] is not None else d[t]["outcome"],
+            "demo_pnl": pnl(dt.get(t, [])), "prod_pnl": pnl(pt.get(t, [])), "outcome_yes": p[t]["outcome"] if p[t]["outcome"] is not None else d[t]["outcome"],
         })
     return {"windows": rows, "median_abs_mid_gap": _med(diffs), "n_windows": len(common)}
 
