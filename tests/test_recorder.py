@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -191,6 +192,54 @@ class TestRolloverGap:
 
         gap_logs = [r for r in rows(tmp_path / "recorder.sqlite", "run_log") if r["event"] == "rollover_gap"]
         assert gap_logs == []  # never having seen a market yet is not itself a logged transition
+
+
+class _RaceOrderbookClient(FakeKalshiSource):
+    """The market is still open when discovery runs, but closes during the orderbook fetch itself -- the
+    exact race ``expired_book`` exists to catch, timed by advancing the shared clock as if the fetch took
+    real time. Records the clock reading at each discovery call so a test can check the poll cadence was
+    respected even on the one iteration that discarded the book."""
+
+    def __init__(self, *, markets, orderbook, clock, fetch_delay_sec, market_detail=None):
+        super().__init__(markets=markets, orderbooks=[orderbook], market_detail=market_detail)
+        self._clock = clock
+        self._fetch_delay_sec = fetch_delay_sec
+        self.discovery_times: list[datetime] = []
+
+    async def list_markets(self, *, series_ticker, status=None):
+        self.discovery_times.append(self._clock.now)
+        return await super().list_markets(series_ticker=series_ticker, status=status)
+
+    async def get_orderbook(self, ticker, *, depth=0):
+        await self._clock.sleep(self._fetch_delay_sec)
+        return await super().get_orderbook(ticker, depth=depth)
+
+
+class TestPostCloseBookDiscard:
+    async def test_a_discarded_post_close_book_still_respects_the_poll_interval(self, tmp_path):
+        # If this branch skipped its cooldown sleep, the very next iteration's discovery call would fire
+        # immediately after the orderbook fetch that just discarded a book, instead of waiting out the rest
+        # of the poll interval -- breaking the module's own documented "at most 2 req/s average" budget
+        # right at the recurring 15-minute rollover boundary this race happens at.
+        clock = FakeClock()
+        market = replace(make_market("KXBTC15M-26SEP190015-15"), close_time=T0 + timedelta(seconds=2))
+        client = _RaceOrderbookClient(
+            markets=[[market]], orderbook=make_orderbook(market.ticker), clock=clock, fetch_delay_sec=3.0,
+            market_detail={market.ticker: [market]},  # never finalized: settlement checks just no-op
+        )
+        recorder, _ = make_recorder(tmp_path, client, clock=clock, poll_interval_sec=1.0)
+        try:
+            summary = await asyncio.wait_for(recorder.run(duration_sec=8.0), timeout=5.0)
+        finally:
+            recorder.close()
+
+        assert summary.stop_reason == "time_limit"
+        assert summary.orderbook_polls == 0  # the only book fetched was discarded as post-close
+        assert len(client.discovery_times) >= 2
+        # Discovery #1 ran at T0; the orderbook fetch that followed took 3s (closing the market mid-fetch).
+        # Discovery #2 must not fire before that 3s plus a full poll interval (4s total) has passed.
+        gap = client.discovery_times[1] - client.discovery_times[0]
+        assert gap >= timedelta(seconds=4.0)
 
 
 class TestSettlement:

@@ -15,6 +15,7 @@ from btcbot.demo_trader import DemoTrader, render_demo_report
 from btcbot.kalshi_client import KalshiAPIError, KalshiConnectionError, KalshiWriteNotAllowedError
 from btcbot.models import ParseError
 from btcbot.spot_feed import SpotBuffer
+from btcbot.strategy import Action, Decision
 
 SIZES = [15, 14, 13, 12, 11, 10, 14, 0]  # the YES bid queue shrinks then refills: the paper shadow fills partway
 
@@ -143,6 +144,18 @@ class TestWhenTheExchangeDisagreesWithTheSimulation:
         assert trader._shadow_order_id is None  # the paper twin was cancelled too, so it cannot fill on its own
         assert trader.trades == [] and trader._position is None
 
+    async def test_the_clients_own_local_precondition_check_is_handled_like_any_other_rejection(self):
+        # create_order() raises plain ValueError for its own local checks (count <= 0, price outside (0, 1))
+        # rather than a KalshiError -- the strategy should never trigger this, but it must not crash the run.
+        trader, buffer, client, conn = make_trader()
+        client.create_error = ValueError("count must be positive")
+        await drive(trader, buffer, client)
+
+        assert trader._resting_order_id is None
+        assert trader.risk.open_exposure_usd == Decimal(0)
+        assert trader.stats.orders_rejected >= 1 and trader.stats.orders_placed == 0
+        assert trader._shadow_order_id is None
+
     async def test_an_unreadable_acknowledgement_cancels_whatever_may_be_resting(self):
         trader, buffer, client, conn = make_trader()
         client.create_error = ParseError("create-order response payload has no 'order_id' field")
@@ -172,6 +185,50 @@ class TestWhenTheExchangeDisagreesWithTheSimulation:
         assert trader.risk.open_exposure_usd == Decimal("1.5")  # 5 contracts at 0.30
         await trader._cancel_resting()
         assert trader.risk.open_exposure_usd == Decimal(0)
+
+    async def test_a_fill_that_lands_between_the_last_poll_and_the_cancel_is_not_double_released(self):
+        # 5 ordered, 4 known filled as of the last regular poll; the 5th fills on the exchange in the gap
+        # before the cancel is sent, so this trader has not polled for it yet when _cancel_resting starts.
+        trader, buffer, client, _ = make_trader()
+        known = make_fill("t-1", "ord-1", price=Decimal("0.30"), count=Decimal(4), fill_id="f-1")
+        await drive(trader, buffer, client, real_fill=known, upto=3)
+        assert trader.risk.open_exposure_usd == Decimal("1.5")  # 5 contracts at 0.30 taken when the order was placed
+        assert trader._position.size == Decimal(4)
+        client.fills.append(make_fill("t-1", "ord-1", price=Decimal("0.30"), count=Decimal(1), fill_id="f-2"))
+
+        await trader._cancel_resting()
+
+        rec = trader._latest(TICKER)
+        assert rec.demo_filled == Decimal(5)  # the late fill was picked up before "unfilled" was computed
+        assert trader._position.size == Decimal(5)  # ...and folded into the position, not lost
+        # Nothing was actually unfilled, so cancel must release nothing yet -- only settlement releases a
+        # filled contract's exposure. A stale "remaining" would wrongly release 1 contract's worth here.
+        assert trader.risk.open_exposure_usd == Decimal("1.5")
+
+        await trader.on_settlement(make_market(TICKER, status="finalized", raw_extra={"result": "yes"}))
+        assert trader.risk.open_exposure_usd == Decimal(0)  # released exactly once, for exactly what was filled
+
+
+class TestFillAttribution:
+    async def test_a_late_fill_is_attributed_to_its_own_order_not_just_the_latest(self):
+        # Two orders can rest on the same ticker within one window (place, cancel, place again). A fill for
+        # the FIRST one that arrives only after the SECOND already exists must still be booked onto the
+        # first order's row, not silently misattributed to "whichever order is most recent".
+        trader, buffer, client, _ = make_trader()
+        trader._current_ticker = TICKER
+        trader._backend.sync_market(make_book(), T0)  # prime the shadow paper backend for _place_resting
+        decision = Decision(Action.REST, side="yes", price=Decimal("0.30"), size=Decimal(5))
+        order_a = await trader._place_resting(decision, T0)
+        order_b = await trader._place_resting(decision, T0 + timedelta(seconds=1))
+        assert order_a != order_b and len(trader._records[TICKER]) == 2
+
+        client.fills.append(make_fill("t-1", order_a, ticker=TICKER, price=Decimal("0.30"), count=Decimal(3), fill_id="f-a"))
+        await trader._poll_real(TICKER)
+
+        rec_a, rec_b = trader._records[TICKER]
+        assert rec_a.order_id == order_a and rec_b.order_id == order_b
+        assert rec_a.demo_filled == Decimal(3)
+        assert rec_b.demo_filled == Decimal(0)  # not misattributed to the most recently placed order
 
 
 class TestSettlementAndReport:

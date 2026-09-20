@@ -106,6 +106,9 @@ class Fill:
     fee: Decimal
     maker: bool
     ts: datetime
+    order_id: str | None = None  # the exchange order this fill belongs to, when the source can tell (see
+    # btcbot.demo_trader, which needs it to attribute a fill to the right order when more than one has
+    # rested on the same ticker in one window); paper fills have no such id and leave this None.
 
 
 @dataclass

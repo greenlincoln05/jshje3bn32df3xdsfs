@@ -145,7 +145,8 @@ class DemoExecutionBackend:
             # response itself reports what filled. ``average_fee_paid`` is read as per contract; the fidelity
             # report compares it with the fee formula, so a wrong reading shows up there.
             fee = (getattr(order, "average_fee_paid", None) or Decimal(0)) * acked
-            result = [Fill(side=side, price=price, size=acked, fee=fee, maker=False, ts=datetime.now(timezone.utc))]
+            result = [Fill(side=side, price=price, size=acked, fee=fee, maker=False,
+                           ts=datetime.now(timezone.utc), order_id=order.order_id)]
         return result
 
     async def poll_fills(self) -> list[Fill]:
@@ -174,4 +175,5 @@ class DemoExecutionBackend:
             fee=kalshi_fill.fee_usd,
             maker=not kalshi_fill.is_taker,
             ts=kalshi_fill.created_time,
+            order_id=kalshi_fill.order_id,
         )

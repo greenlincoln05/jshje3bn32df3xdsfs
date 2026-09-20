@@ -147,6 +147,20 @@ class DemoTrader(LivePaperTrader):
         records = self._records.get(ticker or "")
         return records[-1] if records else None
 
+    def _record_for_order(self, ticker: str | None, order_id: str | None) -> _OrderRecord | None:
+        """The record for the real order a fill actually belongs to, not just whichever order was placed
+        most recently: more than one order can rest on the same ticker within one window (place, cancel,
+        place again), and a fill for an earlier one can arrive late. Falls back to the latest record for an
+        order id this trader does not recognize (e.g. a fill attributed oddly by the exchange), matching the
+        old behavior in that case rather than dropping it."""
+        records = self._records.get(ticker or "")
+        if not records:
+            return None
+        for rec in reversed(records):
+            if rec.order_id == order_id:
+                return rec
+        return records[-1]
+
     def _event(self, ticker: str | None, event: str, detail: str) -> None:
         ts = self.last_ts or datetime.now(timezone.utc)
         log.warning("%s %s: %s", ticker, event, detail)
@@ -169,19 +183,17 @@ class DemoTrader(LivePaperTrader):
 
     async def _sync_fills(self, book: OrderBook, poll_ts: datetime) -> list[Fill]:
         shadow_fills = await super()._sync_fills(book, poll_ts)  # keeps the paper broker's queue model current
-        rec = self._latest(self._current_ticker)
-        if rec is not None:
+        shadow_rec = self._latest(self._current_ticker)
+        if shadow_rec is not None and shadow_fills:
             for fill in shadow_fills:
-                rec.paper_filled += fill.size
-                rec.paper_cost += fill.price * fill.size
-                rec.paper_fee += fill.fee
-                rec.paper_first_fill_ts = rec.paper_first_fill_ts or fill.ts
-        real_fills = await self._poll_real(self._current_ticker, rec)
-        if rec is not None and (shadow_fills or real_fills):
-            self._save(rec)
-        return real_fills
+                shadow_rec.paper_filled += fill.size
+                shadow_rec.paper_cost += fill.price * fill.size
+                shadow_rec.paper_fee += fill.fee
+                shadow_rec.paper_first_fill_ts = shadow_rec.paper_first_fill_ts or fill.ts
+            self._save(shadow_rec)
+        return await self._poll_real(self._current_ticker)
 
-    async def _poll_real(self, ticker: str | None, rec: _OrderRecord | None) -> list[Fill]:
+    async def _poll_real(self, ticker: str | None) -> list[Fill]:
         if ticker is None:
             return []
         try:
@@ -190,12 +202,19 @@ class DemoTrader(LivePaperTrader):
             self.stats.poll_failures += 1
             self._event(ticker, "fills_unavailable", str(exc))
             return []  # try again next snapshot; a fill is never lost, only late (poll_fills dedupes by fill id)
-        if rec is not None:
-            for fill in fills:
+        touched: dict[int, _OrderRecord] = {}
+        for fill in fills:
+            # Attributed by the real order id, not just "whichever order is latest": more than one order can
+            # rest on the same ticker within a window, and a fill for an earlier one can arrive late.
+            rec = self._record_for_order(ticker, fill.order_id)
+            if rec is not None:
                 rec.demo_filled += fill.size
                 rec.demo_cost += fill.price * fill.size
                 rec.demo_fee += fill.fee
                 rec.demo_first_fill_ts = rec.demo_first_fill_ts or fill.ts
+                touched[rec.row_id] = rec
+        for rec in touched.values():
+            self._save(rec)
         return fills
 
     def _resting_order_filled(self) -> bool:
@@ -207,19 +226,23 @@ class DemoTrader(LivePaperTrader):
         shadow_id = await super()._place_resting(decision, poll_ts)  # the same order, simulated, on the same book
         try:
             order_id = await self._backend_for(ticker).place_resting_order(decision.side, decision.price, decision.size)
-        except KalshiError as exc:
-            # Most often a post-only bid that would have crossed because the book moved since the snapshot.
-            self.stats.orders_rejected += 1
-            await self._backend.cancel_order(shadow_id)
-            self._event(ticker, "order_rejected", f"{decision.side} {decision.size}@{decision.price}: {exc}")
-            return None
         except ParseError as exc:
             # The exchange may have ACCEPTED the order while we could not read its id: never leave it resting
-            # untracked. Find whatever is resting on this market and cancel it.
+            # untracked. Find whatever is resting on this market and cancel it. (ParseError is a ValueError,
+            # so this must be checked before the broader clause below.)
             self.stats.orders_rejected += 1
             await self._backend.cancel_order(shadow_id)
             self._event(ticker, "order_ack_unreadable", f"{exc}; cancelling anything resting on {ticker}")
             await self._cancel_everything_resting(ticker)
+            return None
+        except (KalshiError, ValueError) as exc:
+            # Most often a post-only bid that would have crossed because the book moved since the snapshot.
+            # ValueError is create_order()'s own local precondition check (count <= 0, price outside (0, 1)):
+            # the strategy should never produce one, but a crash here would take down the whole run instead
+            # of being handled like any other rejection, so it is treated the same way.
+            self.stats.orders_rejected += 1
+            await self._backend.cancel_order(shadow_id)
+            self._event(ticker, "order_rejected", f"{decision.side} {decision.size}@{decision.price}: {exc}")
             return None
         self.stats.orders_placed += 1
         self._shadow_order_id = shadow_id
@@ -241,10 +264,21 @@ class DemoTrader(LivePaperTrader):
             self.stats.cancel_failures += 1
             self._event(ticker, "cancel_failed", f"could not clear resting orders: {exc}")
 
+    async def _catch_up_real_fills(self, ticker: str | None, poll_ts: datetime) -> None:
+        """Poll for fills the exchange has recorded but this trader has not yet applied, and fold them into the
+        position immediately. Used right before any exposure release that depends on "how much is still
+        unfilled", so that number is never computed from a stale ``rec.demo_filled`` (see ``_cancel_resting``:
+        a fill landing between the last regular poll and a cancel would otherwise be double-released -- once
+        as "unfilled" at cancel time, again from the position at settlement)."""
+        for fill in await self._poll_real(ticker):
+            self._apply_fill(ticker, fill, poll_ts, 0.5)
+
     async def _cancel_resting(self) -> None:
         ticker = self._current_ticker
-        rec = self._latest(ticker)
         real_id = self._resting_order_id
+        poll_ts = self.last_ts or datetime.now(timezone.utc)
+        await self._catch_up_real_fills(ticker, poll_ts)
+        rec = self._latest(ticker)
         remaining = Decimal(0) if rec is None else max(rec.size - rec.demo_filled, Decimal(0))
         try:
             await self._backend_for(ticker).cancel_order(real_id)
@@ -267,9 +301,9 @@ class DemoTrader(LivePaperTrader):
     async def _roll_over(self, poll_ts: datetime) -> None:
         if self._resting_order_id is not None:
             await self._cancel_resting()
-        # A cancel can race a fill: look once more at the window that just ended before its position is filed.
-        for fill in await self._poll_real(self._current_ticker, self._latest(self._current_ticker)):
-            self._apply_fill(self._current_ticker, fill, poll_ts, 0.5)
+        # A cancel can also race a fill during the cancel call itself: look once more before the window's
+        # position is filed away pending settlement.
+        await self._catch_up_real_fills(self._current_ticker, poll_ts)
         await super()._roll_over(poll_ts)
 
     async def on_settlement(self, market: Market) -> None:

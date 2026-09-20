@@ -427,6 +427,7 @@ class Recorder:
                         pending_settlement.add(market.ticker)
                         self._log("info", "expired_book", f"discarded post-close book for {market.ticker}")
                         await self._finalize_pending(pending_settlement, stats)
+                        await self._sleep(self._poll_interval_sec)
                         continue
                     self._record_orderbook(market.ticker, book, request_started=request_started, poll_ts=poll_ts)
                     stats.orderbook_polls += 1
