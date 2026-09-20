@@ -115,6 +115,30 @@ def test_validate_with_a_trained_model_prints_both_sections_and_a_comparison(tmp
     assert "Test-window pnl/contract" in out
 
 
+def test_a_model_trained_for_a_different_feature_schema_is_rejected(tmp_path, capsys):
+    from btcbot.cli import main
+    from btcbot.features import COLUMNS, write_csv
+    from btcbot.ml_model import LogisticModel, save_model
+
+    # A model whose feature_names don't overlap the feature-store CSV schema at all -- e.g. one trained on
+    # the tick-level ml_features.ENTRY_FEATURES schema instead (docs/research/ml-layers-handoff.md's
+    # "feature schemas" -- the same mismatch tests/test_lab.py guards against for run_ml_ablation).
+    wrong_schema = LogisticModel(("edge", "p_side", "price", "spread", "depth", "momentum_60s"), (1.0,) * 6, 0.0, (0.0,) * 6, (1.0,) * 6)
+    model_path = tmp_path / "wrong_schema.json"
+    save_model(wrong_schema, model_path)
+
+    r = [{c: None for c in COLUMNS} | x for x in rows(12, label=lambda w: w % 2)]
+    for x in r:
+        x["source"] = "s"
+    features_path = tmp_path / "f.csv"
+    write_csv(r, features_path)
+
+    exit_code = main(["validate", "--features", str(features_path), "--model", str(model_path)])
+
+    assert exit_code == 1
+    assert "different feature schema" in capsys.readouterr().err
+
+
 def test_bad_model_path_is_reported_cleanly(tmp_path, capsys):
     from btcbot.cli import main
     from btcbot.features import COLUMNS, write_csv

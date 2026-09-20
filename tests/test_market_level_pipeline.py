@@ -8,12 +8,15 @@ import pytest
 from btcbot.coinbase_history import Candle
 from btcbot.history_pipeline import MarketOutcome
 from btcbot.market_level_pipeline import (
+    MIN_TRAIN_EXAMPLES,
+    MIN_VALIDATE_EXAMPLES,
     MarketLevelError,
     adverse_exit_pnl,
     adverse_exit_price,
     market_level_examples,
     realized_vol_from_candles,
     split_markets_by_time,
+    train_and_validate_market_level,
 )
 from btcbot.model import ModelState, predict_p_yes
 from btcbot.paper_broker import taker_fee
@@ -136,3 +139,54 @@ class TestAdverseExit:
         exit_price = adverse_exit_price(state, c, "yes")
         assert pnl == (exit_price - entry_price) * size - taker_fee(size, exit_price)
         assert pnl < 0  # the worst-case low is well below the strike: this exit is a clear loss
+
+
+# ``predict_p_yes`` at the tau_sec=1.0 :func:`market_level_examples` always prices at is extremely sensitive
+# (strike_eff amplifies any spot/strike gap ~59x -- see btcbot.model's module docstring): a raw spot/strike
+# delta of even a few dollars saturates p_model to the 0.02/0.98 clamp, which is already "confident and
+# correct" and leaves nothing for a trained model to visibly improve on. This dataset instead derives its
+# parameters from the exact v1 formula (60*strike - 59*spot, then normal_cdf(log_ratio / sigma)) so that a
+# tiny, sub-dollar final-candle delta (0.5) against a realistic realized-vol sigma (~0.0004, from a small
+# +-0.155% oscillation in the preceding candles) lands p_model at a weakly-but-consistently-directional
+# ~0.83/~0.17 -- not saturated, not noise -- which a trained LogisticModel can then sharpen toward 0/1.
+def _market_level_dataset(n_markets):
+    strike = Decimal("80000")
+    oscillation = Decimal("0.00155")
+    final_delta = Decimal("0.5")
+    candles: list[Candle] = []
+    outcomes: list[MarketOutcome] = []
+    t = T0
+    for i in range(n_markets):
+        is_yes = i % 2 == 0
+        fd = final_delta if is_yes else -final_delta
+        for j in range(16):
+            if j < 15:
+                close = strike * (1 + oscillation) if j % 2 == 0 else strike * (1 - oscillation)
+            else:
+                close = strike + fd
+            candles.append(candle(t, close))
+            t += timedelta(minutes=1)
+        close_time = t - timedelta(minutes=1)  # the start of this market's own last candle
+        outcomes.append(outcome(f"T{i:03d}", close_time, "yes" if is_yes else "no", strike=str(strike)))
+    return outcomes, candles
+
+
+class TestTrainAndValidateMarketLevel:
+    def test_a_weakly_separated_but_consistent_signal_beats_the_raw_v1_baseline(self):
+        outcomes, candles = _market_level_dataset(80)
+
+        model, report = train_and_validate_market_level(outcomes, candles)
+
+        assert report.markets_train == 56 and report.markets_validate == 23  # 0.7 split, embargo of 1
+        assert report.train_examples >= MIN_TRAIN_EXAMPLES
+        assert report.validate_examples >= MIN_VALIDATE_EXAMPLES
+        assert 0.0 <= report.train_brier <= 1.0 and 0.0 <= report.validate_brier <= 1.0
+        assert report.validate_brier < report.baseline_validate_brier
+        assert report.beats_baseline is True
+        assert set(model.feature_names) == {"p_model", "sigma"}
+
+    def test_too_few_markets_is_an_error(self):
+        outcomes, candles = _market_level_dataset(4)
+
+        with pytest.raises(MarketLevelError, match="at least 6"):
+            train_and_validate_market_level(outcomes, candles)

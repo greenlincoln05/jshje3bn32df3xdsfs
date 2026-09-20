@@ -531,6 +531,14 @@ class TestMlTrainEndToEnd:
         assert exit_code == 2
         assert "--db" in capsys.readouterr().err
 
+    def test_rejects_all_three_sources(self, tmp_path, capsys):
+        exit_code = cli.main([
+            "ml-train", "--db", "whatever.sqlite", "--features", "whatever.csv", "--history", "whatever2.sqlite",
+            "--which", "entry", "--out", str(tmp_path / "m.json"),
+        ])
+        assert exit_code == 2
+        assert "--db" in capsys.readouterr().err
+
     def test_db_mode_requires_which(self, tmp_path, capsys):
         exit_code = cli.main(["ml-train", "--db", "whatever.sqlite", "--out", str(tmp_path / "m.json")])
         assert exit_code == 2
@@ -551,6 +559,52 @@ class TestMlTrainEndToEnd:
         out = capsys.readouterr().out
         assert "beats baseline: YES" in out
         assert "not a profitability claim" in out
+
+
+def make_history_db(tmp_path, n_markets=80):
+    from btcbot.history_pipeline import init_history_schema, save_candles, save_market_outcomes
+    from test_market_level_pipeline import _market_level_dataset
+
+    outcomes, candles = _market_level_dataset(n_markets)
+    db_path = tmp_path / "history.sqlite"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        init_history_schema(conn)
+        save_market_outcomes(conn, outcomes)  # MarketOutcome has the same fields this reads off Market
+        save_candles(conn, candles)
+    finally:
+        conn.close()
+    return db_path
+
+
+class TestMlTrainHistoryEndToEnd:
+    def test_reports_a_missing_database(self, tmp_path, capsys):
+        exit_code = cli.main([
+            "ml-train", "--history", str(tmp_path / "nope.sqlite"), "--out", str(tmp_path / "m.json"),
+        ])
+        assert exit_code == 1
+        assert "no such database" in capsys.readouterr().err
+
+    def test_trains_a_market_level_model_and_reports_the_schema_caveat(self, tmp_path, capsys):
+        db_path = make_history_db(tmp_path)
+        out_path = tmp_path / "market_level.json"
+
+        exit_code = cli.main(["ml-train", "--history", str(db_path), "--out", str(out_path)])
+
+        assert exit_code == 0
+        assert out_path.is_file()
+        out = capsys.readouterr().out
+        assert "beats baseline: YES" in out
+        assert "NOT compatible with `btcbot ml-ablation` or `btcbot validate --model`" in out
+        assert "calibration measure only" in out
+
+    def test_too_few_markets_is_reported_cleanly(self, tmp_path, capsys):
+        db_path = make_history_db(tmp_path, n_markets=4)
+
+        exit_code = cli.main(["ml-train", "--history", str(db_path), "--out", str(tmp_path / "m.json")])
+
+        assert exit_code == 1
+        assert "error:" in capsys.readouterr().err
 
 
 class TestMlAblationEndToEnd:

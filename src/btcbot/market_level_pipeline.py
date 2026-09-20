@@ -19,15 +19,19 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from btcbot.coinbase_history import Candle
 from btcbot.history_pipeline import MarketOutcome
+from btcbot.ml_model import LogisticModel, brier_score, fit
 from btcbot.model import ModelState, predict_p_yes
 from btcbot.paper_broker import taker_fee
 
 MIN_MARKETS = 6
+MIN_TRAIN_EXAMPLES = 20
+MIN_VALIDATE_EXAMPLES = 5
+MARKET_LEVEL_FEATURES = ("p_model", "sigma")
 
 
 class MarketLevelError(Exception):
@@ -117,3 +121,67 @@ def adverse_exit_pnl(entry_price: Decimal, size: Decimal, state: ModelState, can
     sanity number over this dataset (see the module docstring: not a claim, not a replay)."""
     exit_price = adverse_exit_price(state, candle, side)
     return (exit_price - entry_price) * size - taker_fee(size, exit_price)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketLevelTrainingReport:
+    markets_train: int
+    markets_validate: int
+    train_examples: int
+    validate_examples: int
+    train_brier: float
+    validate_brier: float
+    baseline_validate_brier: float  # the v1 model's own p_model, UNCHANGED, on the same validate markets
+    beats_baseline: bool
+
+
+def train_and_validate_market_level(
+    outcomes: Sequence[MarketOutcome],
+    candles: Sequence[Candle],
+    *,
+    train_fraction: float = 0.7,
+    embargo: int = 1,
+    vol_window: int = 15,
+    epochs: int = 300,
+    learning_rate: float = 0.3,
+    l2: float = 0.001,
+) -> tuple[LogisticModel, MarketLevelTrainingReport]:
+    """Trains a calibration-correction model on this coarse, candle-only dataset and validates it on later
+    markets it never trained on (:func:`split_markets_by_time`'s time-ordered, embargoed split) -- the same
+    ``beats_baseline`` discipline :func:`btcbot.ml_pipeline.train_and_validate_from_features` applies to the
+    richer feature-store path, completing it for all three feature schemas
+    (docs/research/ml-layers-handoff.md's "Review" section). The baseline here is the v1 model's own
+    ``p_model``, UNCHANGED, scored on the exact same held-out markets: since ``p_model`` is one of this
+    model's own two features, ``beats_baseline`` answers "does correcting the v1 formula with sigma actually
+    help, or is the raw formula already as good." A calibration measure, never a PnL or profitability claim
+    -- there is no recorded book price this far back to simulate a trade against at all.
+    """
+    train_tickers, validate_tickers, _ = split_markets_by_time(outcomes, train_fraction, embargo=embargo)
+    train_outcomes = [o for o in outcomes if o.ticker in train_tickers]
+    validate_outcomes = [o for o in outcomes if o.ticker in validate_tickers]
+
+    train_examples = market_level_examples(train_outcomes, candles, vol_window=vol_window)
+    validate_examples = market_level_examples(validate_outcomes, candles, vol_window=vol_window)
+    if len(train_examples) < MIN_TRAIN_EXAMPLES:
+        raise MarketLevelError(f"only {len(train_examples)} usable train markets; need at least {MIN_TRAIN_EXAMPLES}")
+    if len(validate_examples) < MIN_VALIDATE_EXAMPLES:
+        raise MarketLevelError(f"only {len(validate_examples)} usable validate markets; need at least {MIN_VALIDATE_EXAMPLES}")
+
+    train_rows = [r for r, _ in train_examples]
+    train_labels = [y for _, y in train_examples]
+    model = fit(train_rows, train_labels, MARKET_LEVEL_FEATURES, epochs=epochs, learning_rate=learning_rate, l2=l2)
+
+    validate_rows = [r for r, _ in validate_examples]
+    validate_labels = [y for _, y in validate_examples]
+    validate_brier = brier_score(model, validate_rows, validate_labels)
+    baseline_brier = sum(
+        (row["p_model"] - (1.0 if label else 0.0)) ** 2 for row, label in zip(validate_rows, validate_labels)
+    ) / len(validate_rows)
+
+    report = MarketLevelTrainingReport(
+        markets_train=len(train_tickers), markets_validate=len(validate_tickers),
+        train_examples=len(train_examples), validate_examples=len(validate_examples),
+        train_brier=brier_score(model, train_rows, train_labels), validate_brier=validate_brier,
+        baseline_validate_brier=baseline_brier, beats_baseline=validate_brier < baseline_brier,
+    )
+    return model, report
