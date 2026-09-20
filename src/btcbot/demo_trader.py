@@ -14,7 +14,7 @@ What this can and cannot tell you (also printed with every report):
 
 * Kalshi's demo book is thin and largely synthetic, so fill behavior here is NOT prod fill behavior. It
   validates plumbing and the fee formula; it does not measure a real edge.
-* There is no smart routing: resting bids are ``post_only`` joins of the best bid, so "routing" here means
+* There is no smart routing: resting bids are ``post_only`` joins of the best bid (``btcbot demo --plumbing`` bids up to a few cents inside the spread instead), so "routing" here means
   the order type and the exchange's response to it.
 
 Hard limits, none of which this module can relax: :class:`btcbot.kalshi_client.KalshiClient` refuses to sign an

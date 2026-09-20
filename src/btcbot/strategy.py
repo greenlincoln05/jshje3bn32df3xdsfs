@@ -285,6 +285,8 @@ def decide(
             ask = book.best_ask(side)
             if ask is not None:
                 price = max(price, min(price + Decimal("0.01") * bid_improve_ticks, ask.price - Decimal("0.01")))
+            if max_price is not None:
+                price = min(price, max(bid.price, max_price))  # the improved price must still respect the price band
         p_side = p_yes if side == "yes" else (1.0 - p_yes)
         expected_fee = float(maker_fee(Decimal(1), price, multiplier=maker_fee_multiplier))
         edge = p_side - float(price) - expected_fee

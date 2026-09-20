@@ -1021,6 +1021,8 @@ async def _cmd_backtest(args: argparse.Namespace) -> int:
 
 async def _cmd_paper(args: argparse.Namespace) -> int:
     config = load_config(args.config)
+    if config.bid_improve_ticks:
+        raise ConfigError("bid_improve_ticks is demo-plumbing only (btcbot demo --plumbing); it must be 0 for paper trading")
     series_ticker = args.series or config.series_ticker
     env = KalshiEnv(args.env) if args.env else KalshiSettings().env
     data_dir = Path(args.data_dir)

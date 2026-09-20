@@ -41,3 +41,16 @@ def test_the_flag_is_demo_only_and_defaults_off():
     import pytest
     with pytest.raises(SystemExit):
         main(["paper", "--plumbing"])          # not a paper/prod option
+
+
+def test_the_improved_price_respects_the_price_band():
+    d = go(bid_improve_ticks=20, max_price=D("0.42"))
+    assert d.price == D("0.42")
+
+
+def test_paper_refuses_a_config_with_bid_improvement(tmp_path, capsys):
+    from btcbot.cli import main
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("bid_improve_ticks: 3\n")
+    assert main(["--config", str(cfg), "paper", "--hours", "0.001", "--data-dir", str(tmp_path)]) != 0
+    assert "demo-plumbing only" in capsys.readouterr().err
