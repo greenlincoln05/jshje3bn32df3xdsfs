@@ -25,8 +25,8 @@ guessed at as a loss.
 
 from __future__ import annotations
 
+import json
 import logging
-
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -105,6 +105,17 @@ class LivePaperTrader:
         self.first_ts: datetime | None = None
         self.last_ts: datetime | None = None
         self._tickers_seen: set[str] = set()
+        # A tiny monitor snapshot makes resting paper orders and held fills visible
+        # before settlement. DemoTrader has its own authoritative local ledger.
+        self._monitor_enabled = type(self) is LivePaperTrader
+        self._last_monitor_payload: str | None = None
+        self._last_monitor_ts: datetime | None = None
+        if self._monitor_enabled:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_runtime "
+                "(id INTEGER PRIMARY KEY CHECK(id=1), updated_ts TEXT NOT NULL, state_json TEXT NOT NULL)"
+            )
+            self._persist_monitor(datetime.now(timezone.utc), stopped=False)
 
     @property
     def risk(self) -> RiskManager:
@@ -123,6 +134,12 @@ class LivePaperTrader:
         self._vol.update(price, ts)
 
     async def on_orderbook_snapshot(self, market: Market, book: OrderBook, poll_ts: datetime) -> None:
+        try:
+            await self._process_orderbook_snapshot(market, book, poll_ts)
+        finally:
+            self._persist_monitor(poll_ts)
+
+    async def _process_orderbook_snapshot(self, market: Market, book: OrderBook, poll_ts: datetime) -> None:
         self.first_ts = self.first_ts or poll_ts
         self.last_ts = poll_ts
         self._tickers_seen.add(market.ticker)
@@ -225,6 +242,12 @@ class LivePaperTrader:
             await self._exit_position(decision, poll_ts)
 
     async def on_settlement(self, market: Market) -> None:
+        try:
+            await self._process_settlement(market)
+        finally:
+            self._persist_monitor(datetime.now(timezone.utc))
+
+    async def _process_settlement(self, market: Market) -> None:
         result = market.raw.get("result") or None
         pending = self._pending_settlements.get(market.ticker)
         if pending is None:
@@ -258,6 +281,45 @@ class LivePaperTrader:
             self.trades.append(pending)
             log_trade(self._conn, pending)
         self._pending_settlements.clear()
+        self._persist_monitor(ts, stopped=True)
+
+    def _persist_monitor(self, ts: datetime, *, stopped: bool = False) -> None:
+        """Persist monitoring state only; never affect order or risk decisions."""
+        if not self._monitor_enabled:
+            return
+        orders = []
+        if self._resting_order_id is not None:
+            order = self._broker.get_order(self._resting_order_id)
+            if not order.is_done:
+                orders.append({
+                    "order_id": order.order_id, "ticker": self._current_ticker,
+                    "side": order.side, "price": str(order.price), "size": str(order.size),
+                    "filled_size": str(order.filled_size), "remaining_size": str(order.remaining_size),
+                    "placed_ts": order.placed_at.isoformat(), "queue_ahead": str(order.queue_ahead),
+                    "state": order.status, "state_label": "Simulated partial fill" if order.filled_size else "Simulated resting",
+                    "remaining_notional_usd": str(order.remaining_size * order.price),
+                    "exchange_status": "not_applicable",
+                })
+        positions = list(self._pending_settlements.values()) + ([self._position] if self._position else [])
+        payload = {"stopped": stopped, "active_orders": orders, "open_positions": [
+            {"ticker": p.ticker, "side": p.side, "size": str(p.size), "entry_price": str(p.entry_price),
+             "entry_ts": p.entry_ts.isoformat(), "fee_paid": str(p.fee_paid),
+             "cost_usd": str(p.entry_price * p.size), "pnl_usd": None, "result": None,
+             "state": "simulated_awaiting_resolution", "source": "paper_runtime"} for p in positions
+        ]}
+        encoded = json.dumps(payload)
+        if (encoded == self._last_monitor_payload and self._last_monitor_ts is not None
+                and 0 <= (ts - self._last_monitor_ts).total_seconds() < 1):
+            return
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO paper_runtime (id,updated_ts,state_json) VALUES (1,?,?)",
+                (ts.isoformat(), encoded),
+            )
+            self._conn.commit()
+            self._last_monitor_payload, self._last_monitor_ts = encoded, ts
+        except sqlite3.Error:
+            logging.getLogger(__name__).warning("Paper monitoring snapshot unavailable", exc_info=True)
 
     def report(self) -> BacktestReport:
         return build_report(

@@ -262,17 +262,21 @@ Top of book (dollars per contract; asks are implied from opposite-side bids):
 
 ## Dashboard (local web UI)
 
+The [trading terminal guide](docs/dashboard-terminal.md) covers depth, the millisecond display, portfolio accounting, active order snapshots, and background backtests.
+
 `btcbot dashboard` is a monitoring tool, not one of the numbered build phases: a small local web server
 (stdlib `http.server`, no new dependency) that reads what `record`/`paper`/`backtest` already produce.
 
 - **Binds to `127.0.0.1` only** (`--port`, default 8765) -- never reachable from another machine.
-- **Live / Paper monitor** tab: picks a `--data-dir` (default `./data`) database and shows trade count, win
-  rate, total PnL, unresolved count, a cumulative-PnL chart, and a trades table, refreshing every few
-  seconds. This reads a new `trades` table `btcbot paper` now writes to as trades resolve (in addition to
-  keeping them in memory for its own end-of-run report), so a `paper` run can be watched live from a second
-  process while it's still going, the same way `calibrate` already reads its `predictions` table mid-run.
-- **Backtest** tab: runs `btcbot backtest`'s replay against a chosen database and queue/fee combination on
-  demand and renders the report, instead of using the CLI.
+- **Overview**: full YES/NO depth, price grouping, cumulative liquidity, local quote timing, a millisecond
+  clock/countdown, and bounded charts for the selected market window.
+- **Portfolio**: settled PnL, reference equity/growth, drawdown, fees, profit factor, exposure, searchable
+  trade history, and CSV export. Select the recording directory with `--data-dir` (default `./data`).
+- **Active orders**: local demo order state or updated paper-trader snapshots, including partial fills
+  and positions awaiting resolution. Existing paper processes need a restart with this version to persist
+  their active state. These are recorded states, not a live exchange order-status service.
+- **Backtest**: runs the same offline replay in a bounded background job, with scenario progress and
+  queue/fee sensitivity comparisons while the dashboard stays usable.
 - **Settings** tab: reads and writes the same local `--env-file` (default `./.env`) every other command
   already reads via `KALSHI_ENV` / `KALSHI_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` -- a nicer editor for the file
   `docs/running-live.md` already tells you to edit by hand, nothing more. It never sends a key anywhere

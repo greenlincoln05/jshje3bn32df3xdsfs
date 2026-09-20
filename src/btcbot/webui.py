@@ -34,6 +34,9 @@ from urllib.parse import parse_qs, urlparse
 
 from btcbot.backtest import BacktestError, load_trades, run_backtest
 from btcbot.config import ConfigError, load_config
+from btcbot.dashboard_analytics import portfolio_view
+from btcbot.dashboard_jobs import BacktestJobs, BacktestQueueFull
+from btcbot.dashboard_market import market_quote, market_view
 from btcbot.lab import (
     DEFAULT_GRID, TUNABLE, AccountSettings, LabError, LabParams, expand_grid, load_lab_data, parse_values, run_lab,
 )
@@ -199,99 +202,6 @@ def paper_summary(db_path: Path) -> dict[str, Any]:
         "last_ts": span[1] if span else None,
         "cumulative_pnl": cumulative,
         "trades": [asdict(t) for t in reversed(trades)],  # newest first for the table
-    }
-
-
-def _downsample(rows: list[Any], limit: int) -> list[Any]:
-    if len(rows) <= limit:
-        return rows
-    step = len(rows) / limit
-    return [rows[int(i * step)] for i in range(limit)] + [rows[-1]]
-
-
-def market_quote(db_path: Path, ticker: str) -> dict[str, Any]:
-    """Small read-only snapshot for fast rendering; never scans chart/trade history."""
-    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1)
-    try:
-        book = conn.execute(
-            "SELECT poll_ts, book_json, latency_ms FROM orderbook_snapshots "
-            "WHERE ticker=? ORDER BY poll_ts DESC LIMIT 1", (ticker,),
-        ).fetchone()
-        meta = conn.execute(
-            "SELECT open_time, close_time FROM market_state WHERE ticker=? ORDER BY poll_ts DESC LIMIT 1",
-            (ticker,),
-        ).fetchone()
-        spot = conn.execute(
-            "SELECT price, receive_ts FROM spot_ticks WHERE receive_ts>=? AND receive_ts<=? "
-            "ORDER BY receive_ts DESC LIMIT 1", meta,
-        ).fetchone() if meta else None
-        return {"ticker": ticker, "book": json.loads(book[1]) if book else {"yes": [], "no": []},
-                "book_ts": book[0] if book else None, "book_latency_ms": book[2] if book else None,
-                "spot": spot[0] if spot else None, "spot_ts": spot[1] if spot else None}
-    finally:
-        conn.close()
-
-
-def market_view(db_path: Path, ticker: str | None = None) -> dict[str, Any]:
-    """Everything the Market tab draws for one window of a recorder/paper database: market metadata, the
-    latest order book, spot and YES-mid history, and this window's paper trades. Read-only."""
-    conn = sqlite3.connect(str(db_path))
-    try:
-        try:
-            tickers = [r[0] for r in conn.execute(
-                "SELECT ticker FROM orderbook_snapshots GROUP BY ticker ORDER BY MAX(id) DESC LIMIT 50")]
-        except sqlite3.OperationalError:
-            return {"tickers": [], "ticker": None}
-        if not tickers:
-            return {"tickers": [], "ticker": None}
-        if ticker is None or ticker not in tickers:
-            ticker = tickers[0]
-        meta = conn.execute(
-            "SELECT status, strike, open_time, close_time, volume, open_interest FROM market_state "
-            "WHERE ticker=? ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
-        book_row = conn.execute(
-            "SELECT poll_ts, book_json, latency_ms FROM orderbook_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
-            (ticker,)).fetchone()
-        book = json.loads(book_row[1]) if book_row else {"yes": [], "no": []}
-        mids = conn.execute(
-            "SELECT poll_ts, yes_bid_price, yes_ask_price FROM orderbook_snapshots WHERE ticker=? ORDER BY id",
-            (ticker,)).fetchall()
-        first_ts = mids[0][0] if mids else None
-        spot = conn.execute(
-            "SELECT receive_ts, price FROM spot_ticks WHERE receive_ts>=? AND receive_ts<=? ORDER BY receive_ts",
-            (first_ts or "", meta[3] if meta else book_row[0])).fetchall() if first_ts else []
-        latest_spot = conn.execute(
-            "SELECT price, receive_ts FROM spot_ticks WHERE receive_ts>=? AND receive_ts<=? "
-            "ORDER BY receive_ts DESC LIMIT 1",
-            (first_ts or "", meta[3] if meta else book_row[0]),
-        ).fetchone()
-        settlement = conn.execute(
-            "SELECT result, settled_avg FROM settlements WHERE ticker=?", (ticker,)).fetchone()
-        all_trades = _safe_trades(conn)
-        trades = [asdict(t) for t in reversed(all_trades) if t.ticker == ticker]
-        closes = dict(conn.execute("SELECT ticker, MAX(close_time) FROM market_state GROUP BY ticker"))
-        results = dict(conn.execute("SELECT ticker, result FROM settlements"))
-        trade_counts: dict[str, int] = {}
-        for t in all_trades:
-            trade_counts[t.ticker] = trade_counts.get(t.ticker, 0) + 1
-        windows = [
-            {"ticker": tk, "close_time": closes.get(tk), "result": results.get(tk), "trades": trade_counts.get(tk, 0)}
-            for tk in tickers
-        ]
-    finally:
-        conn.close()
-    return {
-        "tickers": tickers, "windows": windows, "ticker": ticker,
-        "status": meta[0] if meta else None, "strike": meta[1] if meta else None,
-        "open_time": meta[2] if meta else None, "close_time": meta[3] if meta else None,
-        "volume": meta[4] if meta else None, "open_interest": meta[5] if meta else None,
-        "book": book, "book_ts": book_row[0] if book_row else None,
-        "book_latency_ms": book_row[2] if book_row else None,
-        "mid_series": _downsample([[r[0], r[1], r[2]] for r in mids], 400),
-        "spot_series": _downsample([[r[0], r[1]] for r in spot], 400),
-        "spot": latest_spot[0] if latest_spot else None, "spot_ts": latest_spot[1] if latest_spot else None,
-        "settlement": {"result": settlement[0], "settled_avg": settlement[1]} if settlement else None,
-        "trades": trades,
     }
 
 
@@ -504,6 +414,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -533,6 +444,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"databases": list_databases(self.server.data_dir)})
             elif parsed.path == "/api/paper_summary":
                 self._send_json(200, self._paper_summary(query))
+            elif parsed.path == "/api/portfolio":
+                try:
+                    result = portfolio_view(self._require_db(query), query.get("starting_balance"))
+                except (ValueError, ArithmeticError, sqlite3.Error) as exc:
+                    raise _ApiError(400, f"portfolio error: {exc}") from exc
+                self._send_json(200, result)
             elif parsed.path == "/api/quote":
                 self._send_json(200, market_quote(self._require_db(query), query.get("ticker", "")))
             elif parsed.path == "/api/market":
@@ -556,6 +473,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, job.snapshot())
             elif parsed.path == "/api/backtest":
                 self._send_json(200, self._backtest(query))
+            elif parsed.path == "/api/backtest/status":
+                job = self.server.backtest_jobs.get(query.get("id", ""))
+                if job is None:
+                    raise _ApiError(404, "no such backtest (the dashboard may have been restarted)")
+                self._send_json(200, job)
             elif parsed.path == "/api/settings":
                 self._send_json(200, settings_status(self.server.env_path))
             else:
@@ -583,6 +505,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise _ApiError(400, str(exc)) from exc
             elif parsed.path == "/api/lab/start":
                 self._send_json(200, self._lab_start(self._read_json_body()))
+            elif parsed.path == "/api/backtest/start":
+                payload = self._read_json_body()
+                path = self._require_db({"db": str(payload.get("db", ""))})
+                try:
+                    job = self.server.backtest_jobs.submit(
+                        path, self.server.config_path, queue=str(payload.get("queue", "both")),
+                        maker_fee_multiplier=str(payload.get("maker_fee_multiplier", "both")),
+                    )
+                except BacktestQueueFull as exc:
+                    raise _ApiError(409, str(exc)) from exc
+                except (ValueError, OSError) as exc:
+                    raise _ApiError(400, str(exc)) from exc
+                self._send_json(202, job)
             elif parsed.path == "/api/lab/cancel":
                 job = self.server.lab_jobs.get(str(self._read_json_body().get("id", "")))  # type: ignore[attr-defined]
                 if job is None:
@@ -648,7 +583,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         maker_fee_multiplier = query.get("maker_fee_multiplier", "both")
         if maker_fee_multiplier != "both":
             try:
-                if Decimal(maker_fee_multiplier) < 0:
+                if not Decimal(maker_fee_multiplier).is_finite() or Decimal(maker_fee_multiplier) < 0:
                     raise _ApiError(400, "maker_fee_multiplier must be 'both' or a non-negative number")
             except InvalidOperation as exc:
                 raise _ApiError(400, "maker_fee_multiplier must be 'both' or a non-negative number") from exc
@@ -672,843 +607,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return db_path
 
 
+class DashboardServer(ThreadingHTTPServer):
+    def server_close(self) -> None:
+        if hasattr(self, "backtest_jobs"):
+            self.backtest_jobs.close(wait=False)
+        super().server_close()
+
+
 def create_dashboard_server(*, data_dir: Path, env_path: Path, config_path: Path, port: int) -> ThreadingHTTPServer:
     """Binds to ``127.0.0.1`` only -- never ``0.0.0.0`` -- so the dashboard is reachable only from this
     machine. ``port=0`` lets the OS pick a free port (used by tests); the bound port is on
     ``server.server_address[1]`` either way."""
-    server = ThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
+    server = DashboardServer(("127.0.0.1", port), DashboardHandler)
     server.data_dir = data_dir  # type: ignore[attr-defined]
     server.env_path = env_path  # type: ignore[attr-defined]
     server.config_path = config_path  # type: ignore[attr-defined]
     server.lab_jobs = {}  # type: ignore[attr-defined]
+    server.backtest_jobs = BacktestJobs()
     server.daemon_threads = True
     return server
 
 
 # --------------------------------------------------------------------------- frontend
 
-INDEX_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>btc15m-bot dashboard</title>
-<style>
-  :root { color-scheme: dark; --bg:#07090b; --panel:#0e1114; --panel2:#12161a; --line:#1c2126; --text:#e9edf0;
-          --muted:#7d8791; --green:#2ee6a6; --greenbg:#0f2a22; --red:#ff5a6a; --redbg:#2a1216; --orange:#ff9b3d;
-          --blue:#3b82f6; }
-  * { box-sizing: border-box; }
-  body { background: var(--bg); color: var(--text); margin: 0; padding: 20px;
-         font: 13px/1.45 Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
-  .shell { max-width: 1240px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line);
-           border-radius: 14px; overflow: hidden; }
-  .top { display: flex; gap: 14px; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
-  .coin { width: 32px; height: 32px; border-radius: 50%; background: var(--orange); color: #fff; display: grid;
-          place-items: center; font-weight: 700; flex: none; }
-  .title { font-weight: 700; font-size: 15px; }
-  .sub { color: var(--muted); font-size: 12px; }
-  .sub b { color: var(--text); font-weight: 600; }
-  .grow { flex: 1; }
-  .pick { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
-  .pick label { display: flex; flex-direction: column; gap: 3px; font-size: 10.5px; color: var(--muted);
-                text-transform: uppercase; letter-spacing: .05em; }
-  .pick select { min-width: 230px; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--text); }
-  .pickhelp { padding: 8px 18px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
-  .pickhelp b { color: var(--text); font-weight: 600; }
-  select, input { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
-                  padding: 7px 10px; font: inherit; max-width: 100%; }
-  button { font: inherit; }
-  button.action { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
-                  padding: 7px 12px; cursor: pointer; }
-  button.action:hover { border-color: var(--green); }
-  button.action:disabled { opacity: .5; cursor: wait; }
-  nav { display: flex; gap: 4px; padding: 0 18px; border-bottom: 1px solid var(--line); }
-  nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
-               padding: 11px 14px; cursor: pointer; font-weight: 600; }
-  nav button.active { color: var(--text); border-bottom-color: var(--green); }
-  .stats { display: flex; gap: 26px; padding: 10px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; font-size: 11px;
-           color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-  .stats b { color: var(--text); font-size: 13px; margin-left: 4px; letter-spacing: 0; }
-  section { display: none; } section.active { display: block; }
-  .chartwrap { padding: 8px 18px 0; }
-  canvas { width: 100%; display: block; }
-  .cols { display: grid; grid-template-columns: 1.05fr 1.15fr 1fr; border-top: 1px solid var(--line); }
-  .col { padding: 14px 16px; border-right: 1px solid var(--line); min-width: 0; }
-  .col:last-child { border-right: 0; }
-  @media (max-width: 960px) { .cols { grid-template-columns: 1fr; } .col { border-right: 0; border-bottom: 1px solid var(--line); } }
-  .facts { display: flex; gap: 22px; margin-bottom: 8px; flex-wrap: wrap; }
-  .fact .k { color: var(--muted); font-size: 11px; } .fact .v { font-weight: 600; font-size: 14px; }
-  .orange { color: var(--orange); } .green { color: var(--green); } .red { color: var(--red); }
-  .toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .toggle button { background: none; border: 0; color: var(--muted); padding: 5px 14px; cursor: pointer; font-weight: 700; font-size: 11px; }
-  .toggle button.on { background: var(--greenbg); color: var(--green); }
-  .toggle.no button.on { background: var(--redbg); color: var(--red); }
-  .ladder-head, .lrow { display: grid; grid-template-columns: 60px 1fr 1fr; padding: 3px 8px; font-variant-numeric: tabular-nums; }
-  .ladder-head { color: var(--muted); font-size: 11px; margin-top: 10px; }
-  .ladder-head span:nth-child(n+2), .lrow span:nth-child(n+2) { text-align: right; }
-  .lrow { position: relative; }
-  .lrow .bar { position: absolute; right: 0; top: 0; bottom: 0; opacity: .22; }
-  .lrow span { position: relative; }
-  .lrow.ask .p { color: var(--red); } .lrow.ask .bar { background: var(--red); }
-  .lrow.bid .p { color: var(--green); } .lrow.bid .bar { background: var(--green); }
-  .mid { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 8px; margin: 3px 0;
-         border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .mid .big { font-size: 18px; font-weight: 700; } .mid .sp { color: var(--muted); font-size: 11px; }
-  .quote { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 10px; }
-  .quote div { text-align: center; padding: 8px; border-radius: 8px; font-weight: 700; }
-  .quote .y { background: var(--greenbg); color: var(--green); border: 1px solid #1b5a45; }
-  .quote .n { background: var(--redbg); color: var(--red); border: 1px solid #5a1f28; }
-  h3 { margin: 14px 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-  .tiles { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 18px; }
-  .tile { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-width: 120px; }
-  .tile .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
-  .tile .value { font-size: 19px; margin-top: 3px; font-weight: 600; }
-  .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
-  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-  .pad { padding: 14px 18px; }
-  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
-  .error { color: var(--red); margin-top: 8px; } .ok { color: var(--green); margin-top: 8px; }
-  .empty { color: var(--muted); text-align: center; padding: 20px 10px; }
-  .warn { background: #2a1d10; border: 1px solid #6b4a1c; color: #fbbf77; border-radius: 8px; padding: 10px 14px; margin: 10px 0; display: none; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
-  .badge.live { color: var(--green); border-color: #1b5a45; } .badge.closed { color: var(--orange); border-color: #6b4a1c; }
-  .foot { padding: 10px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
-  .lab { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 0; }
-  .lab > div { padding: 14px 18px; min-width: 0; }
-  .lab .setup { border-right: 1px solid var(--line); }
-  @media (max-width: 960px) { .lab { grid-template-columns: 1fr; } .lab .setup { border-right: 0; border-bottom: 1px solid var(--line); } }
-  .lab h3 { margin-top: 16px; } .lab h3:first-child { margin-top: 0; }
-  .field { display: grid; grid-template-columns: 1fr 1.1fr; gap: 4px 10px; align-items: center; margin-bottom: 7px; }
-  .field label { color: var(--text); font-size: 12.5px; }
-  .field small { grid-column: 1 / -1; color: var(--muted); font-size: 11px; margin-top: -3px; }
-  .field input { width: 100%; }
-  .checks label { display: block; font-size: 12.5px; padding: 2px 0; cursor: pointer; }
-  .presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
-  .presets button { font-size: 11.5px; padding: 4px 9px; }
-  .bar { height: 6px; background: var(--panel2); border-radius: 4px; overflow: hidden; margin: 8px 0; }
-  .bar div { height: 100%; background: var(--green); width: 0; transition: width .3s; }
-  .verdict { border-radius: 10px; padding: 12px 14px; margin: 0 0 14px; border: 1px solid var(--line); }
-  .verdict b { display: block; margin-bottom: 3px; }
-  .verdict.insufficient { background: #2a1d10; border-color: #6b4a1c; color: #fbbf77; }
-  .verdict.not_supported { background: var(--redbg); border-color: #5a1f28; color: #ff9aa6; }
-  .verdict.weak_signal { background: #0f1f33; border-color: #1f4a80; color: #8ec2ff; }
-  .lab td.num, .lab th.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .lab tr.base td { color: var(--muted); font-style: italic; }
-  .lab ul.warns { color: var(--muted); font-size: 12px; padding-left: 18px; }
-  @media (max-width: 700px) { body { padding: 8px; } table { display: block; overflow-x: auto; } }
-</style>
-</head>
-<body>
-<div class="shell">
-  <div class="top">
-    <div class="coin">&#8383;</div>
-    <div>
-      <div class="title" id="hdr-title">BTC 15 min</div>
-      <div class="sub" id="hdr-sub">No data loaded</div>
-    </div>
-    <span class="badge" id="hdr-badge"></span>
-    <div class="grow"></div>
-    <div class="pick" id="db-row">
-      <label>1. Data file
-        <select id="db-select" title="Which run to look at. The newest is at the top."></select></label>
-      <label>2. Market window
-        <select id="ticker-select" title="Each 15-minute market. Leave on Latest to follow along."></select></label>
-      <button class="action" id="refresh-databases" title="Look for new files">Refresh</button>
-    </div>
-  </div>
-  <div class="pickhelp" id="pickhelp">Pick the newest <b>Paper trading</b> file to watch a live run. Leave the window on <b>Latest</b> to follow the current 15-minute market automatically.</div>
-  <nav>
-    <button data-tab="market" class="active">Market</button>
-    <button data-tab="monitor">Paper PnL</button>
-    <button data-tab="backtest">Backtest</button>
-    <button data-tab="lab">Strategy Lab</button>
-    <button data-tab="demo">Demo orders</button>
-    <button data-tab="settings">Settings</button>
-  </nav>
-
-  <section id="tab-market" class="active">
-    <div class="stats">
-      <span>Vol <b id="st-vol">--</b></span><span>Open int <b id="st-oi">--</b></span>
-      <span>Spread <b id="st-spread">--</b></span><span>Time left <b id="st-left">--</b></span>
-      <span>Last book <b id="st-ts">--</b></span><span>Book age <b id="st-age">--</b></span>
-      <span>Spot age <b id="st-spot-age">--</b></span><span>Book request <b id="st-latency">--</b></span>
-    </div>
-    <div class="chartwrap"><canvas id="mid-chart" height="190"></canvas></div>
-    <div class="cols">
-      <div class="col">
-        <div class="facts">
-          <div class="fact"><div class="k">Expiration</div><div class="v orange" id="f-exp">--</div></div>
-          <div class="fact"><div class="k">To beat</div><div class="v" id="f-strike">--</div></div>
-          <div class="fact"><div class="k">Current price</div><div class="v" id="f-spot">--</div></div>
-        </div>
-        <canvas id="spot-chart" height="210"></canvas>
-        <div class="note" id="spot-note"></div>
-      </div>
-      <div class="col">
-        <div class="row" style="justify-content:space-between;margin-bottom:0">
-          <span class="sub">Order book</span>
-          <div class="toggle" id="side-toggle"><button data-side="yes" class="on">YES</button><button data-side="no">NO</button></div>
-        </div>
-        <div class="ladder-head"><span>Price</span><span>Contracts</span><span>Total</span></div>
-        <div id="asks"></div>
-        <div class="mid"><span class="big" id="mid-price">--</span><span class="sp" id="mid-spread"></span></div>
-        <div id="bids"></div>
-        <div class="note" id="market-note"></div>
-      </div>
-      <div class="col">
-        <div class="quote"><div class="y" id="q-yes">Yes --</div><div class="n" id="q-no">No --</div></div>
-        <h3>Paper trades, this window</h3>
-        <table id="win-trades"><thead><tr><th>Side</th><th>Size</th><th>Entry</th><th>Result</th><th>PnL</th></tr></thead><tbody></tbody></table>
-        <h3>Settlement</h3>
-        <div id="settle" class="sub">Not settled yet.</div>
-        <div class="note">Read-only view of recorded data. There is no order ticket: nothing here can place, cancel or modify a Kalshi order.</div>
-      </div>
-    </div>
-  </section>
-
-  <section id="tab-monitor">
-    <div class="tiles" id="summary-tiles"></div>
-    <div class="chartwrap"><canvas id="pnl-chart" height="220"></canvas></div>
-    <div class="pad"><table id="trades-table">
-      <thead><tr><th>Ticker</th><th>Side</th><th>Size</th><th>Entry price</th><th>Entry time (UTC)</th><th>Result</th><th>PnL (USD)</th></tr></thead>
-      <tbody></tbody></table>
-      <div class="note" id="monitor-note"></div></div>
-  </section>
-
-  <section id="tab-backtest">
-    <div class="pad">
-      <div class="row">
-        <label for="queue-select">Queue assumption</label>
-        <select id="queue-select"><option value="both">both</option><option value="optimistic">optimistic</option><option value="pessimistic">pessimistic</option></select>
-        <label for="fee-input">Maker fee multiplier</label>
-        <select id="fee-input"><option value="both">both (0 and 0.25)</option><option value="0">0 (makers pay no fee)</option><option value="1">1 (makers pay the full fee)</option></select>
-        <button class="action" id="run-backtest">Run backtest</button>
-      </div>
-      <table id="backtest-table">
-        <thead><tr><th>Queue</th><th>Fee mult.</th><th>Trades</th><th>Win rate</th><th>Total PnL</th><th>Max drawdown</th><th>Trades/day</th><th>Beats trade-nothing?</th><th>Sample size</th></tr></thead>
-        <tbody></tbody></table>
-      <div class="note" id="backtest-note"></div>
-    </div>
-  </section>
-
-  <section id="tab-demo">
-    <div class="tiles" id="demo-tiles"></div>
-    <div class="pad">
-      <div class="note" id="demo-note"></div>
-      <h3>Each real demo order next to its paper simulation</h3>
-      <table id="demo-orders"><thead><tr><th>Placed (UTC)</th><th>Window</th><th>Side</th><th class="num">Price</th><th class="num">Size</th>
-        <th>State</th><th class="num">Demo filled</th><th class="num">Demo avg</th><th class="num">Demo fee</th><th class="num">Paper filled</th>
-        <th class="num">Demo PnL</th><th class="num">Paper PnL</th></tr></thead><tbody></tbody></table>
-      <h3>Problems this run <span class="sub">(rejected orders, failed cancels, unavailable fills)</span></h3>
-      <table id="demo-events"><thead><tr><th>Time (UTC)</th><th>Window</th><th>Event</th><th>Detail</th></tr></thead><tbody></tbody></table>
-      <h3>Order ledger: everything the bot sent to Kalshi <span class="sub">(data/order-audit.jsonl, newest first)</span></h3>
-      <table id="demo-audit"><thead><tr><th>Time (UTC)</th><th>Event</th><th>Side</th><th class="num">Price</th><th class="num">Count</th><th>Order id</th><th>Error</th></tr></thead><tbody></tbody></table>
-      <div class="note">Compare this ledger with the Orders and History tabs on Kalshi's demo Portfolio page. Any order there that is not in this ledger did not come from this bot.</div>
-    </div>
-  </section>
-
-  <section id="tab-lab">
-    <div class="lab">
-      <div class="setup">
-        <h3>1. Data to test on</h3>
-        <div class="checks" id="lab-dbs"></div>
-        <div class="note">Use real (PROD) recordings. Demo books are mostly synthetic. More days of data = results worth reading; you need at least 6 market windows, and hundreds before anything is believable.</div>
-
-        <h3>2. Account and risk</h3>
-        <div class="field"><label for="lab-account_usd">Account size ($)</label><input id="lab-account_usd" value="500"></div>
-        <div class="field"><label for="lab-max_exposure_pct">Max at risk at once (%)</label><input id="lab-max_exposure_pct" value="25"></div>
-        <div class="field"><label for="lab-daily_loss_pct">Daily loss stop (%)</label><input id="lab-daily_loss_pct" value="10"></div>
-
-        <h3>3. What to vary <span class="sub">(comma lists; blank = keep the default)</span></h3>
-        <div class="presets" id="lab-presets"></div>
-        <div id="lab-fields"></div>
-
-        <h3>4. How to judge it</h3>
-        <div class="field"><label for="lab-split">Train share of windows</label><input id="lab-split" value="0.7"><small>Ranked on this earlier slice, then shown on the held-out rest.</small></div>
-        <div class="field"><label for="lab-min_train_trades">Min trades to rank</label><input id="lab-min_train_trades" value="20"></div>
-        <div class="field"><label for="lab-queue">Fill assumption</label>
-          <select id="lab-queue"><option value="optimistic">optimistic (best case)</option><option value="pessimistic">pessimistic (never fills)</option></select></div>
-        <div class="field"><label for="lab-maker_fee_multiplier">Maker fee multiplier</label>
-          <select id="lab-maker_fee_multiplier"><option value="0">0 (makers pay nothing)</option><option value="0.25">0.25</option><option value="1">1 (full fee)</option></select></div>
-
-        <div class="row" style="margin-top:14px">
-          <button class="action" id="lab-run">Run lab</button>
-          <button class="action" id="lab-cancel" disabled>Cancel</button>
-          <span class="note" id="lab-preview"></span>
-        </div>
-        <div class="bar" id="lab-bar" style="display:none"><div id="lab-bar-fill"></div></div>
-        <div class="note" id="lab-status"></div>
-      </div>
-      <div class="results" id="lab-results">
-        <div class="empty">Pick data, choose what to vary, and press <b>Run lab</b>. Results appear here: every combination is ranked on the training windows and then shown on windows it never saw.</div>
-      </div>
-    </div>
-  </section>
-
-  <section id="tab-settings">
-    <div class="pad">
-      <p class="note">Stored only in the local settings file shown below, from your browser to this localhost server to that file. A key pasted anywhere else (a chat, an issue, a screenshot) should be treated as exposed and reissued.</p>
-      <div class="row">
-        <label><input type="radio" name="kalshi-env" value="demo"> Demo</label>
-        <label><input type="radio" name="kalshi-env" value="prod"> Live (prod)</label>
-      </div>
-      <div class="row"><label for="key-id-input">Key ID</label><input id="key-id-input" type="password" placeholder="leave blank to keep current value" size="36"></div>
-      <div class="row"><label for="key-path-input">Private key path</label><input id="key-path-input" placeholder="/path/to/key.pem" size="36"></div>
-      <div class="warn" id="prod-warn">Live (prod) is selected. This dashboard still cannot place, cancel, or modify any order -- but Phase 6 did add real (demo-only) order-placing code elsewhere in this repo (`btcbot demo-check`), so a key entered here now lets you run that yourself. Keep this on Demo unless you mean to.</div>
-      <div class="row"><button class="action" id="save-settings">Save</button></div>
-      <div id="settings-status"></div>
-    </div>
-  </section>
-
-  <div class="foot">Local only: this page and everything it fetches stays on this machine. Read-only monitoring plus a local settings editor.</div>
-</div>
-
-<script>
-const $ = (id) => document.getElementById(id);
-const $q = (sel) => document.querySelector(sel);
-const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-
-function fmtUsd(value) {
-  if (value === null || value === undefined) return "--";
-  const n = Number(value);
-  return `<span class="${n > 0 ? "pnl-pos" : n < 0 ? "pnl-neg" : ""}">${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}</span>`;
-}
-const fmtPct = (v) => (v === null || v === undefined ? "--" : (Number(v) * 100).toFixed(1) + "%");
-const cents = (p) => (p === null || p === undefined || p === "" ? "--" : Number((Number(p) * 100).toFixed(1)) + "¢");
-const num = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
-
-async function getJson(url) {
-  const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
-}
-
-function drawSeries(canvas, points, opts) {
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth, h = Number(canvas.getAttribute("height"));
-  canvas.width = w * dpr; canvas.height = h * dpr;
-  const ctx = canvas.getContext("2d");
-  ctx.scale(dpr, dpr); ctx.clearRect(0, 0, w, h);
-  ctx.font = "11px sans-serif";
-  if (points.length < 2) {
-    ctx.fillStyle = css("--muted"); ctx.fillText(opts.empty || "Not enough data yet.", 10, 22); return;
-  }
-  const padL = 6, padR = 60, padT = 10, padB = 22;
-  const xs = points.map((p) => p[0]), ys = points.map((p) => p[1]);
-  let lo = Math.min(...ys, ...(opts.include || [])), hi = Math.max(...ys, ...(opts.include || []));
-  if (opts.min !== undefined) lo = Math.min(lo, opts.min);
-  if (opts.max !== undefined) hi = Math.max(hi, opts.max);
-  if (hi === lo) { hi += 1; lo -= 1; }
-  const x0 = xs[0], x1 = xs[xs.length - 1] === x0 ? x0 + 1 : xs[xs.length - 1];
-  const X = (x) => padL + ((x - x0) / (x1 - x0)) * (w - padL - padR);
-  const Y = (y) => padT + (1 - (y - lo) / (hi - lo)) * (h - padT - padB);
-  ctx.strokeStyle = css("--line"); ctx.fillStyle = css("--muted"); ctx.lineWidth = 1;
-  for (let i = 0; i <= 3; i++) {
-    const y = lo + ((hi - lo) * i) / 3;
-    ctx.beginPath(); ctx.moveTo(padL, Y(y)); ctx.lineTo(w - padR, Y(y)); ctx.stroke();
-    ctx.fillText(opts.yfmt(y), w - padR + 6, Y(y) + 4);
-  }
-  const xTicks = Math.max(1, Math.min(3, Math.floor((w - padL - padR) / 95)));
-  for (let i = 0; i <= xTicks; i++) {
-    const x = x0 + ((x1 - x0) * i) / xTicks;
-    const lbl = new Date(x).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: opts.seconds ? "2-digit" : undefined });
-    ctx.fillText(lbl, Math.max(padL, Math.min(X(x) - 22, w - padR - 58)), h - 6);
-  }
-  (opts.lines || []).forEach((l) => {
-    ctx.setLineDash([2, 3]); ctx.strokeStyle = l.color; ctx.beginPath();
-    ctx.moveTo(padL, Y(l.y)); ctx.lineTo(w - padR, Y(l.y)); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle = l.color; ctx.fillText(l.label, padL + 4, Y(l.y) - 4);
-  });
-  const path = () => {
-    ctx.beginPath();
-    points.forEach((p, i) => {
-      const x = X(p[0]), y = Y(p[1]);
-      if (i === 0) ctx.moveTo(x, y);
-      else if (opts.step) { ctx.lineTo(x, Y(points[i - 1][1])); ctx.lineTo(x, y); } else ctx.lineTo(x, y);
-    });
-  };
-  if (opts.fill) {
-    path(); ctx.lineTo(X(x1), h - padB); ctx.lineTo(X(x0), h - padB); ctx.closePath();
-    const g = ctx.createLinearGradient(0, padT, 0, h - padB);
-    g.addColorStop(0, opts.color + "66"); g.addColorStop(1, opts.color + "00");
-    ctx.fillStyle = g; ctx.fill();
-  }
-  path(); ctx.strokeStyle = opts.color; ctx.lineWidth = 2; ctx.stroke();
-  const last = points[points.length - 1];
-  ctx.fillStyle = opts.color; ctx.beginPath(); ctx.arc(X(last[0]), Y(last[1]), 3.5, 0, 7); ctx.fill();
-}
-
-let market = null, side = "yes";
-
-const KIND_LABELS = { paper: "Paper trading", recorder: "Data recording", stream: "BRTI + book stream", demo: "Demo orders (fake money)", unknown: "Data file" };
-function dbLabel(db) {
-  const m = /^[a-z]+-[A-Z0-9]+-(demo|prod)-/.exec(db.name);
-  const env = m ? m[1].toUpperCase() : "";
-  const when = new Date(db.modified_ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-  const mb = db.size_bytes / 1048576;
-  return `${KIND_LABELS[db.kind] || KIND_LABELS.unknown}${env ? " \u00b7 " + env : ""} \u00b7 ${when} \u00b7 ${mb < 0.1 ? "<0.1" : mb.toFixed(1)} MB`;
-}
-
-function windowLabel(w, isLatest) {
-  const close = w.close_time ? new Date(w.close_time) : null;
-  const time = close ? close.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : w.ticker;
-  const state = close && close > Date.now() ? "live" : w.result ? "settled " + w.result.toUpperCase() : "closed";
-  return `${time} close \u00b7 ${state}` + (w.trades ? ` \u00b7 ${w.trades} trade${w.trades > 1 ? "s" : ""}` : "");
-}
-
-let databaseList = [];
-const runSelections = {};
-let databaseRefresh = false;
-function runGroup() { return tab === "demo" ? "demo" : "paper"; }
-function selectRun() {
-  const select = $("db-select"), group = runGroup();
-  const candidates = databaseList.filter(d => group === "demo" ? d.kind === "demo" : d.kind === "paper" && /-prod-/.test(d.name));
-  // Filenames contain the run start time; writes/checkpoints must not reorder runs.
-  candidates.sort((a, b) => b.name.localeCompare(a.name));
-  const chosen = runSelections[group] || candidates[0]?.name || databaseList[0]?.name || "";
-  if (select.value !== chosen) {
-    select.value = chosen;
-    market = null;
-    $("ticker-select").innerHTML = "";
-  }
-}
-async function refreshDatabases() {
-  if (databaseRefresh) return databaseList;
-  databaseRefresh = true;
-  try {
-    const { databases } = await getJson("/api/databases");
-    databaseList = databases;
-    const select = $("db-select"), previous = select.value;
-    select.innerHTML = databases.length ? "" : '<option value="">(no data files yet)</option>';
-    databases.forEach(db => {
-      const opt = document.createElement("option");
-      opt.value = db.name; opt.textContent = dbLabel(db); select.appendChild(opt);
-    });
-    select.value = previous;
-    selectRun();
-    return databases;
-  } finally { databaseRefresh = false; }
-}
-
-function ladder(levels, isAsk) {
-  const sorted = levels.slice().sort((a, b) => (isAsk ? a[0] - b[0] : b[0] - a[0]));
-  let run = 0;
-  const rows = sorted.map(([p, s]) => { run += p * s; return { p, s, t: run }; });
-  const max = Math.max(1, ...rows.map((r) => r.s));
-  const shown = isAsk ? rows.slice(0, 10).reverse() : rows.slice(0, 10);
-  return shown.map((r) => `<div class="lrow ${isAsk ? "ask" : "bid"}"><div class="bar" style="width:${(r.s / max) * 100}%"></div>
-    <span class="p">${cents(r.p)}</span><span>${num(r.s)}</span><span>${num(r.t)}</span></div>`).join("")
-    || `<div class="empty">no ${isAsk ? "asks" : "bids"}</div>`;
-}
-
-function renderBook() {
-  if (!market || !market.book) return;
-  const yesBids = market.book.yes.map(([p, s]) => [Number(p), Number(s)]);
-  const noBids = market.book.no.map(([p, s]) => [Number(p), Number(s)]);
-  const ownBids = side === "yes" ? yesBids : noBids, otherBids = side === "yes" ? noBids : yesBids;
-  const asks = otherBids.map(([p, s]) => [1 - p, s]);
-  $("asks").innerHTML = ladder(asks, true);
-  $("bids").innerHTML = ladder(ownBids, false);
-  const bestBid = ownBids.length ? Math.max(...ownBids.map((l) => l[0])) : null;
-  const bestAsk = asks.length ? Math.min(...asks.map((l) => l[0])) : null;
-  $("mid-price").textContent = bestBid !== null && bestAsk !== null ? cents((bestBid + bestAsk) / 2) : "--";
-  $("mid-price").className = "big " + (side === "yes" ? "green" : "red");
-  $("mid-spread").textContent = bestBid !== null && bestAsk !== null ? "SPREAD: " + cents(bestAsk - bestBid) : "";
-  const yb = yesBids.length ? Math.max(...yesBids.map((l) => l[0])) : null;
-  const nb = noBids.length ? Math.max(...noBids.map((l) => l[0])) : null;
-  $("q-yes").textContent = "Yes " + (nb !== null ? cents(1 - nb) : "--");
-  $("q-no").textContent = "No " + (yb !== null ? cents(1 - yb) : "--");
-  $("st-spread").textContent = yb !== null && nb !== null ? cents(1 - nb - yb) : "--";
-}
-
-function updateAge() {
-  if (!market) return;
-  const ageOf = (ts) => ts ? Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000) : Infinity;
-  const bookAge = ageOf(market.book_ts), spotAge = ageOf(market.spot_ts);
-  for (const [id, age] of [["st-age", bookAge], ["st-spot-age", spotAge]]) {
-    $(id).textContent = Number.isFinite(age) ? age.toFixed(1) + "s" : "missing";
-    $(id).className = age < 3 ? "green" : "red";
-  }
-  const tl = timeLeft(), fresh = bookAge < 3 && spotAge < 3;
-  $("st-left").textContent = tl.text;
-  $("hdr-badge").textContent = !tl.live ? "CLOSED" : fresh ? "LIVE" : "STALE";
-  $("hdr-badge").className = "badge " + (tl.live && fresh ? "live" : "closed");
-}
-
-function timeLeft() {
-  if (!market || !market.close_time) return { text: "--", live: false };
-  const ms = new Date(market.close_time) - Date.now();
-  if (ms <= 0) return { text: "closed", live: false };
-  return { text: `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`, live: true };
-}
-
-async function refreshMarket() {
-  const db = $("db-select").value, note = $("market-note");
-  if (!db) { note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record, then click Refresh."; return; }
-  try {
-    const t = $("ticker-select").value;
-    const response = await getJson(`/api/market?db=${encodeURIComponent(db)}` + (t ? `&ticker=${encodeURIComponent(t)}` : ""));
-    if (db !== $("db-select").value || t !== $("ticker-select").value || tab !== "market") return;
-    if (market?.ticker === response.ticker) {
-      if (market.book_ts > response.book_ts) Object.assign(response, {book: market.book, book_ts: market.book_ts, book_latency_ms: market.book_latency_ms});
-      if (market.spot_ts > response.spot_ts) Object.assign(response, {spot: market.spot, spot_ts: market.spot_ts});
-    }
-    market = response;
-    note.className = "note"; note.textContent = "";
-    const sel = $("ticker-select"), chosen = sel.value;
-    sel.innerHTML = '<option value="">Latest window (follows automatically)</option>' +
-      (market.windows || []).map((w) => `<option value="${esc(w.ticker)}">${esc(windowLabel(w))}</option>`).join("");
-    sel.value = (market.windows || []).some((w) => w.ticker === chosen) ? chosen : "";
-    if (!market.ticker) { note.textContent = "This database has no order-book snapshots yet."; return; }
-    const strike = market.strike ? Number(market.strike) : null;
-    $("hdr-title").textContent = "BTC 15 min" + (strike ? " · $" + num(strike) + " target" : "");
-    $("hdr-sub").innerHTML = `Target price: <b>${strike ? "$" + num(strike) : "--"}</b> · <b>${esc(market.ticker)}</b>`;
-    const tl = timeLeft();
-    $("hdr-badge").textContent = tl.live ? "LIVE" : "CLOSED";
-    $("hdr-badge").className = "badge " + (tl.live ? "live" : "closed");
-    $("st-vol").textContent = market.volume ? num(market.volume) : "--";
-    $("st-oi").textContent = market.open_interest ? num(market.open_interest) : "--";
-    $("st-left").textContent = tl.text;
-    updateAge();
-    $("st-latency").textContent = market.book_latency_ms == null ? "--" : market.book_latency_ms.toFixed(0) + " ms";
-    $("st-ts").textContent = market.book_ts ? new Date(market.book_ts).toLocaleTimeString() : "--";
-    $("f-exp").textContent = market.close_time ? new Date(market.close_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--";
-    $("f-strike").textContent = strike ? "$" + num(strike) : "--";
-    const spot = market.spot ? Number(market.spot) : null;
-    $("f-spot").innerHTML = spot ? `<span class="orange">$${num(spot)}</span>` + (strike ? ` <span class="${spot >= strike ? "green" : "red"}" style="font-size:11px">${spot >= strike ? "+" : "-"}$${num(Math.abs(spot - strike))}</span>` : "") : "--";
-    renderBook();
-    const toMs = (s) => new Date(s).getTime();
-    drawSeries($("mid-chart"), market.mid_series.filter((r) => r[1] !== null && r[2] !== null)
-      .map((r) => [toMs(r[0]), (Number(r[1]) + Number(r[2])) / 2 * 100]),
-      { color: css("--green"), step: true, yfmt: (v) => v.toFixed(1), min: 0, max: 100, seconds: true, empty: "No YES price history yet." });
-    drawSeries($("spot-chart"), market.spot_series.map((r) => [toMs(r[0]), Number(r[1])]),
-      { color: css("--orange"), fill: true, seconds: true, yfmt: (v) => "$" + num(v), include: strike ? [strike] : [],
-        lines: strike ? [{ y: strike, color: css("--muted"), label: "Target: $" + num(strike) }] : [], empty: "No spot ticks recorded for this window." });
-    $("spot-note").textContent = "Spot is the Coinbase BTC-USD proxy the model uses, not Kalshi's BRTI.";
-    $q("#win-trades tbody").innerHTML = market.trades.length ? market.trades.map((x) => `<tr><td>${esc(x.side)}</td><td>${esc(x.size)}</td>
-      <td>${cents(x.entry_price)}</td><td>${esc(x.result ?? "pending")}</td><td>${fmtUsd(x.pnl_usd)}</td></tr>`).join("")
-      : '<tr><td colspan="5" class="empty">No paper trades in this window.</td></tr>';
-    $("settle").textContent = market.settlement && market.settlement.result
-      ? `Result: ${market.settlement.result.toUpperCase()}` + (market.settlement.settled_avg ? ` · settled avg $${num(market.settlement.settled_avg)}` : "")
-      : "Not settled yet.";
-  } catch (err) { note.className = "error"; note.textContent = "Error: " + err.message; }
-}
-
-function drawPnlChart(points) {
-  drawSeries($("pnl-chart"), points.map((p) => [new Date(p.ts).getTime(), Number(p.cumulative_pnl_usd)]),
-    { color: css("--blue"), fill: true, yfmt: (v) => "$" + v.toFixed(2), min: 0, max: 0, empty: "Not enough resolved trades yet for a chart." });
-}
-
-async function refreshMonitor() {
-  const db = $("db-select").value, note = $("monitor-note");
-  if (!db) { note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record first, then click Refresh."; return; }
-  try {
-    const s = await getJson(`/api/paper_summary?db=${encodeURIComponent(db)}`);
-    if (db !== $("db-select").value || tab !== "monitor") return;
-    note.textContent = "Simulated paper results for this run only: " + db;
-    $("summary-tiles").innerHTML = [
-      ["Trades", s.trade_count], ["Resolved", s.resolved_count], ["Unresolved", s.unresolved_count],
-      ["Win rate", fmtPct(s.win_rate)], ["Total PnL", fmtUsd(s.total_pnl_usd)],
-      ["Windows seen", s.windows_seen], ["Windows traded", s.windows_traded],
-    ].map(([label, value]) => `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
-    drawPnlChart(s.cumulative_pnl);
-    $q("#trades-table tbody").innerHTML = s.trades.length ? s.trades.map((t) => `<tr>
-      <td>${esc(t.ticker)}</td><td>${esc(t.side)}</td><td>${esc(t.size)}</td><td>${esc(t.entry_price)}</td>
-      <td>${esc(t.entry_ts)}</td><td>${esc(t.result ?? "pending")}</td><td>${fmtUsd(t.pnl_usd)}</td></tr>`).join("")
-      : '<tr><td colspan="7" class="empty">No trades yet in this database. That is normal for a short run or a quiet market.</td></tr>';
-  } catch (err) { note.className = "error"; note.textContent = `Error: ${err.message}`; }
-}
-
-async function runBacktest() {
-  const db = $("db-select").value, note = $("backtest-note");
-  if (!db) { note.className = "error"; note.textContent = "No databases found in ./data yet. Run btcbot paper or btcbot record first, then click Refresh."; return; }
-  note.className = "note"; note.textContent = "Running backtest..."; $("run-backtest").disabled = true;
-  try {
-    const { reports } = await getJson(`/api/backtest?db=${encodeURIComponent(db)}&queue=${$("queue-select").value}&maker_fee_multiplier=${encodeURIComponent($("fee-input").value)}`);
-    $q("#backtest-table tbody").innerHTML = reports.length ? reports.map((r) => `<tr>
-      <td>${esc(r.queue_assumption)}</td><td>${esc(r.maker_fee_multiplier)}</td><td>${esc(r.trades)}</td>
-      <td>${fmtPct(r.win_rate)}</td><td>${fmtUsd(r.total_pnl_usd)}</td><td>${fmtUsd(r.max_drawdown_usd)}</td>
-      <td>${r.trades_per_day === null ? "--" : Number(r.trades_per_day).toFixed(2)}</td>
-      <td>${r.beats_trade_nothing === null ? "n/a" : (r.beats_trade_nothing ? "yes" : "no")}</td>
-      <td>${esc(r.sample_size_note)}</td></tr>`).join("")
-      : '<tr><td colspan="9" class="empty">The backtest returned no rows.</td></tr>';
-    note.className = "note";
-    note.textContent = "Done. " + reports.length + " scenario(s). Results come from recorded data only, so treat small samples as noise.";
-  } catch (err) { note.className = "error"; note.textContent = `Error: ${err.message}`; }
-  finally { $("run-backtest").disabled = false; }
-}
-
-async function loadSettings() {
-  const s = await getJson("/api/settings");
-  const radio = document.querySelector(`input[name="kalshi-env"][value="${s.kalshi_env}"]`) || document.querySelector('input[name="kalshi-env"][value="demo"]');
-  radio.checked = true;
-  $("prod-warn").style.display = radio.value === "prod" ? "block" : "none";
-  $("key-id-input").placeholder = s.key_id_set ? `current key ends in ...${s.key_id_last4}` : "not set";
-  $("key-path-input").value = s.private_key_path || "";
-  $("settings-status").innerHTML = `<div class="note">Settings file: ${esc(s.env_file)}${s.env_file_exists ? "" : " (does not exist yet -- Save will create it)"}</div>`;
-}
-
-async function saveSettings() {
-  const payload = { kalshi_env: $q('input[name="kalshi-env"]:checked').value };
-  if ($("key-id-input").value) payload.key_id = $("key-id-input").value;
-  if ($("key-path-input").value) payload.private_key_path = $("key-path-input").value;
-  const status = $("settings-status");
-  try {
-    const res = await fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || res.statusText);
-    $("key-id-input").value = "";
-    status.innerHTML = '<div class="ok">Saved.</div>';
-    await loadSettings();
-  } catch (err) { status.innerHTML = `<div class="error">Error: ${esc(err.message)}</div>`; }
-}
-
-// ---------------------------------------------------------------- strategy lab
-const LAB_FIELDS = [
-  ["min_edge", "Min edge", "0.02, 0.04, 0.06", "How far the model's win chance must beat your bid price (after fees)."],
-  ["max_spread", "Max spread ($)", "0.02, 0.06", "Skip thin books: bid-ask gap must be at most this."],
-  ["max_tau_sec", "Earliest entry (secs left)", "480, 600, 780", "Only enter once this many seconds or fewer remain in the 15-minute window."],
-  ["min_tau_sec", "Latest entry (secs left)", "30, 120, 300", "Stop entering when fewer than this many seconds remain."],
-  ["min_price", "Min entry price ($)", "none, 0.20", "0.20 = 20 cents. 'none' = no floor."],
-  ["max_price", "Max entry price ($)", "none, 0.60", "0.60 = 60 cents. 'none' = no cap."],
-  ["persist_steps", "Edge must persist (seconds)", "1, 5, 15, 30", "Only enter once the strategy has wanted the same side this many seconds in a row (ignores one-quote flickers)."],
-  ["min_p_side", "Min chance of winning", "none, 0.5, 0.6", "Only enter a side the model says is at least this likely to win. 0.5 refuses bets against the favourite."],
-  ["trend_mode", "Trend filter", "off, with, against, aligned4", "aligned4 requires matching 15m/30m/1h/24h directions and full history. with = only the side spot is moving toward; against = fade the move."],
-  ["trend_lookback_sec", "Trend lookback (secs)", "60, 180", "How far back to measure the move."],
-  ["trend_min_move_usd", "Trend min move ($)", "0, 10, 25", "Ignore moves smaller than this."],
-  ["model_blend", "Model weight (0-1)", "0.3, 0.5, 0.8", "1 = trust the model only, 0 = trust the market mid only."],
-  ["min_stake_pct", "Minimum order premium (% initial account)", "5", "Default 5: $5 on $100; $25 on $500. Fees extra. Whole contracts round up; risk/cash limits may skip. Partial fills can be smaller."],
-  ["risk_pct", "Risk per trade (% of account)", "1, 2, 5", "Blank = fixed number of contracts instead."],
-  ["max_growth_pct", "Max growth per win (%)", "none, 10, 25", "With risk %: after a win the next order may be at most this much larger. Never grows after a loss."],
-  ["contracts", "Fixed contracts", "5, 10", "Used when risk % is blank."],
-  ["ramp_growth_pct", "Ramp growth per win (contracts %)", "none, 20, 50", "Independent of risk %: after a win the next order grows by at least 1 contract, or this % of the last order, whichever is more. Any loss resets straight back to the fixed contracts above. This is sizing.mode 'ramp' -- supported but no longer the live default (percent-of-account, i.e. risk % above, is); 'none' turns it off (flat contracts every time)."],
-];
-const LAB_PRESETS = {
-  "Entry timing": { max_tau_sec: "480, 600, 780", min_tau_sec: "30, 60, 120, 300" },
-  "Entry price": { min_price: "none, 0.15, 0.30", max_price: "none, 0.50, 0.60, 0.70" },
-  "Multi-timeframe": { trend_mode: "aligned4", min_price: "0.55", max_price: "0.65", min_tau_sec: "480", max_tau_sec: "600", min_stake_pct: "5" },
-  "Trend": { trend_mode: "off, with, against", trend_lookback_sec: "60, 180", trend_min_move_usd: "0, 10, 25" },
-  "Risk sizing": { risk_pct: "1, 2, 5, 10" },
-  "Edge and spread": { min_edge: "0.01, 0.02, 0.04, 0.06", max_spread: "0.02, 0.04, 0.06" },
-  "A bit of everything": { min_edge: "0.02, 0.04", min_tau_sec: "30, 120", max_price: "none, 0.60", trend_mode: "off, with" },
-};
-let labJob = null, labTimer = null, labPreviewTimer = null;
-
-function buildLabForm(databases) {
-  $("lab-fields").innerHTML = LAB_FIELDS.map(([key, label, ph, help]) =>
-    `<div class="field"><label for="lab-${key}">${label}</label><input id="lab-${key}" placeholder="${esc(ph)}"><small>${esc(help)}</small></div>`).join("");
-  $("lab-presets").innerHTML = Object.keys(LAB_PRESETS).map((n) => `<button class="action" data-preset="${esc(n)}">${esc(n)}</button>`).join("");
-  document.querySelectorAll("#lab-presets button").forEach((b) => b.addEventListener("click", () => {
-    LAB_FIELDS.forEach(([key]) => { $("lab-" + key).value = LAB_PRESETS[b.dataset.preset][key] || ""; });
-    labPreview();
-  }));
-  document.querySelectorAll("#lab-fields input, #lab-account_usd").forEach((i) => i.addEventListener("input", labPreviewSoon));
-  renderLabDbs(databases);
-  LAB_PRESETS["Entry timing"] && Object.entries(LAB_PRESETS["Entry timing"]).forEach(([k, v]) => { $("lab-" + k).value = v; });
-  labPreview();
-}
-
-function renderLabDbs(databases) {
-  const usable = databases.filter((d) => d.kind !== "unknown");
-  $("lab-dbs").innerHTML = usable.length ? usable.map((d) => {
-    const demo = /-demo-/.test(d.name);
-    return `<label><input type="checkbox" value="${esc(d.name)}" ${demo ? "disabled" : "checked"}> ${esc(dbLabel(d))}${demo ? ' <span class="orange">(demo, synthetic)</span>' : ""}</label>`;
-  }).join("") : '<div class="empty">No recordings yet. Run <code>btcbot paper</code> or <code>btcbot record</code> first.</div>';
-  document.querySelectorAll("#lab-dbs input").forEach((i) => i.addEventListener("change", labPreviewSoon));
-}
-
-function labPayload() {
-  const grid = {};
-  LAB_FIELDS.forEach(([key]) => { grid[key] = $("lab-" + key).value; });
-  const dbs = [...document.querySelectorAll("#lab-dbs input:checked")].map((i) => i.value);
-  const out = { dbs, grid };
-  ["account_usd", "max_exposure_pct", "daily_loss_pct", "split", "min_train_trades", "queue", "maker_fee_multiplier"].forEach((k) => { out[k] = $("lab-" + k).value; });
-  return out;
-}
-
-async function postJson(url, body) {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
-}
-
-function labPreviewSoon() { clearTimeout(labPreviewTimer); labPreviewTimer = setTimeout(labPreview, 350); }
-async function labPreview() {
-  const el = $("lab-preview");
-  try {
-    const r = await postJson("/api/lab/preview", labPayload());
-    el.className = r.combinations > 400 ? "error" : "note";
-    el.textContent = `${r.combinations.toLocaleString()} combinations \u00b7 ${r.windows.toLocaleString()} windows in the selected files`;
-  } catch (err) { el.className = "note"; el.textContent = err.message; }
-}
-
-const mUsd = (v) => `<span class="${Number(v) > 0 ? "pnl-pos" : Number(v) < 0 ? "pnl-neg" : ""}">${Number(v) < 0 ? "-" : ""}$${Math.abs(Number(v)).toFixed(2)}</span>`;
-function metricCells(m) {
-  const wr = m.win_rate === null ? "--" : (m.win_rate * 100).toFixed(0) + "%";
-  const t = m.t_stat === null ? "--" : (m.t_stat > 0 ? "+" : "") + m.t_stat.toFixed(1);
-  return `<td class="num">${m.resolved}</td><td class="num">${wr}</td><td class="num">${mUsd(m.pnl)}</td><td class="num">${t}</td>`;
-}
-
-function renderLabReport(r) {
-  const rows = r.rows.map((row) => `<tr><td class="num">${row.rank}</td><td>${esc(row.description)}${row.equivalent ? ` <span class="sub">(+${row.equivalent} equivalent)</span>` : ""}</td>${metricCells(row.train)}${metricCells(row.test)}
-    <td class="num">${row.test.return_pct === null ? "--" : row.test.return_pct.toFixed(1) + "%"}</td>
-    <td class="num">${row.test.max_drawdown_pct === null ? "--" : row.test.max_drawdown_pct.toFixed(1) + "%"}</td></tr>`).join("");
-  const base = `<tr class="base"><td class="num">base</td><td>config.yaml defaults</td>${metricCells(r.baseline_train)}${metricCells(r.baseline_test)}
-    <td class="num">${r.baseline_test.return_pct === null ? "--" : r.baseline_test.return_pct.toFixed(1) + "%"}</td>
-    <td class="num">${r.baseline_test.max_drawdown_pct === null ? "--" : r.baseline_test.max_drawdown_pct.toFixed(1) + "%"}</td></tr>`;
-  $("lab-results").innerHTML = `
-    <div class="verdict ${esc(r.verdict_level)}"><b>${{ insufficient: "Not enough data to conclude", not_supported: "Did not hold up on unseen windows", weak_signal: "Held up on unseen windows (weakly)" }[r.verdict_level] || ""}</b>${esc(r.verdict)}</div>
-    <div class="sub" style="margin-bottom:8px">${r.windows_total} windows: ${r.windows_train} train, ${r.windows_test} test (1 skipped between). ${r.combinations.toLocaleString()} combinations, ${r.ranked_combinations.toLocaleString()} with at least ${r.min_train_trades} training trades. Account $${esc(r.account_usd)} \u00b7 ${esc(r.queue)} fills \u00b7 ${r.seconds.toFixed(1)}s.</div>
-    <table><thead><tr><th class="num">#</th><th>What changed</th>
-      <th class="num" colspan="4" style="text-align:center">TRAIN (used to rank)</th><th class="num" colspan="4" style="text-align:center">TEST (never seen)</th><th class="num">Return</th><th class="num">Max DD</th></tr>
-      <tr><th></th><th></th><th class="num">Trades</th><th class="num">Win</th><th class="num">PnL</th><th class="num">t</th><th class="num">Trades</th><th class="num">Win</th><th class="num">PnL</th><th class="num">t</th><th class="num">(test)</th><th class="num">(test)</th></tr></thead>
-      <tbody>${base}${rows || '<tr><td colspan="12" class="empty">Nothing had enough training trades to rank.</td></tr>'}</tbody></table>
-    <h3>Read this before believing anything</h3><ul class="warns">${r.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}<li>t is the average PnL per trade divided by its noise; roughly, below 2 is indistinguishable from luck.</li></ul>`;
-}
-
-function labSetRunning(running) {
-  $("lab-run").disabled = running; $("lab-cancel").disabled = !running;
-  $("lab-bar").style.display = running ? "block" : "none";
-}
-
-async function labPoll() {
-  if (!labJob) return;
-  try {
-    const st = await getJson("/api/lab/status?id=" + encodeURIComponent(labJob));
-    const pct = st.total ? (st.done / st.total) * 100 : 5;
-    $("lab-bar-fill").style.width = pct + "%";
-    $("lab-status").className = "note";
-    $("lab-status").textContent = st.state === "running"
-      ? `${st.done}/${st.total || "?"} \u00b7 ${st.label} \u00b7 ${Math.round(st.elapsed_sec)}s` : "";
-    if (st.state !== "running") {
-      clearInterval(labTimer); labJob = null; labSetRunning(false);
-      if (st.state === "done") renderLabReport(st.report);
-      else if (st.state === "cancelled") { $("lab-status").textContent = "Cancelled."; }
-      else { $("lab-status").className = "error"; $("lab-status").textContent = "Error: " + st.error; }
-    }
-  } catch (err) { clearInterval(labTimer); labJob = null; labSetRunning(false); $("lab-status").className = "error"; $("lab-status").textContent = "Error: " + err.message; }
-}
-
-async function labRun() {
-  $("lab-status").className = "note"; $("lab-status").textContent = "Starting...";
-  try {
-    const st = await postJson("/api/lab/start", labPayload());
-    labJob = st.id; labSetRunning(true);
-    clearInterval(labTimer); labTimer = setInterval(labPoll, 1000); labPoll();
-  } catch (err) { $("lab-status").className = "error"; $("lab-status").textContent = "Error: " + err.message; }
-}
-
-async function labCancel() { if (labJob) { try { await postJson("/api/lab/cancel", { id: labJob }); } catch (e) { /* the poll will surface it */ } } }
-
-let tab = "market";
-async function refreshDemo() {
-  const db = $("db-select").value, note = $("demo-note");
-  if (!db) { note.className = "note"; note.textContent = "No data files yet. Start btcbot demo, then click Refresh."; return; }
-  try {
-    const d = await getJson(`/api/demo?db=${encodeURIComponent(db)}`);
-    if (db !== $("db-select").value || tab !== "demo") return;
-    const s = d.summary, t = (iso) => (iso ? iso.slice(11, 19) : "--");
-    const age = d.last_snapshot ? (Date.now() - new Date(d.last_snapshot).getTime()) / 1000 : null;
-    $("demo-tiles").innerHTML = [
-      ["Orders placed", s.placed], ["Filled on demo", s.filled_on_demo], ["Filled in paper", s.filled_in_paper],
-      ["Rejected", s.rejected], ["Problems", s.problems], ["Demo PnL (settled)", fmtUsd(s.demo_pnl)],
-      ["Paper PnL (settled)", fmtUsd(s.paper_pnl)], ["Data age", age === null ? "--" : (age < 60 ? age.toFixed(1) + "s" : "stale")],
-    ].map(([label, value]) => `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
-    note.className = "note";
-    note.textContent = d.orders.length || d.events.length ? "Exchange demo fills vs simulated paper fills for this run only: " + db + ". Older/manual account trades are not included." : "No demo orders yet. Normal: the strategy only orders when it sees an edge. If this is not a demo file, pick the newest Demo orders file above.";
-    $q("#demo-orders tbody").innerHTML = d.orders.length ? d.orders.map((o) => `<tr><td>${t(o.placed_ts)}</td><td>${esc(o.ticker.slice(-8))}</td>
-      <td>${esc(o.side)}</td><td class="num">${cents(o.price)}</td><td class="num">${esc(o.size)}</td><td>${esc(o.state)}</td>
-      <td class="num">${num(o.demo_filled)}</td><td class="num">${o.demo_avg_price === null ? "--" : cents(o.demo_avg_price)}</td>
-      <td class="num">$${Number(o.demo_fee).toFixed(4)}</td><td class="num">${num(o.paper_filled)}</td>
-      <td class="num">${o.demo_pnl === null ? "--" : fmtUsd(o.demo_pnl)}</td><td class="num">${o.paper_pnl === null ? "--" : fmtUsd(o.paper_pnl)}</td></tr>`).join("")
-      : '<tr><td colspan="12" class="empty">No orders yet.</td></tr>';
-    $q("#demo-events tbody").innerHTML = d.events.length ? d.events.map((e) => `<tr><td>${t(e.ts)}</td><td>${esc((e.ticker || "").slice(-8))}</td><td>${esc(e.event)}</td><td>${esc(e.detail)}</td></tr>`).join("")
-      : '<tr><td colspan="4" class="empty">No problems. </td></tr>';
-    $q("#demo-audit tbody").innerHTML = d.audit.length ? d.audit.map((a) => `<tr><td>${t(a.ts)}</td><td>${esc(a.event)}</td><td>${esc(a.side || "")}</td>
-      <td class="num">${a.price ? cents(a.price) : ""}</td><td class="num">${esc(a.count || "")}</td><td>${esc((a.order_id || "").slice(0, 13))}</td><td>${esc(a.error || "")}</td></tr>`).join("")
-      : '<tr><td colspan="7" class="empty">No ledger yet.</td></tr>';
-  } catch (err) { note.className = "error"; note.textContent = "Error: " + err.message; }
-}
-
-let refreshing = false;
-let quoting = false;
-async function refreshQuote() {
-  if (quoting || document.hidden || tab !== "market" || !market?.ticker) return;
-  const db = $("db-select").value, ticker = market.ticker, selection = $("ticker-select").value;
-  if (selection && selection !== ticker) return;
-  quoting = true;
-  try {
-    const q = await getJson(`/api/quote?db=${encodeURIComponent(db)}&ticker=${encodeURIComponent(ticker)}`);
-    if (db !== $("db-select").value || selection !== $("ticker-select").value || ticker !== market?.ticker) return;
-    if (q.book_ts && (!market.book_ts || q.book_ts > market.book_ts)) {
-      market.book = q.book; market.book_ts = q.book_ts; market.book_latency_ms = q.book_latency_ms;
-      renderBook();
-      $("st-ts").textContent = new Date(q.book_ts).toLocaleTimeString();
-      $("st-latency").textContent = q.book_latency_ms == null ? "--" : q.book_latency_ms.toFixed(0) + " ms";
-    }
-    if (q.spot_ts && (!market.spot_ts || q.spot_ts > market.spot_ts)) {
-      market.spot = q.spot; market.spot_ts = q.spot_ts;
-      const spot = Number(q.spot), strike = Number(market.strike);
-      $("f-spot").innerHTML = `<span class="orange">$${num(spot)}</span>` + (strike ? ` <span class="${spot >= strike ? "green" : "red"}" style="font-size:11px">${spot >= strike ? "+" : "-"}$${num(Math.abs(spot - strike))}</span>` : "");
-    }
-    updateAge();
-  } catch (e) { /* ages continue advancing when the local reader is unavailable */ }
-  finally { quoting = false; }
-}
-async function refreshTab() {
-  if (refreshing) return;  // a slow response must not pile up requests behind it
-  refreshing = true;
-  try {
-    if (tab === "market") await refreshMarket(); else if (tab === "monitor") await refreshMonitor(); else if (tab === "demo") await refreshDemo();
-  } finally { refreshing = false; }
-}
-document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("click", () => {
-  tab = btn.dataset.tab;
-  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
-  document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === `tab-${tab}`));
-  const noPicker = tab === "settings" || tab === "lab";
-  $("db-row").style.display = noPicker ? "none" : "";
-  $("pickhelp").style.display = noPicker ? "none" : "";
-  $q("#ticker-select").parentElement.style.display = tab === "market" ? "" : "none";
-  selectRun();
-  refreshTab();
-}));
-document.querySelectorAll("#side-toggle button").forEach((b) => b.addEventListener("click", () => {
-  side = b.dataset.side;
-  document.querySelectorAll("#side-toggle button").forEach((x) => x.classList.toggle("on", x === b));
-  $("side-toggle").classList.toggle("no", side === "no");
-  renderBook();
-}));
-$("refresh-databases").addEventListener("click", async () => { const dbs = await refreshDatabases(); renderLabDbs(dbs); refreshTab(); });
-$("db-select").addEventListener("change", () => { runSelections[runGroup()] = $("db-select").value; market = null; $("ticker-select").innerHTML = ""; refreshTab(); });
-$("ticker-select").addEventListener("change", refreshTab);
-$("run-backtest").addEventListener("click", runBacktest);
-$("lab-run").addEventListener("click", labRun);
-$("lab-cancel").addEventListener("click", labCancel);
-$("save-settings").addEventListener("click", saveSettings);
-document.querySelectorAll('input[name="kalshi-env"]').forEach((r) => r.addEventListener("change", () => {
-  $("prod-warn").style.display = $q('input[name="kalshi-env"]:checked').value === "prod" ? "block" : "none";
-}));
-window.addEventListener("resize", () => { if (tab === "market" || tab === "monitor") refreshTab(); });
-
-(async function init() {
-  let dbList = [];
-  try { dbList = await refreshDatabases(); } catch (e) { $("market-note").textContent = "Error: " + e.message; }
-  buildLabForm(dbList);
-  await refreshMarket();
-  try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
-  setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor" || tab === "demo")) refreshTab(); }, 3000);
-  setInterval(() => { if (!document.hidden) refreshDatabases().catch(() => {}); }, 10000);
-  setInterval(refreshQuote, 50);
-  setInterval(updateAge, 50);
-})();
-</script>
-</body>
-</html>
-"""
+INDEX_HTML = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
