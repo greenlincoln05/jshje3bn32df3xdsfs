@@ -7,6 +7,7 @@ import pytest
 
 from btcbot.backtest import (
     BacktestError,
+    EntryFilters,
     Settlement,
     load_replay_data,
     load_settlements,
@@ -113,8 +114,8 @@ def seed_window_with_price_drop(conn, ticker, *, start_ts, strike=Decimal("80000
     return close_time
 
 
-def replay(conn, config):
-    return replay_prepared(prepare_replay(load_replay_data(conn), config), config)
+def replay(conn, config, *, filters=None):
+    return replay_prepared(prepare_replay(load_replay_data(conn), config), config, filters=filters)
 
 
 class TestLoaders:
@@ -358,6 +359,43 @@ class TestStopLoss:
         assert exited.size == Decimal(2) and held.size == Decimal(3)
         assert exited.exit_price == Decimal("0.20")
         assert held.result == "no" and held.entry_price == Decimal("0.30")  # unchanged cost basis for the rest
+
+
+class TestRampSizingInBacktest:
+    """sizing.mode "ramp" is the shipped default, but replay_prepared's core loop only sizes flat contracts
+    unless EntryFilters.ramp_growth_pct is explicitly set -- so btcbot backtest/lab did not reflect live
+    sizing until this filter was added (see docs/research/overnight-handoff.md). FULL_FILL_SIZES (unlike
+    seed_fillable_window's own default, deliberately-partial sequence) fills whatever size is actually
+    ordered, up to 9 contracts, so TradeRecord.size below reflects the ramped ORDER size exactly."""
+
+    def test_a_loss_resets_to_base_and_a_later_win_ramps_again(self, tmp_path):
+        conn = make_db(tmp_path)
+        for i, result in enumerate(["yes", "no", "yes", "yes"]):
+            start = T0 + timedelta(seconds=i * 15)
+            seed_fillable_window(conn, f"T{i}", start_ts=start, sizes=FULL_FILL_SIZES)
+            # Announced well before the next window starts (unlike a real close_time, ~500s out), so each
+            # settlement's ramp effect is in place before the next window's own entry decision.
+            insert_settlement(conn, f"T{i}", result, strike=Decimal("80000"),
+                               close_time=start + timedelta(seconds=500), available_ts=start + timedelta(seconds=12))
+        config = BotConfig()  # default sizing: ramp, contracts_per_trade=5, ramp_growth_pct=20
+
+        result = replay(conn, config, filters=EntryFilters(ramp_growth_pct=config.sizing.ramp_growth_pct))
+
+        sizes = [t.size for t in sorted(result.trades, key=lambda t: t.entry_ts)]
+        assert sizes == [Decimal(5), Decimal(6), Decimal(5), Decimal(6)]
+
+    def test_without_the_filter_sizing_stays_flat_regardless_of_config(self, tmp_path):
+        conn = make_db(tmp_path)
+        for i, result in enumerate(["yes", "no", "yes"]):
+            start = T0 + timedelta(seconds=i * 15)
+            seed_fillable_window(conn, f"T{i}", start_ts=start, sizes=FULL_FILL_SIZES)
+            insert_settlement(conn, f"T{i}", result, strike=Decimal("80000"),
+                               close_time=start + timedelta(seconds=500), available_ts=start + timedelta(seconds=12))
+
+        result = replay(conn, BotConfig())  # no filters: today's plain-backtest behavior, unchanged
+
+        sizes = [t.size for t in sorted(result.trades, key=lambda t: t.entry_ts)]
+        assert sizes == [Decimal(5), Decimal(5), Decimal(5)]
 
 
 class TestReportShape:

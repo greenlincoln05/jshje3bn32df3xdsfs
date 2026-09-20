@@ -31,3 +31,50 @@
 - Recorder still writing (db mtime recent); demo process alive; note partial fills (a 5-lot order can fill only
   2 contracts while the paper twin assumes all 5; the twin is optimistic).
 - Workflow: commit, then push as a separate call; review gate (`mark-reviewed.mjs`) needs a real review first.
+
+## Progress (Claude, 2026-09-20 overnight)
+
+**Ramp reset-then-ramp-again, verified (owner's specific ask):** traced `ramp_next_size()` and its
+`LivePaperTrader._resolve()` wiring -- a loss already resets straight to `contracts_per_trade` (base)
+unconditionally, and the next settled win resumes growing from there, exactly as intended. No production bug;
+added `TestLiveTraderRampMode` (`tests/test_ramp_sizing.py`) driving the actual live-trader decision loop
+through win/LOSS/win/win (order sizes `[5, 6, 5, 6]`) and two-losses-in-a-row (never below base), since only
+the pure function had coverage before. Confirmed each assertion catches a regression by temporarily breaking
+the reset branch and watching 4 tests fail, then restoring. See PR #35.
+
+**Item 4, ramp parity in lab/backtest -- done for the lab's `EntryFilters` path, not `run_backtest`'s bare
+path:** `EntryFilters.ramp_growth_pct` / `LabParams.ramp_growth_pct` (a new sweepable grid axis) now drive
+the exact same `ramp_next_size()` used live, independent of the `account_usd`/`risk_pct_per_trade`
+(percent-mode) machinery. `LabParams.from_config()` picks it up automatically when `config.sizing.mode` is
+`ramp` (the shipped default) -- so a plain `btcbot lab` run (no `--grid`) now reflects live sizing without
+asking for it explicitly, the same way percent/kelly never did (those stay opt-in only, unchanged).
+Deliberately did **not** wire this into `run_backtest()`'s own no-filters call: it would have broken
+`test_no_filters_is_identical_to_the_plain_backtest`'s invariant (that a bare backtest call is byte-for-byte
+what a raw `filters=None` replay produces) by silently injecting filters behind the caller's back. Whoever
+picks up `btcbot backtest`'s own CLI parity next should decide deliberately whether that invariant should
+change, not have it changed for them.
+
+New tests: `tests/test_backtest.py::TestRampSizingInBacktest` (win/LOSS/win/win via a full-filling order-book
+sequence -- `FULL_FILL_SIZES`, since the default `seed_fillable_window` sequence only ever fills 4 contracts
+regardless of order size, which would hide any sizing-mode bug), `tests/test_lab.py::TestRampSizing` (same
+end-to-end check, plus `from_config()`'s auto-detection and the grid-axis wiring). All new assertions verified
+to fail against a deliberately broken build first. Full suite: 823 passed, offline only, no key used.
+
+**Item 3, stop-loss lab replay -- the grid axis now exists, no sweep has been run:** `docs/research/
+stop-loss-handoff.md` step 3 asked for `stop_loss_pct`/`take_profit_pct` to be a grid axis judged on the
+train/test split, same as any other lab parameter; until tonight it only ever came from whatever `--config`
+YAML the whole run used, fixed for every combination (that doc's own "Not done" note). Added
+`LabParams.stop_loss_pct` / `take_profit_pct` / `stop_min_hold_sec` / `stop_min_tau_sec`, wired into
+`_config_for`'s `config.exit` (independent of sizing, unlike ramp/percent) and picked up automatically by
+`from_config()` from whatever `config.exit` already says. `tests/test_lab.py::TestExitRulesGrid` covers
+parsing/range-checking, the grid sweep, `_config_for`'s wiring, and an end-to-end replay (a seeded price-drop
+window closes early with a tight stop configured, and does not without one) -- each assertion verified to
+fail first against a deliberately broken build. This makes a real sweep possible in one `btcbot lab --grid
+stop_loss_pct=...` call; running that sweep against real recorded data, and reading the result, is still
+undone and still needs data this sandbox does not have. See `docs/research/stop-loss-handoff.md`'s own
+Progress section for the full picture across both nights.
+
+**Still open from this list:** item 1 (candidate suite forward check) and item 2 (Codex's data pipeline) need
+real recorded data this sandbox does not have; item 3's actual sweep (above) also needs real recorded data,
+though the mechanism to run it now exists end to end. `btcbot backtest`'s own ramp parity (above) is a real,
+separate follow-up if wanted.

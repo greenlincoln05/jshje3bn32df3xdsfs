@@ -27,7 +27,7 @@ from btcbot.model import TimedVolatility, ModelState, predict
 from btcbot.models import OrderBook, ParseError, PriceLevel, Side, parse_time
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, Decision, decide, percent_size
+from btcbot.strategy import Action, Decision, decide, percent_size, ramp_next_size
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -388,6 +388,11 @@ class EntryFilters:
     risk_pct_per_trade: Decimal | None = None
     min_stake_usd: Decimal = Decimal(0)
     max_growth_pct: Decimal | None = None  # after a win the next order may grow by at most this percent (None: no ramp)
+    # sizing.mode "ramp" (btcbot.strategy.ramp_next_size), independent of account_usd/risk_pct_per_trade above
+    # (percent-of-account sizing): a settled win grows the next order by max(1, ramp_growth_pct%) contracts
+    # from the configured base (contracts_per_trade); any loss drops it straight back to that base. None: off,
+    # the plain contracts_per_trade size every time.
+    ramp_growth_pct: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,21 +456,27 @@ def replay_prepared(
     rest_streak = 0
     bankroll = filters.account_usd if filters is not None else None
     equity: list[tuple[datetime, Decimal]] = []
-    last_order_size: Decimal | None = None  # the ordered size of the most recent order (for the growth ramp)
+    last_order_size: Decimal | None = None  # the ordered size of the most recent order (for the percent-mode ramp)
     last_result: str | None = None  # "win" / "loss" of the most recent settled trade
+    ramp_size: Decimal | None = None  # sizing.mode "ramp": next order size, moved only by settlements (see below)
     if bankroll is not None and filters.risk_pct_per_trade is not None:
         risk.set_account_value(bankroll)
 
     def finalize_trade(record: TradeRecord, ts: datetime, *, exposure_released_usd: Decimal) -> None:
         """Record a trade whose PnL is now known -- by settlement or by an early exit -- and update
         risk/bankroll state the same way regardless of which one closed it."""
-        nonlocal bankroll, last_result
+        nonlocal bankroll, last_result, ramp_size
         assert record.pnl_usd is not None
         trades.append(record)
         risk.record_trade_closed(
             TradeOutcome(ts=ts, size=record.size, pnl_usd=record.pnl_usd), exposure_released_usd=exposure_released_usd
         )
         last_result = "loss" if record.pnl_usd < 0 else "win"
+        if filters is not None and filters.ramp_growth_pct is not None:
+            ramp_size = ramp_next_size(
+                record.size, record.pnl_usd > 0, base=Decimal(config.sizing.contracts_per_trade),
+                growth_pct=filters.ramp_growth_pct, max_contracts=Decimal(config.risk.max_contracts_per_trade),
+            )
         if bankroll is not None:
             bankroll += record.pnl_usd
             equity.append((ts, bankroll))
@@ -558,6 +569,10 @@ def replay_prepared(
             if not wanted:
                 counts["book_move"] += 1
                 return None
+        if filters.ramp_growth_pct is not None:
+            # Independent of account_usd/bankroll: ramp sizes by contract count, not by percent of an account.
+            contracts = int(ramp_size if ramp_size is not None else decision.size)
+            decision = replace(decision, size=Decimal(min(contracts, config.risk.max_contracts_per_trade)))
         if bankroll is not None:
             cash = bankroll - risk.open_exposure_usd
             if filters.risk_pct_per_trade is not None:
