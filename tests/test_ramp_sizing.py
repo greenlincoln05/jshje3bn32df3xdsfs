@@ -28,3 +28,10 @@ def test_price_band_boost_doubles_only_inside_band_and_never_after_loss():
     trader, buffer = make_trader(sqlite3.connect(":memory:"), config=cfg)
     rows = asyncio.run(run_windows(trader, buffer, ["yes"] * 2))
     assert rows[0][1] == 10  # 5 doubled, at the cap
+
+
+def test_boost_band_must_be_ordered():
+    import pytest
+    from btcbot.config import Sizing
+    with pytest.raises(ValueError):
+        Sizing(boost_min_price=D("0.5"), boost_max_price=D("0.3"))

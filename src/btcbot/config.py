@@ -64,6 +64,13 @@ class Sizing(_Strict):
     max_growth_per_win_pct: Decimal = Field(Decimal("20"), ge=0, le=100)
 
 
+    @model_validator(mode="after")
+    def _boost_band_is_ordered(self) -> "Sizing":
+        if self.boost_min_price > self.boost_max_price:
+            raise ValueError("boost_min_price must not exceed boost_max_price")
+        return self
+
+
 class RiskLimits(_Strict):
     max_contracts_per_trade: int = Field(10, gt=0)
     max_open_exposure_usd: Decimal = Field(Decimal("25"), gt=0)
