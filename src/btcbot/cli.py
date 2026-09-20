@@ -518,6 +518,18 @@ async def _cmd_features(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_compare(args: argparse.Namespace) -> int:
+    """Line up a demo and a prod recording window by window. Offline: no network, no key."""
+    from btcbot.compare import CompareError, compare, render
+
+    try:
+        print(render(compare(args.demo_db, args.prod_db)))
+    except (CompareError, BacktestError, sqlite3.Error, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     """Evaluate a frozen set of named candidates against shared recorded data."""
     config = load_config(args.config)
@@ -914,6 +926,11 @@ def build_parser() -> argparse.ArgumentParser:
     features.add_argument("--step-sec", type=float, default=5.0, help="keep at most one row per window per this many seconds (default: 5)")
     features.add_argument("--output", default="data/research/features.csv")
     features.set_defaults(handler=_cmd_features)
+
+    compare_cmd = commands.add_parser("compare", help="line up a demo and a prod recording window by window (offline)")
+    compare_cmd.add_argument("--demo-db", required=True, help="a demo-* database")
+    compare_cmd.add_argument("--prod-db", required=True, help="a paper-*-prod database recorded over the same period")
+    compare_cmd.set_defaults(handler=_cmd_compare)
 
     suite = commands.add_parser(
         "lab-suite",
