@@ -80,7 +80,7 @@ def build_rows(db_paths: Sequence[str | Path], *, step_sec: float = 5.0) -> list
         raise FeatureError("no databases given")
     parts = []
     for path in db_paths:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
         try:
             parts.append((Path(path).name, load_replay_data(conn), _load_preds(conn)))
         finally:
@@ -97,13 +97,13 @@ def build_rows(db_paths: Sequence[str | Path], *, step_sec: float = 5.0) -> list
     outcomes: dict[str, str] = {}
     for _, data, _ in parts:
         windows.update(data.windows)
-        outcomes.update({t: s.result for t, s in data.settlements.items()})
+        outcomes.update({t: s.result for t, s in data.settlements.items() if s.result in ("yes", "no")})
 
     rows: list[dict] = []
     for i, (name, data, preds) in enumerate(parts):
         spot = SpotSeries(data.spot_ticks)
         last_kept: dict[str, float] = {}
-        for snap in data.snapshots:
+        for snap in sorted(data.snapshots, key=lambda x: x.poll_ts):
             t = snap.ticker
             if counts[t][1] != i or t not in windows:
                 continue
@@ -141,7 +141,7 @@ def build_rows(db_paths: Sequence[str | Path], *, step_sec: float = 5.0) -> list
             for n in SPOT_LOOKBACKS_SEC:
                 row[f"spot_move_{n}s"] = _f(spot.move(snap.poll_ts, n))
             rows.append(row)
-    rows.sort(key=lambda r: (r["ts"], r["ticker"]))
+    rows.sort(key=lambda r: (parse_time(r["ts"]), r["ticker"]))
     return rows
 
 
