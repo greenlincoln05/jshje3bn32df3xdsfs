@@ -1,5 +1,5 @@
 const fs = require('fs'), vm = require('vm'), assert = require('node:assert/strict');
-const html = fs.readFileSync('src/btcbot/webui.py','utf8');
+const html = fs.readFileSync('src/btcbot/dashboard.html','utf8');
 const source = html.slice(html.indexOf('let databaseList = []'),html.indexOf('\nfunction ladder'));
 const elements={'db-select':{value:'prod-old'},'ticker-select':{innerHTML:'old'}};
 const context=vm.createContext({$:id=>elements[id],tab:'market',market:{ticker:'old'}});
