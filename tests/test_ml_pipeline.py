@@ -9,13 +9,17 @@ import pytest
 
 from btcbot.backtest import load_replay_data, prepare_replay
 from btcbot.config import BotConfig
+from btcbot.features import COLUMNS
 from btcbot.ml_features import ENTRY_FEATURES, EXIT_FEATURES
 from btcbot.ml_pipeline import (
+    FEATURE_STORE_ENTRY_FEATURES,
     MLPipelineError,
     build_training_examples,
     train_and_validate,
+    train_and_validate_from_features,
     train_entry_model,
     train_exit_model,
+    train_from_feature_rows,
 )
 from test_backtest import FULL_FILL_SIZES, insert_settlement, make_db, seed_fillable_window
 
@@ -138,3 +142,97 @@ class TestTrainAndValidate:
         data = load_replay_data(conn)
         with pytest.raises(MLPipelineError):
             train_and_validate(data, BotConfig(), which="entry")
+
+
+def separable_feature_rows(n_windows):
+    """Synthetic btcbot.features-shaped rows (every column defaulted to None, like a real CSV round trip,
+    matching tests/test_validation.py's own helper) where the label is a perfect function of
+    model_minus_market -- a v1-model-vs-market disagreement, the same signal
+    docs.research/demo-loss-streak-2026-09-20.md flags as the one that actually mattered."""
+    rows = []
+    for w in range(n_windows):
+        row = {c: None for c in COLUMNS}
+        signal = 3.0 if w % 2 == 0 else -3.0
+        row.update(
+            source="s", ticker=f"W{w:03d}", ts=f"2026-01-01T{w // 60:02d}:{w % 60:02d}:00+00:00",
+            tau_sec=300.0, spot_minus_strike=0.0, spot_move_60s=0.0, spot_move_300s=0.0, spot_move_900s=0.0,
+            yes_spread=0.02, yes_bid_size=10.0, no_bid_size=10.0, yes_depth3=20.0, no_depth3=20.0,
+            book_imbalance=0.0, p_model=0.5, sigma=0.0004, model_minus_market=signal, p_blend=0.5,
+            outcome_yes=1 if w % 2 == 0 else 0,
+        )
+        rows.append(row)
+    return rows
+
+
+class TestFeatureStoreExamples:
+    def test_drops_unsettled_rows(self):
+        from btcbot.ml_pipeline import _feature_store_examples
+
+        rows = separable_feature_rows(6)
+        rows[0]["outcome_yes"] = None
+
+        examples = _feature_store_examples(rows, FEATURE_STORE_ENTRY_FEATURES)
+
+        assert len(examples) == 5
+
+    def test_drops_rows_missing_a_named_feature(self):
+        from btcbot.ml_pipeline import _feature_store_examples
+
+        rows = separable_feature_rows(6)
+        rows[0]["sigma"] = None  # e.g. no prediction logged yet for this row
+
+        examples = _feature_store_examples(rows, FEATURE_STORE_ENTRY_FEATURES)
+
+        assert len(examples) == 5
+
+
+class TestTrainFromFeatureRows:
+    def test_learns_the_separable_signal_and_reports_a_brier_score(self):
+        rows = separable_feature_rows(60)
+
+        model, brier = train_from_feature_rows(rows)
+
+        assert model.feature_names == FEATURE_STORE_ENTRY_FEATURES
+        assert 0.0 <= brier <= 1.0
+        # A features-store row can be fed straight into predict_proba -- no adapter, no renaming.
+        yes_row = next(r for r in rows if r["model_minus_market"] > 0)
+        no_row = next(r for r in rows if r["model_minus_market"] < 0)
+        assert model.predict_proba(yes_row) > 0.7
+        assert model.predict_proba(no_row) < 0.3
+
+
+class TestTrainAndValidateFromFeatures:
+    def test_reports_examples_and_a_baseline_comparison(self):
+        rows = separable_feature_rows(60)
+
+        model, report = train_and_validate_from_features(rows, train_fraction=0.7)
+
+        assert report.train_examples > 0 and report.validate_examples >= 5
+        assert report.windows_train + report.windows_validate < 60  # one window embargoed at the boundary
+        assert 0.0 <= report.train_brier <= 1.0 and 0.0 <= report.validate_brier <= 1.0
+
+    def test_beats_a_constant_uninformative_baseline(self):
+        # p_blend is a constant 0.5 here (uninformative), so the trained model -- which actually separates
+        # the classes via model_minus_market -- must score a materially better (lower) Brier.
+        rows = separable_feature_rows(60)
+
+        _, report = train_and_validate_from_features(rows, train_fraction=0.7)
+
+        assert report.baseline_validate_brier is not None
+        assert report.beats_baseline is True
+        assert report.validate_brier < report.baseline_validate_brier
+
+    def test_no_baseline_rows_leaves_beats_baseline_unknown(self):
+        rows = separable_feature_rows(60)
+        for row in rows:
+            row["p_blend"] = None
+
+        _, report = train_and_validate_from_features(rows, train_fraction=0.7)
+
+        assert report.baseline_validate_brier is None
+        assert report.beats_baseline is None
+
+    def test_too_few_validate_rows_raises(self):
+        rows = separable_feature_rows(6)
+        with pytest.raises(MLPipelineError):
+            train_and_validate_from_features(rows)

@@ -408,6 +408,19 @@ class TestMLAblation:
         with pytest.raises(LabError, match="at least one"):
             run_ml_ablation(data, BotConfig(), ml_entry_model_path=None, ml_exit_model_path=None)
 
+    def test_rejects_a_model_trained_for_a_different_feature_schema(self, tmp_path):
+        from btcbot.ml_model import LogisticModel
+
+        data = seeded(tmp_path, alternating(12))
+        # A model whose feature_names don't overlap ENTRY_FEATURES at all -- e.g. one trained on the
+        # feature-store CSV's own column names (see docs/research/ml-layers-handoff.md's "feature schemas").
+        wrong_schema = LogisticModel(("book_imbalance", "yes_depth3"), (1.0, 1.0), 0.0, (0.0, 0.0), (1.0, 1.0))
+        entry_path = tmp_path / "wrong_schema.json"
+        save_model(wrong_schema, entry_path)
+
+        with pytest.raises(LabError, match="different feature schema"):
+            run_ml_ablation(data, BotConfig(), ml_entry_model_path=str(entry_path), ml_exit_model_path=None)
+
     def test_four_layers_share_the_same_train_test_split(self, tmp_path):
         data = seeded(tmp_path, alternating(12))
         entry_path = tmp_path / "entry.json"
@@ -451,6 +464,85 @@ class TestMLAblation:
 
         assert "TRAIN" in text and "TEST" in text
         assert "not a profitability claim" in text
+        assert "Verdict [" in text
+        assert "vs layer 1" in text  # only layers 2-4 get a delta note; layer 1 is the baseline itself
+
+    def test_a_small_seeded_dataset_is_flagged_insufficient_on_every_layer(self, tmp_path):
+        # 12 windows -> nowhere near ENOUGH_TEST_TRADES=30 test trades; every layer must refuse a verdict.
+        data = seeded(tmp_path, alternating(12))
+        entry_path = tmp_path / "entry.json"
+        save_model(_constant_model(1.0), entry_path)
+
+        report = run_ml_ablation(data, BotConfig(), ml_entry_model_path=str(entry_path), ml_exit_model_path=None)
+
+        assert all(layer.verdict_level == "insufficient" for layer in report.layers)
+
+
+def _metrics(*, resolved, pnl, t_stat, trades=None, windows=10):
+    from btcbot.lab import Metrics
+
+    return Metrics(
+        windows=windows, trades=trades if trades is not None else resolved, resolved=resolved, wins=0,
+        win_rate=None, pnl=Decimal(pnl), fees=Decimal(0), avg_pnl_per_trade=None, t_stat=t_stat,
+        max_drawdown=Decimal(0), return_pct=None, max_drawdown_pct=None, trades_per_day=None,
+    )
+
+
+class TestAblationLayerVerdict:
+    def test_insufficient_below_the_test_trade_threshold(self):
+        from btcbot.lab import ENOUGH_TEST_TRADES, _ablation_layer_verdict
+
+        train = _metrics(resolved=100, pnl="50", t_stat=5.0)
+        test = _metrics(resolved=ENOUGH_TEST_TRADES - 1, pnl="10", t_stat=5.0)
+
+        level, verdict = _ablation_layer_verdict(train, test)
+
+        assert level == "insufficient"
+        assert "no conclusion" in verdict
+
+    def test_not_supported_when_test_pnl_is_negative(self):
+        from btcbot.lab import ENOUGH_TEST_TRADES, _ablation_layer_verdict
+
+        train = _metrics(resolved=100, pnl="50", t_stat=5.0)
+        test = _metrics(resolved=ENOUGH_TEST_TRADES, pnl="-5", t_stat=None)
+
+        level, verdict = _ablation_layer_verdict(train, test)
+
+        assert level == "not_supported"
+        assert "lost money" in verdict
+
+    def test_not_supported_when_positive_but_not_significant(self):
+        from btcbot.lab import ENOUGH_TEST_TRADES, _ablation_layer_verdict
+
+        train = _metrics(resolved=100, pnl="50", t_stat=5.0)
+        test = _metrics(resolved=ENOUGH_TEST_TRADES, pnl="5", t_stat=1.0)
+
+        level, verdict = _ablation_layer_verdict(train, test)
+
+        assert level == "not_supported"
+        assert "not distinguishable from luck" in verdict
+
+    def test_weak_signal_when_positive_and_significant(self):
+        from btcbot.lab import ENOUGH_TEST_TRADES, _ablation_layer_verdict
+
+        train = _metrics(resolved=100, pnl="50", t_stat=3.0)
+        test = _metrics(resolved=ENOUGH_TEST_TRADES, pnl="20", t_stat=2.5)
+
+        level, verdict = _ablation_layer_verdict(train, test)
+
+        assert level == "weak_signal"
+        assert "forward paper-test" in verdict
+
+    def test_flags_a_large_train_to_test_t_stat_drop_as_overfitting(self):
+        from btcbot.lab import ENOUGH_TEST_TRADES, _ablation_layer_verdict
+
+        train = _metrics(resolved=100, pnl="50", t_stat=10.0)
+        test = _metrics(resolved=ENOUGH_TEST_TRADES, pnl="20", t_stat=2.5)
+
+        level, verdict = _ablation_layer_verdict(train, test)
+
+        assert level == "weak_signal"
+        assert "overfitting" in verdict
 
 
 class TestEquivalentSettings:

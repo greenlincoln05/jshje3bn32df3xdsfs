@@ -126,3 +126,118 @@ real network reached.
 - Train: `.venv/Scripts/btcbot.exe ml-train --db data/recorder-....sqlite --which entry --out models/entry.json`
 - Compare the four layers: `.venv/Scripts/btcbot.exe ml-ablation --db data/recorder-....sqlite --entry-model models/entry.json --exit-model models/exit.json`
 - Backfill (owner, needs network): `.venv/Scripts/btcbot.exe download-history --start 2026-01-01T00:00:00Z --end 2026-09-01T00:00:00Z`
+
+## Review (2026-09-20, later): reconciling parallel ML/validation work, and closing three gaps
+
+The owner asked for a review of "the latest PRs for ML infrastructure" and how to make sure ML actually helps
+entry, exit, and profit. In between this handoff's own PR merging and this review, three other sessions
+landed real, related work, motivated by an actual event: `docs/research/demo-loss-streak-2026-09-20.md`
+records a real `btcbot demo` run losing five trades in a row because a resting order sat for 5m25s while its
+edge decayed (fixed upstream by `strategy.decide()`'s new `resting_side`/`resting_price` cancel check). That
+incident is also what motivated:
+
+- **`features.py`** (`btcbot features`): flattens recorder databases into one flat, richer feature-store CSV
+  per snapshot -- tau, spot-minus-strike, three spot-momentum lookbacks (60/300/900s), book imbalance,
+  3-level depth, `p_model`/`p_blend`/`sigma`, and `model_minus_market` (the exact model-vs-market
+  disagreement signal the loss streak came from).
+- **`validation.py`** (`btcbot validate`): a genuinely rigorous time-split harness this handoff's own
+  `run_ml_ablation()` did not have -- whole-market time split with an embargo, Wilson confidence interval, a
+  t-statistic, and a hard refusal below `min_test_trades` (default 30), with wording that only ever says
+  "evidence consistent with an edge" or "no evidence," never "profitable." Critically, it ships
+  `blend_predictor` -- the bot's OWN currently-deployed model, read back from recorded predictions -- as a
+  ready-made baseline any other predictor should be compared against.
+- **`calibration_report.py`** (`btcbot disagree`): reliability and model-vs-market-disagreement buckets on
+  the same feature-store CSV, built specifically to show what happens when the model disagrees with the
+  market or the price is cheap -- exactly the loss streak's shape.
+- **`watch.py`** (`btcbot watch`): a read-only health check of the newest paper/demo databases.
+
+None of that referenced this handoff's `ml_model.py`/`ml_pipeline.py`/`lab.run_ml_ablation()` work, and vice
+versa -- two independently-built pieces of ML-adjacent infrastructure landed side by side. Reviewing both
+together surfaced three real gaps, all fixed in this pass:
+
+### 1. Three incompatible feature schemas, with no guard against mixing them up
+
+This project now has three distinct feature vocabularies a `ml_model.LogisticModel` can be trained on:
+
+| Schema | Names | Used by |
+|---|---|---|
+| `ml_features.ENTRY_FEATURES` / `EXIT_FEATURES` | `edge`, `p_side`, `price`, `tau_sec`, `spread`, `depth`, `sigma`, `momentum_60s` (entry); `held_sec`, `tau_sec`, `unrealized_pct`, `sigma`, `momentum_60s` (exit) | `backtest.py`'s live ML entry/exit gate, `lab.run_ml_ablation()`, `ml_pipeline.build_training_examples()`/`train_and_validate()` |
+| `ml_pipeline.FEATURE_STORE_ENTRY_FEATURES` (new, see below) | a subset of `features.py`'s `COLUMNS`: `tau_sec`, `spot_minus_strike`, `spot_move_60s/300s/900s`, `yes_spread`, `yes_bid_size`, `no_bid_size`, `yes_depth3`, `no_depth3`, `book_imbalance`, `p_model`, `sigma`, `model_minus_market` | `ml_pipeline.train_from_feature_rows()`/`train_and_validate_from_features()`, `btcbot validate --model` |
+| `market_level_pipeline`'s coarse schema | `p_model`, `sigma` | `market_level_pipeline.market_level_examples()` only |
+
+Because `LogisticModel.predict_proba()` treats any name it does not recognize as that feature's training
+mean, loading a model trained on one schema into a pipeline that only ever supplies another would not error
+-- it would just quietly degrade to a near-constant prediction, which could pass every other check and still
+be worthless. Fixed with `ml_model.check_feature_coverage()`, called once when `lab._load_ml_model()` loads a
+path (an `ml_entry_model_path`/`ml_exit_model_path` must actually overlap `ENTRY_FEATURES`/`EXIT_FEATURES`,
+or the ablation refuses to run with a clear error naming the mismatch). `LogisticModel.predict_proba()` was
+also fixed to treat a feature present with value `None` the same as one missing entirely (`features.py`'s
+rows always carry every column, with `None` where a value could not be computed yet, e.g. not enough spot
+history for a 900s lookback) -- it previously only handled a missing KEY, and would have raised a `TypeError`
+the first time it saw a real feature-store row with any `None` in it.
+
+### 2. `run_ml_ablation()` had no insufficient-data or significance discipline
+
+`lab.run_lab()`'s own grid sweep already refuses a verdict below `ENOUGH_TEST_TRADES` (30) and requires a
+test t-stat >= 2 before saying "weak_signal" (never "profitable"). `run_ml_ablation()` -- the direct answer
+to the owner's four-layer ask -- had none of that: it just printed four rows of raw PnL/win-rate/t-stat with
+nothing stopping someone from reading "layer 2 made more money than layer 1" as a real result off a handful
+of test trades. Fixed: each `AblationLayer` now carries its own `verdict_level`/`verdict`
+(`_ablation_layer_verdict()`, the same refuse-below-threshold discipline, checked per layer against its OWN
+test trades since a fully rigorous paired test across layers with different trade counts is a harder problem
+this does not claim to solve) and the report shows each layer's PnL delta against layer 1 explicitly labeled
+"not a tested difference," plus a warning that four layers were compared (a lone `weak_signal` could be the
+one false positive among four tries).
+
+### 3. No way to ask "does the ML model actually beat what's already running"
+
+Before this pass, `ml_pipeline.train_and_validate()` reported a Brier score with nothing to compare it
+against -- a number in isolation cannot say whether an ML model helps. Meanwhile `validation.py` already had
+exactly the machinery to answer that (a `Predictor` type, `blend_predictor` as a ready baseline) but no
+second predictor to compare it with. Connected the two:
+
+- `ml_pipeline.FEATURE_STORE_ENTRY_FEATURES` + `train_from_feature_rows()` / `train_and_validate_from_features()`:
+  trains directly on `features.py`'s row schema (not `ml_features`' tick-level one), using the SAME column
+  names those rows already carry -- a features-store row can be fed straight into `LogisticModel.predict_proba()`
+  with no adapter, and `predict_proba` is itself a valid `validation.Predictor`. `train_and_validate_from_features()`
+  reuses `validation.split_windows` (not a second copy of the same algorithm) and, critically, ALSO scores
+  the bot's own `p_blend` on the exact same held-out rows, reporting `beats_baseline` explicitly.
+- `btcbot ml-train --features <csv>` (alternative to `--db`): trains this way and prints the baseline
+  comparison plainly.
+- `btcbot validate --features <csv> --model <path>`: runs the FULL rigorous harness (time-split, Wilson CI,
+  t-stat, hard refusal below 30 test trades) for both the current model and a trained ML model, side by
+  side, on the same data.
+
+This is the concrete answer to "make sure ML gets us better entry/exit/profit": once real data exists,
+`btcbot features` -> `btcbot ml-train --features` -> `btcbot validate --features ... --model ...` gives an
+honest, baseline-compared, statistically-disciplined verdict -- not a claim, a falsifiable check. Still
+subject to the same limits `validation.py`'s own docstring states (an optimistic maker-fill assumption,
+correlated per-window intervals, one policy shape tried) and CLAUDE.md's "no profitability claims without
+recorded out-of-sample results."
+
+### What is still NOT connected (deliberately, and correctly so)
+
+- `ml_pipeline.train_and_validate()` (the tick-level `ml_features.ENTRY_FEATURES` path, feeding
+  `lab.run_ml_ablation()`) and `train_and_validate_from_features()` (the `features.py`-schema path, feeding
+  `btcbot validate --model`) remain two separate training paths on purpose: the former is needed for the
+  ablation's queue-aware `PaperBroker` replay (which reads `EntryFilters.ml_entry_model` directly), the
+  latter for the richer, already-shared validation/calibration tooling. A model trained one way is not valid
+  input for the other pipeline -- `check_feature_coverage()` now catches that mix-up if attempted.
+- `market_level_pipeline.py`'s coarse (`p_model`, `sigma`) schema is still a third, separate thing, by
+  design: it is the only one of the three that can ever be trained from the "20,000-30,000 markets" dataset
+  (no tick-level book exists for it), and it answers a narrower question (is the v1 formula itself
+  miscalibrated) than either of the other two.
+- None of this is wired into `live_paper.py`/`btcbot paper`/`btcbot demo`. That is still the deliberate next
+  step, gated on a real `validate --model` run actually showing `beats_baseline: True` with a `weak_signal`
+  (never higher) verdict on real recorded data -- not on anything built in this sandbox.
+
+### Tests added in this pass
+
+`tests/test_ml_model.py::TestFeatureCoverage` (+ the `None`-handling fix), `tests/test_lab.py`'s
+`test_rejects_a_model_trained_for_a_different_feature_schema` and `TestAblationLayerVerdict`,
+`tests/test_ml_pipeline.py`'s `TestFeatureStoreExamples`/`TestTrainFromFeatureRows`/`TestTrainAndValidateFromFeatures`,
+and CLI tests in `tests/test_cli.py` (`ml-train --features`, `--db`/`--features` mutual exclusion) and
+`tests/test_validation.py` (`validate --model`). Every new assertion verified to fail against a deliberately
+broken build first (including the resting-order-style precedence bugs' cousins: the coverage-threshold
+direction, the t-stat significance boundary, the `beats_baseline` comparison direction, and the `--db`/
+`--features` XOR check). Full suite: 953 passed, offline only, no key used, no real network reached.

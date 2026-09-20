@@ -45,7 +45,8 @@ from btcbot.backtest import (
     replay_prepared,
 )
 from btcbot.config import BotConfig, ExitRules, RiskLimits, Sizing, SizingMode
-from btcbot.ml_model import LogisticModel, load_model
+from btcbot.ml_features import ENTRY_FEATURES, EXIT_FEATURES
+from btcbot.ml_model import LogisticModel, MLModelError, check_feature_coverage, load_model
 from btcbot.paper_broker import QueueAssumption
 
 DEFAULT_MAX_COMBOS = 400
@@ -356,11 +357,19 @@ def _config_for(base: BotConfig, params: LabParams, account: AccountSettings) ->
 _ML_MODEL_CACHE: dict[str, LogisticModel] = {}  # a grid sweep re-evaluates the same path many times
 
 
-def _load_ml_model(path: str | None) -> LogisticModel | None:
+def _load_ml_model(path: str | None, expected_features: Sequence[str]) -> LogisticModel | None:
+    """Loads and caches (a grid sweep re-evaluates the same path many times), and checks the model was
+    trained for THIS pipeline's feature schema (see ml_model.check_feature_coverage's docstring: this
+    project now has more than one) before it can ever reach a live replay."""
     if path is None:
         return None
     if path not in _ML_MODEL_CACHE:
-        _ML_MODEL_CACHE[path] = load_model(Path(path))
+        model = load_model(Path(path))
+        try:
+            check_feature_coverage(model, expected_features)
+        except MLModelError as exc:
+            raise LabError(str(exc)) from None
+        _ML_MODEL_CACHE[path] = model
     return _ML_MODEL_CACHE[path]
 
 
@@ -376,8 +385,8 @@ def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
         risk_pct_per_trade=None if params.risk_pct is None else params.risk_pct / 100,
         max_growth_pct=params.max_growth_pct,
         ramp_growth_pct=params.ramp_growth_pct,
-        ml_entry_model=_load_ml_model(params.ml_entry_model_path), ml_entry_min_edge=params.ml_entry_min_edge,
-        ml_exit_model=_load_ml_model(params.ml_exit_model_path), ml_exit_prob_threshold=params.ml_exit_prob_threshold,
+        ml_entry_model=_load_ml_model(params.ml_entry_model_path, ENTRY_FEATURES), ml_entry_min_edge=params.ml_entry_min_edge,
+        ml_exit_model=_load_ml_model(params.ml_exit_model_path, EXIT_FEATURES), ml_exit_prob_threshold=params.ml_exit_prob_threshold,
     )
 
 
@@ -674,12 +683,34 @@ def render_lab_report(report: LabReport) -> str:
 # --------------------------------------------------------------------------- ML entry/exit ablation
 
 
+def _ablation_layer_verdict(train: Metrics, test: Metrics) -> tuple[str, str]:
+    """The same refuse-below-threshold discipline :func:`_verdict` applies to the grid sweep's best
+    combination, applied to one ablation layer's own test-window trades. This is a single-sample check (is
+    THIS layer's PnL distinguishable from zero?), not a paired comparison against the baseline layer --
+    a rigorous two-sample test across layers with different trade counts is a harder problem this does not
+    claim to solve; render_ml_ablation_report shows the plain PnL delta against layer 1 as context only,
+    never as a tested claim."""
+    if test.resolved < ENOUGH_TEST_TRADES:
+        return "insufficient", f"only {test.resolved} resolved test trades (want at least {ENOUGH_TEST_TRADES}); no conclusion"
+    if test.pnl <= 0:
+        return "not_supported", f"lost money on the test windows (${test.pnl:,.2f})"
+    if test.t_stat is None or test.t_stat < 2:
+        t_str = "n/a" if test.t_stat is None else f"{test.t_stat:.1f}"
+        return "not_supported", f"positive test PnL (${test.pnl:,.2f}) but not distinguishable from luck (t={t_str}, want at least 2)"
+    gap_note = ""
+    if train.t_stat is not None and train.t_stat - test.t_stat > 2:
+        gap_note = "; a large train-to-test t-stat drop suggests overfitting"
+    return "weak_signal", f"test PnL ${test.pnl:,.2f}, t={test.t_stat:.1f}{gap_note} -- a reason to forward paper-test it, not a profitability claim"
+
+
 @dataclass(frozen=True, slots=True)
 class AblationLayer:
     name: str
     description: str
     train: Metrics
     test: Metrics
+    verdict_level: str  # "insufficient" | "not_supported" | "weak_signal"
+    verdict: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,7 +765,8 @@ def run_ml_ablation(
         )
         train_metrics = evaluate(train_prepared, base_config, params, account, queue=queue, maker_fee_multiplier=maker_fee_multiplier)
         test_metrics = evaluate(test_prepared, base_config, params, account, queue=queue, maker_fee_multiplier=maker_fee_multiplier)
-        return AblationLayer(name, description, train_metrics, test_metrics)
+        verdict_level, verdict = _ablation_layer_verdict(train_metrics, test_metrics)
+        return AblationLayer(name, description, train_metrics, test_metrics, verdict_level, verdict)
 
     layers = (
         layer("1", "current entry, settlement hold", use_entry=False, use_exit=False),
@@ -747,6 +779,9 @@ def run_ml_ablation(
         "module docstring (REST-polled books, simulated queue fills, one train/test sample).",
         "Each ML layer only re-scores or exits a trade the base strategy already proposed/entered; it cannot "
         "create an entry the base strategy would have skipped.",
+        "Each layer's verdict is a single-sample check on ITS OWN test trades, not a paired test against "
+        "layer 1 -- four layers were compared here, so a lone weak_signal layer could still be the one false "
+        "positive among four tries; forward-paper-test before trusting it.",
     ]
     if ml_entry_model_path is None:
         warnings.append("No ml_entry_model_path given: layers 2 and 4 are identical to layers 1 and 3.")
@@ -764,13 +799,17 @@ def render_ml_ablation_report(report: AblationReport) -> str:
         t = "--" if m.t_stat is None else f"{m.t_stat:+.1f}"
         return f"n={m.resolved:<4d} win {wr:>4s}  pnl ${m.pnl:>9,.2f}  t {t:>5s}  dd {m.max_drawdown_pct or 0:>4.1f}%"
 
+    baseline_pnl = report.layers[0].test.pnl if report.layers else Decimal(0)
     lines = [
         f"Windows: {report.windows_total} ({report.windows_train} train, {report.windows_test} test, 1 skipped between).",
         "",
         f"{'':>4s}  {'TRAIN':<58s}  TEST",
     ]
     for layer in report.layers:
-        lines.append(f"{layer.name:>4s}  {fmt(layer.train):<58s}  {fmt(layer.test)}   {layer.description}")
+        delta = layer.test.pnl - baseline_pnl
+        delta_note = "" if layer.name == "1" else f"  (vs layer 1: {delta:+,.2f}, not a tested difference)"
+        lines.append(f"{layer.name:>4s}  {fmt(layer.train):<58s}  {fmt(layer.test)}   {layer.description}{delta_note}")
+        lines.append(f"{'':>4s}  Verdict [{layer.verdict_level}]: {layer.verdict}")
     lines += ["", "Sensitivity comparison only -- not a profitability claim.", ""]
     lines += [f"- {w}" for w in report.warnings]
     return "\n".join(lines)

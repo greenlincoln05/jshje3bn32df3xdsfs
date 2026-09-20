@@ -78,3 +78,51 @@ def test_features_csv_roundtrip_and_cli(tmp_path, capsys):
     assert back[0]["outcome_yes"] in (0, 1) and back[0]["yes_bid"] == 0.3
     assert main(["validate", "--features", str(path)]) == 0
     assert "verdict:" in capsys.readouterr().out
+
+
+def test_validate_with_a_trained_model_prints_both_sections_and_a_comparison(tmp_path, capsys):
+    from btcbot.cli import main
+    from btcbot.features import COLUMNS, write_csv
+    from btcbot.ml_model import save_model
+    from btcbot.ml_pipeline import train_and_validate_from_features
+
+    # A perfectly separable signal via model_minus_market -- the same v1-model-vs-market disagreement
+    # docs/research/demo-loss-streak-2026-09-20.md flags as the one that actually mattered.
+    r = []
+    for w in range(60):
+        row = {c: None for c in COLUMNS}
+        signal = 3.0 if w % 2 == 0 else -3.0
+        row.update(
+            source="s", ticker=f"W{w:03d}", ts=f"2026-01-01T{w // 60:02d}:{w % 60:02d}:00+00:00",
+            tau_sec=300.0, spot_minus_strike=0.0, spot_move_60s=0.0, spot_move_300s=0.0, spot_move_900s=0.0,
+            yes_spread=0.02, yes_bid_size=10.0, no_bid_size=10.0, yes_depth3=20.0, no_depth3=20.0,
+            book_imbalance=0.0, p_model=0.5, sigma=0.0004, model_minus_market=signal, p_blend=0.5,
+            yes_bid=0.30, no_bid=0.60, outcome_yes=1 if w % 2 == 0 else 0,
+        )
+        r.append(row)
+    features_path = tmp_path / "f.csv"
+    write_csv(r, features_path)
+    model, _ = train_and_validate_from_features(r)
+    model_path = tmp_path / "entry.json"
+    save_model(model, model_path)
+
+    exit_code = main(["validate", "--features", str(features_path), "--model", str(model_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "current model (p_blend)" in out
+    assert f"ML model ({model_path})" in out
+    assert "Test-window pnl/contract" in out
+
+
+def test_bad_model_path_is_reported_cleanly(tmp_path, capsys):
+    from btcbot.cli import main
+    from btcbot.features import COLUMNS, write_csv
+    r = [{c: None for c in COLUMNS} | x for x in rows(12, label=lambda w: w % 2)]
+    for x in r:
+        x["source"] = "s"
+    path = tmp_path / "f.csv"
+    write_csv(r, path)
+    exit_code = main(["validate", "--features", str(path), "--model", str(tmp_path / "nope.json")])
+    assert exit_code == 1
+    assert "error:" in capsys.readouterr().err

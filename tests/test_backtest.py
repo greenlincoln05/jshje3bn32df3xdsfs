@@ -401,10 +401,12 @@ class TestRampSizingInBacktest:
 
 def _constant_model(value: float) -> LogisticModel:
     """A LogisticModel whose predict_proba() is (numerically) always ``value``, regardless of the features it
-    is asked about -- a huge bias with a single unused weight makes the sigmoid saturate. Used to test the
-    ML entry/exit WIRING deterministically, independent of whatever a real trained model would predict."""
+    is asked about -- a huge bias with a zero weight makes the sigmoid saturate. Used to test the ML
+    entry/exit WIRING deterministically, independent of whatever a real trained model would predict. Uses a
+    real ENTRY_FEATURES name (not an arbitrary one) so a saved copy of this model still passes
+    lab._load_ml_model's feature-schema coverage check when loaded from a path."""
     bias = 100.0 if value >= 0.5 else -100.0
-    return LogisticModel(("unused",), (0.0,), bias, (0.0,), (1.0,))
+    return LogisticModel(("edge",), (0.0,), bias, (0.0,), (1.0,))
 
 
 class TestMLEntryLayer:

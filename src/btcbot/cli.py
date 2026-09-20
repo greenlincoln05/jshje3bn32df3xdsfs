@@ -78,8 +78,8 @@ from btcbot.demo_trader import DemoTrader, render_demo_report
 from btcbot.execution import DemoExecutionBackend
 from btcbot.live_paper import LivePaperTrader
 from btcbot.market_discovery import find_current_market
-from btcbot.ml_model import save_model
-from btcbot.ml_pipeline import MLPipelineError, train_and_validate
+from btcbot.ml_model import MLModelError, load_model, save_model
+from btcbot.ml_pipeline import MLPipelineError, train_and_validate, train_and_validate_from_features
 from btcbot.model import CalibrationSummary, compute_calibration_report
 from btcbot.models import Market, OrderBook, ParseError, Series, Side, parse_time
 from btcbot.paper_broker import QueueAssumption
@@ -584,21 +584,43 @@ async def _cmd_features(args: argparse.Namespace) -> int:
 
 
 async def _cmd_validate(args: argparse.Namespace) -> int:
-    """Time-split validation of the recorded model probabilities on a features CSV. Offline: no network, no key."""
+    """Time-split validation of the recorded model probabilities on a features CSV, optionally alongside a
+    trained ML model (--model, btcbot ml-train's output) on the SAME split -- the answer to "does the ML
+    model actually beat what is already running" (docs/research/ml-layers-handoff.md). Offline: no network,
+    no key."""
     from btcbot.features import read_csv
     from btcbot.validation import ValidationError, blend_predictor, validate
 
     try:
-        out = validate(read_csv(args.features), blend_predictor, train_frac=args.split, embargo=args.embargo,
-                       min_test_trades=args.min_test_trades)
-    except (ValidationError, OSError, ValueError, KeyError) as exc:
+        rows = read_csv(args.features)
+        results = {
+            "current model (p_blend)": validate(
+                rows, blend_predictor, train_frac=args.split, embargo=args.embargo, min_test_trades=args.min_test_trades
+            ),
+        }
+        if args.model:
+            model = load_model(Path(args.model))
+            results[f"ML model ({args.model})"] = validate(
+                rows, model.predict_proba, train_frac=args.split, embargo=args.embargo, min_test_trades=args.min_test_trades
+            )
+    except (ValidationError, OSError, ValueError, KeyError, MLModelError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    for name, ev in out.items():
-        rate = "-" if ev.win_rate is None else f"{ev.win_rate:.0%} (95% {ev.ci95[0]:.0%}-{ev.ci95[1]:.0%})"
-        brier = "-" if ev.brier is None else f"{ev.brier:.4f}"
-        print(f"{name}: windows {ev.windows}, trades {ev.trades}, wins {ev.wins}, win rate {rate}, "
-              f"pnl/contract ${ev.pnl_per_contract:.2f}, brier {brier}\n  verdict: {ev.verdict}")
+    for label, out in results.items():
+        print(f"=== {label} ===")
+        for name, ev in out.items():
+            rate = "-" if ev.win_rate is None else f"{ev.win_rate:.0%} (95% {ev.ci95[0]:.0%}-{ev.ci95[1]:.0%})"
+            brier = "-" if ev.brier is None else f"{ev.brier:.4f}"
+            print(f"{name}: windows {ev.windows}, trades {ev.trades}, wins {ev.wins}, win rate {rate}, "
+                  f"pnl/contract ${ev.pnl_per_contract:.2f}, brier {brier}\n  verdict: {ev.verdict}")
+    if args.model:
+        base_test = results["current model (p_blend)"]["test"]
+        model_test = results[f"ML model ({args.model})"]["test"]
+        print(
+            f"\nTest-window pnl/contract: current model ${base_test.pnl_per_contract:.2f} vs ML model "
+            f"${model_test.pnl_per_contract:.2f} -- not a paired test between the two; read each verdict "
+            "above on its own terms, not just which number is larger."
+        )
     return 0
 
 
@@ -653,8 +675,36 @@ async def _cmd_lab_suite(args: argparse.Namespace) -> int:
 
 
 async def _cmd_ml_train(args: argparse.Namespace) -> int:
-    """Train an ML entry or exit model from a recorder database, validated on markets it never trained on
-    (docs/research/ml-layers-handoff.md). Offline: no network, no credentials."""
+    """Train an ML entry/exit model, validated on markets it never trained on
+    (docs/research/ml-layers-handoff.md). --features trains an entry model on a `btcbot features` CSV
+    instead of replaying a recorder database directly -- the richer, book-imbalance/depth/multi-window
+    -momentum feature set `btcbot validate`/`btcbot disagree` already share, and its output plugs straight
+    into `btcbot validate --model` for a full PnL-level comparison against the bot's current model. Offline
+    either way: no network, no credentials."""
+    output = Path(args.out)
+    if args.features:
+        from btcbot.features import read_csv
+
+        try:
+            rows = read_csv(args.features)
+            model, freport = train_and_validate_from_features(rows, train_fraction=args.split, embargo=args.embargo)
+        except (MLPipelineError, OSError, ValueError, KeyError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        output.parent.mkdir(parents=True, exist_ok=True)
+        save_model(model, output)
+        baseline = "n/a (no p_blend logged for the validate rows)" if freport.baseline_validate_brier is None else f"{freport.baseline_validate_brier:.4f}"
+        beats = "n/a" if freport.beats_baseline is None else ("YES" if freport.beats_baseline else "no")
+        print(
+            f"Trained an entry model on {freport.windows_train} windows ({freport.train_examples} examples); "
+            f"validated on {freport.windows_validate} later windows it never trained on ({freport.validate_examples} examples).\n"
+            f"Brier score: train {freport.train_brier:.4f}, validate {freport.validate_brier:.4f}; the bot's "
+            f"own current model (p_blend) scores {baseline} on the SAME validate rows -- beats baseline: {beats}.\n"
+            f"Saved to {output}. This is a calibration measure, not a profitability claim; run "
+            "`btcbot validate --model ...` against this file for a PnL-level comparison."
+        )
+        return 0
+
     db_path = Path(args.db)
     if not db_path.is_file():
         print(f"error: no such database: {db_path}", file=sys.stderr)
@@ -673,7 +723,6 @@ async def _cmd_ml_train(args: argparse.Namespace) -> int:
     except (MLPipelineError, LabError, BacktestError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_model(model, output)
     print(
@@ -1117,6 +1166,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_cmd = commands.add_parser(
         "validate", help="time-split validation of the bot's recorded model on a features CSV (offline)")
     validate_cmd.add_argument("--features", default="data/research/features.csv", help="CSV from `btcbot features`")
+    validate_cmd.add_argument("--model", help="also validate a trained ML model (btcbot ml-train's output) side by side with the current model")
     validate_cmd.add_argument("--split", type=float, default=0.7)
     validate_cmd.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (default: 1)")
     validate_cmd.add_argument("--min-test-trades", type=int, default=30)
@@ -1137,10 +1187,12 @@ def build_parser() -> argparse.ArgumentParser:
         "ml-train",
         help="train an ML entry/exit model from recorded data, validated on later markets it never trained on (offline)",
     )
-    ml_train.add_argument("--db", required=True, help="path to a recorder SQLite database")
-    ml_train.add_argument("--which", choices=["entry", "exit"], required=True, help="which model to train")
+    ml_train.add_argument("--db", help="path to a recorder SQLite database (tick-level entry/exit model; requires --which)")
+    ml_train.add_argument("--features", help="CSV from `btcbot features` instead of --db (richer entry-only model, usable with `btcbot validate --model`)")
+    ml_train.add_argument("--which", choices=["entry", "exit"], help="which model to train (--db mode only; required with --db)")
     ml_train.add_argument("--out", required=True, help="output path for the trained model JSON")
     ml_train.add_argument("--split", type=float, default=0.7, help="fraction of windows used to train; the rest validates it (default: 0.7)")
+    ml_train.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (--features mode only, default: 1)")
     ml_train.set_defaults(handler=_cmd_ml_train)
 
     ablation = commands.add_parser(
@@ -1290,9 +1342,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.top < 1 or args.min_train_trades < 1 or args.max_combos < 1:
             print("error: --top, --min-train-trades and --max-combos must be at least 1", file=sys.stderr)
             return 2
-    if args.command == "ml-train" and not (0.2 <= args.split <= 0.9):
-        print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
-        return 2
+    if args.command == "ml-train":
+        if not (0.2 <= args.split <= 0.9):
+            print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
+            return 2
+        if bool(args.db) == bool(args.features):
+            print("error: give exactly one of --db / --features", file=sys.stderr)
+            return 2
+        if args.db and args.which is None:
+            print("error: --which is required with --db", file=sys.stderr)
+            return 2
     if args.command == "ml-ablation":
         if args.entry_model is None and args.exit_model is None:
             print("error: give at least one of --entry-model / --exit-model", file=sys.stderr)
