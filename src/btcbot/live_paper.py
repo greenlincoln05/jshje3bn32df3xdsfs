@@ -176,6 +176,7 @@ class LivePaperTrader:
             has_position=self._position is not None,
             min_price=self._config.min_price,
             max_price=self._effective_max_price(),
+            bid_improve_ticks=self._config.bid_improve_ticks,
             position_side=None if self._position is None else self._position.side,
             position_entry_price=None if self._position is None else self._position.entry_price,
             position_held_sec=None if self._position is None else (poll_ts - self._position.entry_ts).total_seconds(),

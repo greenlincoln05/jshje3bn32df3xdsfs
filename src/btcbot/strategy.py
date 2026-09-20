@@ -218,6 +218,7 @@ def decide(
     take_profit_pct: Decimal | None = None,
     stop_min_hold_sec: float = 0,
     stop_min_tau_sec: float = 0,
+    bid_improve_ticks: int = 0,
 ) -> Decision:
     if has_resting_order:
         if spot_is_stale:
@@ -277,11 +278,18 @@ def decide(
             continue
         if bid.size < min_depth:
             continue
+        price = bid.price
+        if bid_improve_ticks > 0:
+            # Demo plumbing mode: bid up to ``bid_improve_ticks`` cents inside the spread, never onto the ask (a
+            # post-only order would be rejected), so a thin book's few sellers can actually reach us.
+            ask = book.best_ask(side)
+            if ask is not None:
+                price = max(price, min(price + Decimal("0.01") * bid_improve_ticks, ask.price - Decimal("0.01")))
         p_side = p_yes if side == "yes" else (1.0 - p_yes)
-        expected_fee = float(maker_fee(Decimal(1), bid.price, multiplier=maker_fee_multiplier))
-        edge = p_side - float(bid.price) - expected_fee
+        expected_fee = float(maker_fee(Decimal(1), price, multiplier=maker_fee_multiplier))
+        edge = p_side - float(price) - expected_fee
         if edge >= float(min_edge):
-            candidates.append((edge, side, bid.price, p_side))
+            candidates.append((edge, side, price, p_side))
 
     if not candidates:
         return Decision(Action.SKIP, reason="no side clears min_edge/min_depth/max_spread/price_band")

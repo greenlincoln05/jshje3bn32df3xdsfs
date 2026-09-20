@@ -888,6 +888,12 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
     owner's own demo key in .env. Always the demo environment: the client itself also refuses to sign an order
     against prod, so this is a second lock, not the only one."""
     config = load_config(args.config)
+    if args.plumbing:
+        # Thin-book test mode: accept the demo book's wide spread and shallow depth, and bid inside the spread.
+        # This exercises placement/fills/settlement/sizing, it says nothing about the strategy.
+        config = config.model_copy(update={"max_spread": Decimal(1), "min_depth": Decimal(1), "bid_improve_ticks": 5})
+        print("PLUMBING MODE: relaxed spread/depth filters, bidding up to 5 cents inside the spread. "
+              "Results here do not test the strategy.", flush=True)
     series_ticker = args.series or config.series_ticker
     settings = KalshiSettings()
     if settings.key_id is None or settings.private_key_path is None:
@@ -1268,6 +1274,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--kill-file", default="KILL", help="creating this file stops trading and cancels open orders (default: ./KILL)"
     )
     demo.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)")
+    demo.add_argument("--plumbing", action="store_true",
+                      help="thin-demo-book test mode: relax spread/depth filters and bid inside the spread (tests the machinery, not the strategy)")
     demo.add_argument("--maker-fee-multiplier", default="0", help="fee multiplier for the SHADOW paper order only (default: 0)")
     demo.set_defaults(handler=_cmd_demo)
 

@@ -57,6 +57,10 @@ truth for scope and phases; the README has the phase status and a dated table of
   `ramp_max_price_floor`), and `ramp_idle_reset_windows` (2) consecutive windows without opening a position reset
   the ramp to base. `strategy.ramp_stop_loss_pct` tightens the stop per level; that stop is wired into the
   lab/backtest only until paper/demo exits land.
+- `btcbot demo --plumbing`: thin-demo-book TEST mode (max_spread 1.0, min_depth 1, `bid_improve_ticks: 5`, i.e. bid up to 5
+  cents inside the spread, never onto the ask). The demo book's median spread is ~14 cents and depth ~100 contracts, so the
+  normal filters reject most of it. Plumbing mode exercises placement, fills, settlement and sizing; it says nothing about the
+  strategy, which is judged on prod paper. It is a `demo`-only flag and `bid_improve_ticks` defaults to 0 everywhere else.
 - `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
   and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
