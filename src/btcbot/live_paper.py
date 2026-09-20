@@ -307,8 +307,11 @@ class LivePaperTrader:
         sz = self._config.sizing
         if sz.mode is not SizingMode.RAMP or sz.ramp_idle_reset_windows == 0:
             return
-        if self._current_ticker in self.windows_traded:
-            self._idle_windows = 0
+        if self._ramp_level == 0:
+            self._idle_windows = 0  # only a ramped-up size can be "too far": nothing to reset at base
+            return
+        if self._current_ticker in self.windows_traded or self._position is not None:
+            self._idle_windows = 0  # (a fill found late, e.g. by the demo trader's cancel-race catch-up, counts too)
             return
         self._idle_windows += 1
         if self._idle_windows >= sz.ramp_idle_reset_windows and self._ramp_level > 0:

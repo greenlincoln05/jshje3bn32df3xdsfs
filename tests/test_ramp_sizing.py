@@ -109,3 +109,10 @@ def test_the_price_cap_drops_as_the_ramp_climbs():
     base = t._effective_max_price()
     t._ramp_level = 4
     assert t._effective_max_price() < base
+
+
+def test_idle_count_does_not_run_at_base_size():
+    t = _trader()
+    t._current_ticker = "A"
+    t._note_finished_window()
+    assert t._idle_windows == 0
