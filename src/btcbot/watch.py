@@ -36,7 +36,8 @@ def _newest(data_dir: Path, pattern: str) -> Path | None:
 
 def inspect_db(path: Path, kind: str, *, stale_min: float, now: float | None = None) -> DbHealth:
     now = time.time() if now is None else now
-    age = (now - path.stat().st_mtime) / 60
+    mtimes = [q.stat().st_mtime for q in (path, Path(str(path) + "-wal"), Path(str(path) + "-journal")) if q.exists()]
+    age = (now - max(mtimes)) / 60  # a live SQLite writer may only touch the -wal file between checkpoints
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         def q(sql):
@@ -50,8 +51,11 @@ def inspect_db(path: Path, kind: str, *, stale_min: float, now: float | None = N
         last = q("SELECT MAX(ts) FROM predictions")
         last_age = None
         if last and last[0][0]:
-            from btcbot.models import parse_time
-            last_age = (now - parse_time(last[0][0]).timestamp()) / 60
+            from btcbot.models import ParseError, parse_time
+            try:
+                last_age = (now - parse_time(last[0][0]).timestamp()) / 60
+            except ParseError:
+                last_age = None
         return DbHealth(kind, path.name, age, len(trades), len(pnls), sum(1 for p in pnls if p > 0), sum(pnls),
                         [float(s) for s, _ in trades], gaps[0][0] if gaps else 0, last_age, age > stale_min)
     finally:
