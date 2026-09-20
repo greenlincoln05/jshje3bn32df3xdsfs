@@ -83,7 +83,8 @@ class LabParams:
     def from_config(cls, config: BotConfig) -> LabParams:
         return cls(
             min_edge=config.min_edge, max_spread=config.max_spread, min_depth=config.min_depth,
-            min_tau_sec=config.min_tau_sec, max_tau_sec=config.max_tau_sec, model_blend=config.model_blend,
+            min_tau_sec=config.min_tau_sec, max_tau_sec=config.max_tau_sec,
+            min_price=config.min_price, max_price=config.max_price, model_blend=config.model_blend,
             contracts=config.sizing.contracts_per_trade,
         )
 
@@ -326,6 +327,21 @@ def evaluate(
     return _metrics(result, account.account_usd)
 
 
+def _evaluate_with_signature(
+    prepared: PreparedReplay, base: BotConfig, params: LabParams, account: AccountSettings, *,
+    queue: QueueAssumption, maker_fee_multiplier: Decimal,
+) -> tuple[Metrics, tuple[tuple[Any, ...], ...]]:
+    result = replay_prepared(
+        prepared, _config_for(base, params, account), queue_assumption=queue,
+        maker_fee_multiplier=maker_fee_multiplier, filters=_filters_for(params, account),
+    )
+    signature = tuple(
+        (t.ticker, t.side, t.size, t.entry_price, t.entry_ts, t.fee_paid, t.result, t.pnl_usd)
+        for t in result.trades
+    )
+    return _metrics(result, account.account_usd), signature
+
+
 # --------------------------------------------------------------------------- data
 
 
@@ -441,34 +457,36 @@ def run_lab(
             cache[key] = prepare_replay(data, base_config, tickers=tickers, model_blend=blend)
         return cache[key]
 
-    def run(params: LabParams, part: str) -> Metrics:
-        return evaluate(prepared_for(part, params.model_blend), base_config, params, account,
-                        queue=queue, maker_fee_multiplier=maker_fee_multiplier)
+    def run(params: LabParams, part: str) -> tuple[Metrics, tuple[tuple[Any, ...], ...]]:
+        return _evaluate_with_signature(
+            prepared_for(part, params.model_blend), base_config, params, account,
+            queue=queue, maker_fee_multiplier=maker_fee_multiplier,
+        )
 
     try:
-        baseline_train, baseline_test = run(base, "train"), run(base, "test")
+        baseline_train, _ = run(base, "train")
+        baseline_test, _ = run(base, "test")
     except BacktestError as exc:
         raise LabError(str(exc)) from None
 
-    scored: list[tuple[float, LabParams, Metrics]] = []
+    scored: list[tuple[float, LabParams, Metrics, tuple[tuple[Any, ...], ...]]] = []
     total = len(combos)
     for i, params in enumerate(combos, 1):
         if cancelled():
             raise LabError("cancelled")
         if progress is not None:
             progress(i - 1, total, params.describe(base))
-        m = run(params, "train")
+        m, signature = run(params, "train")
         if m.resolved >= min_train_trades and m.t_stat is not None:
-            scored.append((m.t_stat, params, m))
+            scored.append((m.t_stat, params, m, signature))
     if progress is not None:
         progress(total, total, "evaluating the top combinations on the test windows")
 
     scored.sort(key=lambda item: item[0], reverse=True)
     # Settings whose filters never bound make identical trades; show one row and count the rest.
     unique: list[tuple[float, LabParams, Metrics, int]] = []
-    index: dict[tuple[int, int, Decimal], int] = {}
-    for score, params, m in scored:
-        signature = (m.trades, m.wins, m.pnl)
+    index: dict[tuple[tuple[Any, ...], ...], int] = {}
+    for score, params, m, signature in scored:
         if signature in index:
             score0, p0, m0, n0 = unique[index[signature]]
             unique[index[signature]] = (score0, p0, m0, n0 + 1)
@@ -476,7 +494,7 @@ def run_lab(
             index[signature] = len(unique)
             unique.append((score, params, m, 0))
     rows = [
-        LabRow(rank=i, params=_jsonable(asdict(p)), description=p.describe(base), train=m, test=run(p, "test"),
+        LabRow(rank=i, params=_jsonable(asdict(p)), description=p.describe(base), train=m, test=run(p, "test")[0],
                equivalent=n)
         for i, (_, p, m, n) in enumerate(unique[:top_k], 1)
     ]

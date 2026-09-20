@@ -92,6 +92,14 @@ def replay(data, config=None, *, filters=None, tickers=None):
 
 
 class TestParsing:
+    def test_lab_baseline_inherits_live_price_bounds(self):
+        config = BotConfig(min_price=Decimal("0.20"), max_price=Decimal("0.80"))
+
+        params = LabParams.from_config(config)
+
+        assert params.min_price == Decimal("0.20")
+        assert params.max_price == Decimal("0.80")
+
     def test_typed_values_and_optional_none(self):
         assert parse_values("min_edge", "0.02, 0.04") == [Decimal("0.02"), Decimal("0.04")]
         assert parse_values("min_tau_sec", "30,120") == [30, 120]
@@ -270,6 +278,28 @@ class TestEquivalentSettings:
                          min_train_trades=3)
         assert len(report.rows) == 1 and report.rows[0].equivalent == 2
         assert "identical results" in render_lab_report(report)
+
+    def test_matching_aggregate_metrics_do_not_hide_different_ledgers(self, tmp_path, monkeypatch):
+        import btcbot.lab as lab_module
+
+        data = seeded(tmp_path, alternating(12))
+        original = lab_module._evaluate_with_signature
+
+        def same_metrics_different_trades(prepared, base, params, account, **kwargs):
+            metrics, _ = original(prepared, base, params, account, **kwargs)
+            # Force the old aggregate signature to match while preserving an
+            # exact-ledger difference for the two tested configurations.
+            signature = ((str(params.max_price), "different-entry"),)
+            return metrics, signature
+
+        monkeypatch.setattr(lab_module, "_evaluate_with_signature", same_metrics_different_trades)
+        report = run_lab(
+            data, BotConfig(), {"max_price": [Decimal("0.90"), Decimal("0.80")]},
+            min_train_trades=3,
+        )
+
+        assert len(report.rows) == 2
+        assert all(row.equivalent == 0 for row in report.rows)
 
 class TestAuditFixes:
     def test_demo_files_rejected_before_merge(self, tmp_path):
