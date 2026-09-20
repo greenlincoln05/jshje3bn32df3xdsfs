@@ -19,6 +19,7 @@ from btcbot.backtest import (
     run_backtest,
 )
 from btcbot.config import BotConfig, ExitRules
+from btcbot.ml_model import LogisticModel
 from btcbot.models import ParseError
 from btcbot.paper_broker import QueueAssumption, taker_fee
 from btcbot.recorder import Recorder
@@ -396,6 +397,82 @@ class TestRampSizingInBacktest:
 
         sizes = [t.size for t in sorted(result.trades, key=lambda t: t.entry_ts)]
         assert sizes == [Decimal(5), Decimal(5), Decimal(5)]
+
+
+def _constant_model(value: float) -> LogisticModel:
+    """A LogisticModel whose predict_proba() is (numerically) always ``value``, regardless of the features it
+    is asked about -- a huge bias with a single unused weight makes the sigmoid saturate. Used to test the
+    ML entry/exit WIRING deterministically, independent of whatever a real trained model would predict."""
+    bias = 100.0 if value >= 0.5 else -100.0
+    return LogisticModel(("unused",), (0.0,), bias, (0.0,), (1.0,))
+
+
+class TestMLEntryLayer:
+    """EntryFilters.ml_entry_model re-scores a candidate strategy.decide() already proposed (see
+    btcbot.ml_features' module docstring) -- it can only veto a trade the base strategy would have taken, not
+    invent one it would not."""
+
+    def test_a_confident_no_model_blocks_the_trade(self, tmp_path):
+        conn = make_db(tmp_path)
+        close_time = seed_fillable_window(conn, TICKER, start_ts=T0, sizes=FULL_FILL_SIZES)
+        insert_settlement(conn, TICKER, "yes", strike=Decimal("80000"), close_time=close_time)
+
+        result = replay(conn, BotConfig(), filters=EntryFilters(ml_entry_model=_constant_model(0.0)))
+
+        assert result.trades == []
+        assert result.filter_counts["ml_entry"] > 0
+
+    def test_a_confident_yes_model_lets_the_trade_through_unchanged(self, tmp_path):
+        conn = make_db(tmp_path)
+        close_time = seed_fillable_window(conn, TICKER, start_ts=T0, sizes=FULL_FILL_SIZES)
+        insert_settlement(conn, TICKER, "yes", strike=Decimal("80000"), close_time=close_time)
+
+        without_filter = replay(conn, BotConfig())
+        with_filter = replay(conn, BotConfig(), filters=EntryFilters(ml_entry_model=_constant_model(1.0)))
+
+        assert len(with_filter.trades) == len(without_filter.trades) == 1
+        assert with_filter.trades[0].size == without_filter.trades[0].size == Decimal(5)
+
+    def test_ml_entry_min_edge_can_reject_even_a_confident_model(self, tmp_path):
+        conn = make_db(tmp_path)
+        close_time = seed_fillable_window(conn, TICKER, start_ts=T0, sizes=FULL_FILL_SIZES)
+        insert_settlement(conn, TICKER, "yes", strike=Decimal("80000"), close_time=close_time)
+        # predict_proba() saturates just under 1.0 -- an edge threshold above (1 - price) can never clear.
+        filters = EntryFilters(ml_entry_model=_constant_model(1.0), ml_entry_min_edge=Decimal("0.99"))
+
+        result = replay(conn, BotConfig(), filters=filters)
+
+        assert result.trades == []
+        assert result.filter_counts["ml_entry"] > 0
+
+
+class TestMLExitLayer:
+    """EntryFilters.ml_exit_model is checked every tick a position is held (independent of config.exit's fixed
+    percentage thresholds) and can force an early EXIT the same way btcbot.strategy.should_exit does."""
+
+    def test_a_confident_exit_model_closes_the_position_early(self, tmp_path):
+        conn = make_db(tmp_path)
+        seed_window_with_price_drop(conn, TICKER, start_ts=T0)  # no settlement row: only an early exit can resolve this
+
+        result = replay(conn, BotConfig(), filters=EntryFilters(ml_exit_model=_constant_model(1.0)))
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "ml_exit"
+        assert trade.result is None  # the market itself never settled
+        assert trade.pnl_usd is not None
+
+    def test_a_model_below_threshold_holds_to_settlement_as_before(self, tmp_path):
+        conn = make_db(tmp_path)
+        close_time = seed_window_with_price_drop(conn, TICKER, start_ts=T0)
+        insert_settlement(conn, TICKER, "no", strike=Decimal("80000"), close_time=close_time)
+
+        result = replay(conn, BotConfig(), filters=EntryFilters(ml_exit_model=_constant_model(0.0)))
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason is None
+        assert trade.result == "no"
 
 
 class TestReportShape:

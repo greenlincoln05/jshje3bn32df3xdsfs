@@ -23,9 +23,11 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING
 from typing import TYPE_CHECKING
 
+from btcbot.ml_features import entry_features, exit_features
+from btcbot.ml_model import LogisticModel
 from btcbot.model import TimedVolatility, ModelState, predict
 from btcbot.models import OrderBook, ParseError, PriceLevel, Side, parse_time
-from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
+from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, maker_fee, settle
 from btcbot.risk import RiskManager, TradeOutcome
 from btcbot.strategy import Action, Decision, decide, percent_size, ramp_next_size
 
@@ -279,6 +281,8 @@ class Step:
     p_yes: float
     stale: bool
     spot: Decimal | None
+    sigma: float = 0.0  # realized per-second volatility at this tick (btcbot.model.TimedVolatility); for the
+    # ML entry/exit feature vectors only -- the v1 model itself already folded sigma into p_yes above.
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,7 +348,7 @@ def prepare_replay(
         )
         _, p_blend = predict(state, blend=blend)
         stale = (snap.poll_ts - last_ts).total_seconds() > 3 or not vol.ready or tau_sec <= 60
-        steps.append(Step(snap, True, tau_sec, p_blend, stale, last_price))
+        steps.append(Step(snap, True, tau_sec, p_blend, stale, last_price, vol.sigma))
     return PreparedReplay(
         steps=steps,
         windows_seen=len({s.ticker for s in snapshots}),
@@ -393,6 +397,16 @@ class EntryFilters:
     # from the configured base (contracts_per_trade); any loss drops it straight back to that base. None: off,
     # the plain contracts_per_trade size every time.
     ramp_growth_pct: Decimal | None = None
+    # ML entry/exit layers (docs/research/ml-layers-handoff.md), independent of everything else above. The
+    # entry model only ever re-scores a candidate strategy.decide() already proposed (see
+    # btcbot.ml_features.entry_features); it never invents a side the base strategy would have skipped. The
+    # exit model, when set, is checked on every tick a position is held and can force an early EXIT the same
+    # way btcbot.strategy.should_exit does, independent of config.exit's fixed percentage thresholds -- both
+    # can be configured at once, in which case whichever fires first closes the position.
+    ml_entry_model: LogisticModel | None = None
+    ml_entry_min_edge: Decimal = Decimal(0)  # ml_p_side - price - fee must clear this to allow the order
+    ml_exit_model: LogisticModel | None = None
+    ml_exit_prob_threshold: Decimal = Decimal("0.5")  # predict_proba() at/above this triggers an ML exit
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,7 +464,7 @@ def replay_prepared(
     windows_traded: set[str] = set()
     counts = {
         "price_band": 0, "trend": 0, "trend_missing_history": 0, "too_small": 0, "risk_blocked": 0,
-        "persistence": 0, "low_confidence": 0, "book_move": 0, "book_move_missing_history": 0,
+        "persistence": 0, "low_confidence": 0, "book_move": 0, "book_move_missing_history": 0, "ml_entry": 0,
     }
     rest_side: str | None = None  # the side the strategy has wanted on consecutive snapshots, and for how long
     rest_streak = 0
@@ -524,7 +538,7 @@ def replay_prepared(
             return None
         return book_mids[hi] - book_mids[lo]
 
-    def screen(decision: Decision, ts: datetime, p_yes: float, streak: int) -> Decision | None:
+    def screen(decision: Decision, ts: datetime, p_yes: float, streak: int, tau_sec: float, sigma: float, book: OrderBook) -> Decision | None:
         """Apply the lab's filters and sizing to a proposed resting order; None means do not place it."""
         if filters is None:
             return decision
@@ -542,6 +556,21 @@ def replay_prepared(
         ):
             counts["price_band"] += 1
             return None
+        if filters.ml_entry_model is not None:
+            p_side = p_yes if decision.side == "yes" else 1.0 - p_yes
+            bid = book.best_bid(decision.side)
+            momentum = prepared.spot_series.move(ts, 60)
+            features = entry_features(
+                p_side=p_side, price=price, tau_sec=tau_sec, spread=book.spread(decision.side) or Decimal(0),
+                depth=bid.size if bid is not None else Decimal(0), sigma=sigma,
+                momentum_60s=float(momentum) if momentum is not None else None,
+            )
+            ml_p_side = filters.ml_entry_model.predict_proba(features)
+            fee = maker_fee(Decimal(1), price, multiplier=maker_fee_multiplier)
+            ml_edge = Decimal(str(ml_p_side)) - price - fee
+            if ml_edge < filters.ml_entry_min_edge:
+                counts["ml_entry"] += 1
+                return None
         if filters.trend_mode != "off":
             lookbacks = (900, 1800, 3600, 86400) if filters.trend_mode == "aligned4" else (filters.trend_lookback_sec,)
             moves = [prepared.spot_series.move(ts, lookback) for lookback in lookbacks]
@@ -657,6 +686,24 @@ def replay_prepared(
             stop_min_tau_sec=config.exit.stop_min_tau_sec,
         )
 
+        if (
+            decision.action is Action.HOLD and position is not None and resting_order_id is None
+            and filters is not None and filters.ml_exit_model is not None
+        ):
+            current_bid = snap.book.best_bid(position.side)
+            if current_bid is not None:
+                held_sec = (snap.poll_ts - position.entry_ts).total_seconds()
+                momentum = prepared.spot_series.move(snap.poll_ts, 60)
+                features = exit_features(
+                    entry_price=position.entry_price, current_bid=current_bid.price, held_sec=held_sec,
+                    tau_sec=step.tau_sec, sigma=step.sigma, momentum_60s=float(momentum) if momentum is not None else None,
+                )
+                if filters.ml_exit_model.predict_proba(features) >= float(filters.ml_exit_prob_threshold):
+                    decision = Decision(
+                        Action.EXIT, side=position.side, price=current_bid.price,
+                        reason="ml_exit triggered", exit_reason="ml_exit",
+                    )
+
         if decision.action is Action.REST:
             rest_streak = rest_streak + 1 if rest_side == decision.side else 1
             rest_side = decision.side
@@ -664,7 +711,7 @@ def replay_prepared(
             rest_side, rest_streak = None, 0
 
         if decision.action is Action.REST:
-            screened = screen(decision, snap.poll_ts, p_blend, rest_streak)
+            screened = screen(decision, snap.poll_ts, p_blend, rest_streak, step.tau_sec, step.sigma, snap.book)
             if screened is not None:
                 approval = risk.check_new_order(size=screened.size, price=screened.price, now=snap.poll_ts)
                 if approval.approved:

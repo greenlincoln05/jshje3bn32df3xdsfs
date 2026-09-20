@@ -82,6 +82,25 @@ truth for scope and phases; the README has the phase status and a dated table of
   behavior). Wired into `live_paper.py` only, so `btcbot paper` and `btcbot demo` (same decision loop) both
   get it; `btcbot backtest`/`btcbot lab` are untouched and keep their own separate `EntryFilters`/`risk_pct`
   mechanism.
+- ML entry/exit layers (`ml_model.py`, `ml_features.py`, `ml_pipeline.py`, `market_level_pipeline.py`,
+  `history_pipeline.py`, `coinbase_history.py`, `docs/research/ml-layers-handoff.md`), owner-driven, not a
+  numbered phase: a hand-rolled, dependency-free `LogisticModel` (no numpy/scikit-learn) re-scores entries
+  `strategy.decide()` already proposed and can force an early exit, wired into `btcbot.lab`'s
+  `EntryFilters`/`LabParams` as `ml_entry_model_path`/`ml_exit_model_path` -- it can only veto or exit a
+  trade the base strategy already took, never invent one it would have skipped. `lab.run_ml_ablation()`
+  (`btcbot ml-ablation`) runs the four layers the owner asked for (current entry+hold, ML entry+hold,
+  current entry+ML exit, ML entry+ML exit) on the SAME train/test split. `btcbot ml-train` fits a model from
+  a recorder database via `ml_pipeline.train_and_validate()`, reusing `lab.split_windows`'s exact
+  train-on-earlier/validate-on-later, grouped-by-market discipline. Not wired into `live_paper.py`/`btcbot
+  paper`/`btcbot demo` yet -- that is the deliberate next step once a real model has been trained and
+  validated on real data, same as every other phase's "lab first, live later" order. `btcbot download-history`
+  backfills settled markets (via `kalshi_client.py`'s already-public `list_markets(status="settled")`) and
+  Coinbase 1-minute candles for the separate, coarser market-level pipeline (`market_level_pipeline.py`);
+  like `record`/`stream` it is public data needing no key, but this session's own environment cannot reach
+  Kalshi/Coinbase (see `docs/running-live.md`), so it is the owner's to run, built and tested here only via
+  `httpx.MockTransport`. No real data has been downloaded or trained on from this sandbox; every reported
+  Brier score or ablation number in this work is on synthetic fixtures, same caveat as every phase before a
+  real run.
 
 ## Commands
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
@@ -97,6 +116,9 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Demo-environment order validation, needs YOUR demo key (run by the owner): `.venv/Scripts/btcbot.exe demo-check`
 - Strategy placing REAL orders on the DEMO exchange (fake money), with a paper twin of every order, needs YOUR demo key: `.venv/Scripts/btcbot.exe demo --hours 2`
 - Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`
+- Train an ML entry/exit model from recorded data (offline): `.venv/Scripts/btcbot.exe ml-train --db data/recorder-....sqlite --which entry --out models/entry.json`
+- Compare the four ML entry/exit layers on recorded data (offline): `.venv/Scripts/btcbot.exe ml-ablation --db data/recorder-....sqlite --entry-model models/entry.json --exit-model models/exit.json`
+- ONE-TIME backfill of settled markets + Coinbase candles, needs network (owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe download-history --start 2026-01-01T00:00:00Z --end 2026-09-01T00:00:00Z`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own
   environment cannot reach Kalshi/Coinbase; that has to happen on the owner's machine).
 
