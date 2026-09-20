@@ -279,7 +279,7 @@
         <div class="checks" id="lab-dbs"></div>
         <div class="note">Use real (PROD) recordings. Demo books are mostly synthetic. More days of data = results worth reading; you need at least 6 market windows, and hundreds before anything is believable.</div>
 
-        <h3>2. Account and risk</h3>
+        <h3>2. Account and risk <span class="sub">(set from config.yaml; edit here only to ask "what if")</span></h3>
         <div class="field"><label for="lab-account_usd">Account size ($)</label><input id="lab-account_usd" value="500"></div>
         <div class="field"><label for="lab-max_exposure_pct">Max at risk at once (%)</label><input id="lab-max_exposure_pct" value="25"></div>
         <div class="field"><label for="lab-daily_loss_pct">Daily loss stop (%)</label><input id="lab-daily_loss_pct" value="10"></div>
@@ -765,7 +765,7 @@ const LAB_PRESETS = {
 };
 let labJob = null, labTimer = null, labPreviewTimer = null;
 
-function buildLabForm(databases) {
+function buildLabForm(databases, accountDefaults) {
   $("lab-fields").innerHTML = LAB_FIELDS.map(([key, label, ph, help]) =>
     `<div class="field"><label for="lab-${key}">${label}</label><input id="lab-${key}" placeholder="${esc(ph)}"><small>${esc(help)}</small></div>`).join("");
   $("lab-presets").innerHTML = Object.keys(LAB_PRESETS).map((n) => `<button class="action" data-preset="${esc(n)}">${esc(n)}</button>`).join("");
@@ -775,6 +775,13 @@ function buildLabForm(databases) {
   }));
   document.querySelectorAll("#lab-fields input, #lab-account_usd").forEach((i) => i.addEventListener("input", labPreviewSoon));
   renderLabDbs(databases);
+  // account/max_exposure_pct/daily_loss_pct default to whatever config.yaml actually has the bot using
+  // (server-computed in lab_defaults()), not a hardcoded guess -- still editable here for a "what if" sweep.
+  if (accountDefaults) {
+    $("lab-account_usd").value = accountDefaults.account_usd;
+    $("lab-max_exposure_pct").value = accountDefaults.max_exposure_pct;
+    $("lab-daily_loss_pct").value = accountDefaults.daily_loss_pct;
+  }
   LAB_PRESETS["Entry timing"] && Object.entries(LAB_PRESETS["Entry timing"]).forEach(([k, v]) => { $("lab-" + k).value = v; });
   labPreview();
 }
@@ -1001,7 +1008,9 @@ $("export-trades").addEventListener('click',()=>{
 (async function init() {
   let dbList = [];
   try { dbList = await refreshDatabases(); } catch (e) { $("market-note").textContent = "Error: " + e.message; }
-  buildLabForm(dbList);
+  let labDefaults = null;
+  try { labDefaults = await getJson("/api/lab/defaults"); } catch (e) { /* falls back to the static HTML defaults */ }
+  buildLabForm(dbList, labDefaults && labDefaults.account);
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
   setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor" || tab === "demo" || tab === "orders")) refreshTab(); }, 3000);

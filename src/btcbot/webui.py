@@ -310,10 +310,22 @@ class LabJob:
         }
 
 
-def lab_defaults() -> dict[str, Any]:
+def lab_defaults(config_path: Path) -> dict[str, Any]:
+    """``account`` mirrors the account size/risk percentages the bot is ACTUALLY configured with
+    (``config.sizing.account_usd`` and ``config.risk``'s two account-relative caps), so the dashboard's lab
+    account fields start in sync with live config instead of a hardcoded guess the owner has to remember to
+    retype by hand. A live cap left ``None`` (percent sizing off) falls back to :class:`btcbot.lab.AccountSettings`'s
+    own research defaults, since there is then no "live" percentage to mirror."""
+    config = load_config(str(config_path))
+    fallback = AccountSettings()
     return {
         "tunable": list(TUNABLE),
         "grid": {k: ", ".join("none" if v is None else str(v) for v in vals) for k, vals in DEFAULT_GRID.items()},
+        "account": {
+            "account_usd": str(config.sizing.account_usd),
+            "max_exposure_pct": str(config.risk.max_open_exposure_pct) if config.risk.max_open_exposure_pct is not None else str(fallback.max_exposure_pct),
+            "daily_loss_pct": str(config.risk.daily_loss_limit_pct) if config.risk.daily_loss_limit_pct is not None else str(fallback.daily_loss_pct),
+        },
     }
 
 
@@ -466,7 +478,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except (sqlite3.OperationalError, ValueError, ArithmeticError) as exc:
                     raise _ApiError(400, f"demo view error: {exc}") from exc
             elif parsed.path == "/api/lab/defaults":
-                self._send_json(200, lab_defaults())
+                self._send_json(200, lab_defaults(self.server.config_path))
             elif parsed.path == "/api/lab/status":
                 job = self.server.lab_jobs.get(query.get("id", ""))  # type: ignore[attr-defined]
                 if job is None:
