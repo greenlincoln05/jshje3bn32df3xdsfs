@@ -17,6 +17,7 @@ from btcbot.backtest import (
     run_backtest,
 )
 from btcbot.config import BotConfig
+from btcbot.candidate_suite import load_candidate_suite, render_candidate_suite, run_candidate_suite
 from btcbot.lab import (
     AccountSettings,
     LabError,
@@ -106,10 +107,13 @@ class TestParsing:
         assert parse_values("max_price", "none, 0.6") == [None, Decimal("0.6")]
         assert parse_values("trend_mode", "Off, WITH") == ["off", "with"]
         assert parse_values("model_blend", ["0.3", 0.7]) == [0.3, 0.7]
+        assert parse_values("book_move_mode", "against, with") == ["against", "with"]
+        assert parse_values("book_move_min", "0.03,0.08") == [Decimal("0.03"), Decimal("0.08")]
 
     @pytest.mark.parametrize("key,raw", [
         ("min_edge", "1.5"), ("min_edge", "abc"), ("min_tau_sec", "1.5"), ("trend_mode", "sideways"),
         ("max_price", "1.2"), ("risk_pct", "0"), ("bogus", "1"), ("min_edge", ""), ("min_edge", "NaN"),
+        ("book_move_mode", "sideways"), ("book_move_min", "1.0"), ("book_move_lookback_sec", "2"),
     ])
     def test_bad_values_are_rejected(self, key, raw):
         with pytest.raises(LabError):
@@ -175,6 +179,15 @@ class TestFilters:
         assert against.trades == [] and against.filter_counts["trend"] > 0
         too_strict = replay(data, filters=EntryFilters(trend_mode="with", trend_lookback_sec=60, trend_min_move_usd=Decimal(500)))
         assert too_strict.trades == []
+
+    def test_book_move_filter_requires_causal_history(self, tmp_path):
+        data = seeded(tmp_path, ["yes"])
+        result = replay(
+            data,
+            filters=EntryFilters(book_move_mode="against", book_move_lookback_sec=60, book_move_min=Decimal("0.03")),
+        )
+        assert result.trades == []
+        assert result.filter_counts["book_move_missing_history"] > 0
 
     def test_percent_of_account_sizing_and_bankroll(self, tmp_path):
         data = seeded(tmp_path, ["yes", "yes", "no", "yes"])
@@ -394,3 +407,47 @@ class TestConfidenceFilters:
         assert report.combinations == 4
         text = render_lab_report(report)
         assert "persist_steps" in text or "min_p_side" in text or "(defaults)" in text
+
+
+class TestFrozenCandidateSuite:
+    def test_named_suite_runs_only_post_cutoff_windows_and_keeps_full_ledger(self, tmp_path):
+        suite_path = tmp_path / "suite.yaml"
+        suite_path.write_text(
+            """version: 1
+frozen_at: 2026-09-19T00:00:00Z
+assumptions: {account_sizes: [100, 500], max_exposure_pct: 25, daily_loss_pct: 10, maker_fee_multiplier: 0.25}
+candidates:
+  - name: baseline
+    hypothesis: fixed before outcomes
+    params: {}
+""",
+            encoding="utf-8",
+        )
+        suite = load_candidate_suite(suite_path, BotConfig())
+        report = run_candidate_suite(
+            seeded(tmp_path, ["yes", "no", "yes", "yes"]),
+            BotConfig(),
+            suite,
+            after=T0 + timedelta(seconds=2 * WIN),
+        )
+        assert report["strategy_count"] == 1 and report["candidate_count"] == 2
+        assert report["windows"] == 2
+        assert {row["account_usd"] for row in report["results"]} == {Decimal(100), Decimal(500)}
+        assert all(row["metrics"]["resolved"] == 2 for row in report["results"])
+        assert all(len(row["trades"]) == 2 for row in report["results"])
+        assert all(row["evidence"] == "insufficient" for row in report["results"])
+        assert "insufficient" in render_candidate_suite(report).lower()
+
+    def test_duplicate_names_are_rejected(self, tmp_path):
+        suite_path = tmp_path / "bad.yaml"
+        suite_path.write_text(
+            """version: 1
+frozen_at: 2026-09-19T00:00:00Z
+candidates:
+  - {name: same, params: {}}
+  - {name: same, params: {}}
+""",
+            encoding="utf-8",
+        )
+        with pytest.raises(LabError, match="duplicate candidate"):
+            load_candidate_suite(suite_path, BotConfig())

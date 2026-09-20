@@ -370,6 +370,9 @@ class EntryFilters:
     trend_mode: str = "off"
     trend_lookback_sec: int = 60
     trend_min_move_usd: Decimal = Decimal(0)
+    book_move_mode: str = "off"
+    book_move_lookback_sec: int = 60
+    book_move_min: Decimal = Decimal(0)
     account_usd: Decimal | None = None
     risk_pct_per_trade: Decimal | None = None
     min_stake_usd: Decimal = Decimal(0)
@@ -408,7 +411,7 @@ def replay_prepared(
     windows_traded: set[str] = set()
     counts = {
         "price_band": 0, "trend": 0, "trend_missing_history": 0, "too_small": 0, "risk_blocked": 0,
-        "persistence": 0, "low_confidence": 0,
+        "persistence": 0, "low_confidence": 0, "book_move": 0, "book_move_missing_history": 0,
     }
     rest_side: str | None = None  # the side the strategy has wanted on consecutive snapshots, and for how long
     rest_streak = 0
@@ -457,6 +460,19 @@ def replay_prepared(
             pending[ticker] = position
             position = None
 
+    book_times: list[float] = []
+    book_mids: list[Decimal] = []
+
+    def book_move(ts: datetime, lookback_sec: int) -> Decimal | None:
+        if not book_times:
+            return None
+        now = ts.timestamp()
+        hi = bisect_right(book_times, now) - 1
+        lo = bisect_right(book_times, now - lookback_sec) - 1
+        if hi < 0 or lo < 0 or now - book_times[hi] > 5 or (now - lookback_sec) - book_times[lo] > 5:
+            return None
+        return book_mids[hi] - book_mids[lo]
+
     def screen(decision: Decision, ts: datetime, p_yes: float, streak: int) -> Decision | None:
         """Apply the lab's filters and sizing to a proposed resting order; None means do not place it."""
         if filters is None:
@@ -488,6 +504,19 @@ def replay_prepared(
             if not wanted:
                 counts["trend"] += 1
                 return None
+        if filters.book_move_mode != "off":
+            move = book_move(ts, filters.book_move_lookback_sec)
+            if move is None:
+                counts["book_move_missing_history"] += 1
+                return None
+            toward_yes = move >= filters.book_move_min
+            toward_no = move <= -filters.book_move_min
+            wanted = toward_yes if decision.side == "yes" else toward_no
+            if filters.book_move_mode == "against":
+                wanted = toward_no if decision.side == "yes" else toward_yes
+            if not wanted:
+                counts["book_move"] += 1
+                return None
         if bankroll is not None:
             cash = bankroll - risk.open_exposure_usd
             if filters.risk_pct_per_trade is not None:
@@ -517,7 +546,13 @@ def replay_prepared(
                 finalize_window(current_ticker, snap.poll_ts)
             current_ticker = snap.ticker
             rest_side, rest_streak = None, 0  # a new window starts a new streak
+            book_times.clear()
+            book_mids.clear()
         resolve_available(snap.poll_ts)
+        yes_mid = snap.book.mid("yes")
+        if yes_mid is not None:
+            book_times.append(snap.poll_ts.timestamp())
+            book_mids.append(yes_mid)
         if not step.active:
             continue
         p_blend = step.p_yes
