@@ -21,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from btcbot.backtest import PreparedReplay, ReplayData, Settlement, prepare_replay
 from btcbot.config import BotConfig
@@ -29,6 +30,8 @@ from btcbot.ml_features import ENTRY_FEATURES, EXIT_FEATURES, entry_features, ex
 from btcbot.ml_model import LogisticModel, brier_score, fit
 from btcbot.paper_broker import taker_fee
 from btcbot.strategy import Action, decide
+from btcbot.validation import ValidationError
+from btcbot.validation import split_windows as split_feature_windows
 
 MIN_TRAIN_EXAMPLES = 20
 MIN_VALIDATE_EXAMPLES = 5
@@ -185,5 +188,117 @@ def train_and_validate(
         which=which, windows_train=len(train_tickers), windows_validate=len(validate_tickers),
         train_examples=len(train_examples), validate_examples=len(validate_examples),
         train_brier=train_brier, validate_brier=validate_brier,
+    )
+    return model, report
+
+
+# --------------------------------------------------------------------------- training from btcbot.features rows
+
+FEATURE_STORE_ENTRY_FEATURES = (
+    "tau_sec", "spot_minus_strike", "spot_move_60s", "spot_move_300s", "spot_move_900s",
+    "yes_spread", "yes_bid_size", "no_bid_size", "yes_depth3", "no_depth3", "book_imbalance",
+    "p_model", "sigma", "model_minus_market",
+)
+"""The subset of :data:`btcbot.features.COLUMNS` used to train/predict an entry model here -- deliberately
+excludes identifiers (source/ticker/ts), the label (outcome_yes), and raw price levels already summarized by
+yes_spread/yes_mid/model_minus_market. Because these are the SAME names btcbot.features' rows already carry,
+a features-store row can be passed straight into :meth:`btcbot.ml_model.LogisticModel.predict_proba` -- no
+translation layer, and no separate schema for training versus inference -- unlike
+:mod:`btcbot.ml_features`' tick-level replay schema (see docs/research/ml-layers-handoff.md's "feature
+schemas" section for why the two are not interchangeable)."""
+
+
+def _feature_store_examples(rows: Sequence[Mapping[str, Any]], feature_names: Sequence[str]) -> list[Example]:
+    """Settled rows only (``outcome_yes`` is not None), and only those with a real value for every named
+    feature -- a row missing one (e.g. ``spot_move_900s`` before 900s of causal history exist) contributes
+    nothing usable, and :func:`btcbot.ml_model.fit`'s single mean/variance pass has no way to skip just one
+    cell within an otherwise-used row, so the whole row is dropped rather than silently biased toward zero."""
+    examples: list[Example] = []
+    for row in rows:
+        if row.get("outcome_yes") is None:
+            continue
+        if any(row.get(name) is None for name in feature_names):
+            continue
+        examples.append(({name: row[name] for name in feature_names}, bool(row["outcome_yes"])))
+    return examples
+
+
+def train_from_feature_rows(
+    rows: Sequence[Mapping[str, Any]],
+    feature_names: Sequence[str] = FEATURE_STORE_ENTRY_FEATURES,
+    *,
+    epochs: int = 300,
+    learning_rate: float = 0.3,
+    l2: float = 0.001,
+) -> tuple[LogisticModel, float]:
+    """Trains directly on :mod:`btcbot.features`' row schema (``btcbot features``'s CSV output, or the same
+    rows in memory) instead of replaying a recorder database -- the richer, book-imbalance/depth/multi-window
+    -momentum feature set the validation and calibration tooling already share. Returns ``(model,
+    train_brier)``; see :func:`train_and_validate_from_features` for a proper held-out score."""
+    examples = _feature_store_examples(rows, feature_names)
+    return _fit_and_score(examples, feature_names, epochs=epochs, learning_rate=learning_rate, l2=l2)
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureStoreTrainingReport:
+    windows_train: int
+    windows_validate: int
+    train_examples: int
+    validate_examples: int
+    train_brier: float
+    validate_brier: float
+    baseline_validate_brier: float | None  # the bot's own recorded p_blend, scored on the SAME validate rows
+    beats_baseline: bool | None  # None: no baseline rows to compare (p_blend was never logged for them)
+
+
+def train_and_validate_from_features(
+    rows: Sequence[Mapping[str, Any]],
+    feature_names: Sequence[str] = FEATURE_STORE_ENTRY_FEATURES,
+    *,
+    train_fraction: float = 0.7,
+    embargo: int = 1,
+    epochs: int = 300,
+    learning_rate: float = 0.3,
+    l2: float = 0.001,
+) -> tuple[LogisticModel, FeatureStoreTrainingReport]:
+    """Same discipline as :func:`train_and_validate` (time-ordered, embargoed, whole-market split; a Brier
+    score on markets the model never trained on, never a PnL claim) but for :mod:`btcbot.features`' row
+    schema -- and it goes one step further: it also scores the bot's OWN currently-deployed model
+    (``p_blend``, via :func:`btcbot.validation.blend_predictor`'s same field) on the exact same held-out
+    rows, so ``FeatureStoreTrainingReport.beats_baseline`` answers the question this whole handoff exists
+    for -- does the trained model actually do better than what is already running, on data it never saw --
+    instead of reporting a Brier score with nothing to compare it against."""
+    try:
+        train_tickers, validate_tickers = split_feature_windows(list(rows), train_fraction, embargo)
+    except ValidationError as exc:
+        raise MLPipelineError(str(exc)) from None
+    train_ticker_set, validate_ticker_set = set(train_tickers), set(validate_tickers)
+    train_rows = [r for r in rows if r["ticker"] in train_ticker_set]
+    validate_rows = [r for r in rows if r["ticker"] in validate_ticker_set]
+
+    train_examples = _feature_store_examples(train_rows, feature_names)
+    validate_examples = _feature_store_examples(validate_rows, feature_names)
+    if len(validate_examples) < MIN_VALIDATE_EXAMPLES:
+        raise MLPipelineError(
+            f"only {len(validate_examples)} usable validate-window rows; need at least {MIN_VALIDATE_EXAMPLES}"
+        )
+    model, train_brier = _fit_and_score(train_examples, feature_names, epochs=epochs, learning_rate=learning_rate, l2=l2)
+    validate_brier = brier_score(model, [r for r, _ in validate_examples], [y for _, y in validate_examples])
+
+    baseline_pairs = [
+        (row["p_blend"], bool(row["outcome_yes"])) for row in validate_rows
+        if row.get("p_blend") is not None and row.get("outcome_yes") is not None
+    ]
+    baseline_brier = None
+    beats_baseline = None
+    if baseline_pairs:
+        baseline_brier = sum((p - (1.0 if y else 0.0)) ** 2 for p, y in baseline_pairs) / len(baseline_pairs)
+        beats_baseline = validate_brier < baseline_brier
+
+    report = FeatureStoreTrainingReport(
+        windows_train=len(train_tickers), windows_validate=len(validate_tickers),
+        train_examples=len(train_examples), validate_examples=len(validate_examples),
+        train_brier=train_brier, validate_brier=validate_brier,
+        baseline_validate_brier=baseline_brier, beats_baseline=beats_baseline,
     )
     return model, report

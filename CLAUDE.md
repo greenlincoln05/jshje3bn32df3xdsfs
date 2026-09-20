@@ -101,6 +101,17 @@ truth for scope and phases; the README has the phase status and a dated table of
   `httpx.MockTransport`. No real data has been downloaded or trained on from this sandbox; every reported
   Brier score or ablation number in this work is on synthetic fixtures, same caveat as every phase before a
   real run.
+- Three feature schemas now exist for a `ml_model.LogisticModel` (`ml_features.ENTRY_FEATURES`/`EXIT_FEATURES`
+  for the tick-level lab/ablation path, `ml_pipeline.FEATURE_STORE_ENTRY_FEATURES` for the `btcbot features`
+  CSV path, `market_level_pipeline`'s `{p_model, sigma}` for the coarse historical dataset) and they are NOT
+  interchangeable -- `LogisticModel.predict_proba()` silently treats an unrecognized feature as its training
+  mean rather than erroring, so a model trained for one schema plugged into a pipeline expecting another would
+  just degrade to a near-constant prediction. `ml_model.check_feature_coverage()`, called by
+  `lab._load_ml_model()`, refuses to load a model whose features do not overlap the pipeline's schema; see
+  `docs/research/ml-layers-handoff.md`'s "Review" section for the full table. `train_and_validate_from_features()`
+  (`btcbot ml-train --features`) trains directly on the richer `btcbot features` schema and scores the bot's
+  own `p_blend` on the same held-out rows so `beats_baseline` answers "does this actually help," and `btcbot
+  validate --model` runs the full time-split harness for a trained model side by side with the current one.
 
 ## Commands
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
@@ -116,7 +127,12 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Demo-environment order validation, needs YOUR demo key (run by the owner): `.venv/Scripts/btcbot.exe demo-check`
 - Strategy placing REAL orders on the DEMO exchange (fake money), with a paper twin of every order, needs YOUR demo key: `.venv/Scripts/btcbot.exe demo --hours 2`
 - Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`
-- Train an ML entry/exit model from recorded data (offline): `.venv/Scripts/btcbot.exe ml-train --db data/recorder-....sqlite --which entry --out models/entry.json`
+- Health check of the newest paper/demo databases, read-only (offline): `.venv/Scripts/btcbot.exe watch`
+- Flatten recorder databases into one model-ready feature CSV (offline): `.venv/Scripts/btcbot.exe features --data-dir data --output data/research/features.csv`
+- Calibration + model-vs-market disagreement report on a features CSV (offline): `.venv/Scripts/btcbot.exe disagree --features data/research/features.csv`
+- Rigorous time-split validation (Wilson CI, t-stat, refuses under 30 test trades) of the current model, or --model against it, on a features CSV (offline): `.venv/Scripts/btcbot.exe validate --features data/research/features.csv --model models/entry.json`
+- Train an ML entry/exit model from a recorder database (offline): `.venv/Scripts/btcbot.exe ml-train --db data/recorder-....sqlite --which entry --out models/entry.json`
+- Train an ML entry model from a features CSV instead, with a baseline comparison (offline): `.venv/Scripts/btcbot.exe ml-train --features data/research/features.csv --out models/entry.json`
 - Compare the four ML entry/exit layers on recorded data (offline): `.venv/Scripts/btcbot.exe ml-ablation --db data/recorder-....sqlite --entry-model models/entry.json --exit-model models/exit.json`
 - ONE-TIME backfill of settled markets + Coinbase candles, needs network (owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe download-history --start 2026-01-01T00:00:00Z --end 2026-09-01T00:00:00Z`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own

@@ -518,6 +518,40 @@ class TestMlTrainEndToEnd:
         out = capsys.readouterr().out
         assert "Brier score" in out and "not a profitability claim" in out
 
+    def test_rejects_neither_db_nor_features(self, tmp_path, capsys):
+        exit_code = cli.main(["ml-train", "--out", str(tmp_path / "m.json")])
+        assert exit_code == 2
+        assert "--db" in capsys.readouterr().err
+
+    def test_rejects_both_db_and_features(self, tmp_path, capsys):
+        exit_code = cli.main([
+            "ml-train", "--db", "whatever.sqlite", "--features", "whatever.csv", "--which", "entry",
+            "--out", str(tmp_path / "m.json"),
+        ])
+        assert exit_code == 2
+        assert "--db" in capsys.readouterr().err
+
+    def test_db_mode_requires_which(self, tmp_path, capsys):
+        exit_code = cli.main(["ml-train", "--db", "whatever.sqlite", "--out", str(tmp_path / "m.json")])
+        assert exit_code == 2
+        assert "--which" in capsys.readouterr().err
+
+    def test_trains_from_a_features_csv(self, tmp_path, capsys):
+        from btcbot.features import write_csv
+        from test_ml_pipeline import separable_feature_rows
+
+        features_path = tmp_path / "f.csv"
+        write_csv(separable_feature_rows(60), features_path)
+        out_path = tmp_path / "entry.json"
+
+        exit_code = cli.main(["ml-train", "--features", str(features_path), "--out", str(out_path)])
+
+        assert exit_code == 0
+        assert out_path.is_file()
+        out = capsys.readouterr().out
+        assert "beats baseline: YES" in out
+        assert "not a profitability claim" in out
+
 
 class TestMlAblationEndToEnd:
     def test_requires_at_least_one_model(self, tmp_path, capsys):

@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from btcbot.ml_model import LogisticModel, MLModelError, brier_score, fit, load_model, save_model
+from btcbot.ml_model import LogisticModel, MLModelError, brier_score, check_feature_coverage, fit, load_model, save_model
 
 
 def separable_dataset(n=200, seed=7):
@@ -35,6 +35,15 @@ class TestFitAndPredict:
         with_x2 = model.predict_proba({"x1": 3.0, "x2": model.mean[1]})
         without_x2 = model.predict_proba({"x1": 3.0})
         assert without_x2 == pytest.approx(with_x2, abs=1e-9)
+
+    def test_a_none_valued_feature_is_treated_the_same_as_a_missing_one(self):
+        # btcbot.features' feature-store rows always carry every column, with None where a value could not
+        # be computed (e.g. not enough spot history yet) -- predict_proba must not crash on that.
+        rows, labels = separable_dataset()
+        model = fit(rows, labels, ["x1", "x2"])
+        missing_key = model.predict_proba({"x1": 3.0})
+        none_value = model.predict_proba({"x1": 3.0, "x2": None})
+        assert none_value == pytest.approx(missing_key, abs=1e-9)
 
     def test_rejects_mismatched_lengths(self):
         with pytest.raises(MLModelError):
@@ -91,3 +100,23 @@ class TestSerialization:
     def test_mismatched_field_lengths_are_rejected_at_construction(self):
         with pytest.raises(MLModelError):
             LogisticModel(("x", "y"), (1.0,), 0.0, (0.0, 0.0), (1.0, 1.0))
+
+
+class TestFeatureCoverage:
+    def test_full_overlap_passes(self):
+        model = LogisticModel(("a", "b"), (1.0, 1.0), 0.0, (0.0, 0.0), (1.0, 1.0))
+        check_feature_coverage(model, ["a", "b", "c"])  # does not raise
+
+    def test_no_overlap_is_rejected(self):
+        model = LogisticModel(("a", "b"), (1.0, 1.0), 0.0, (0.0, 0.0), (1.0, 1.0))
+        with pytest.raises(MLModelError, match="different feature schema"):
+            check_feature_coverage(model, ["x", "y", "z"])
+
+    def test_partial_overlap_below_threshold_is_rejected(self):
+        model = LogisticModel(("a", "b", "c", "d"), (1.0,) * 4, 0.0, (0.0,) * 4, (1.0,) * 4)
+        with pytest.raises(MLModelError):
+            check_feature_coverage(model, ["a"], min_coverage=0.5)  # 1/4 = 0.25 < 0.5
+
+    def test_partial_overlap_meeting_threshold_passes(self):
+        model = LogisticModel(("a", "b", "c", "d"), (1.0,) * 4, 0.0, (0.0,) * 4, (1.0,) * 4)
+        check_feature_coverage(model, ["a", "b"], min_coverage=0.5)  # 2/4 = 0.5, does not raise
