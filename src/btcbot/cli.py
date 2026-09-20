@@ -57,6 +57,8 @@ from btcbot.history_pipeline import (
     HistoryError,
     fetch_all_settled_markets,
     init_history_schema,
+    load_candles,
+    load_market_outcomes,
     save_candles,
     save_market_outcomes,
 )
@@ -78,8 +80,14 @@ from btcbot.demo_trader import DemoTrader, render_demo_report
 from btcbot.execution import DemoExecutionBackend
 from btcbot.live_paper import LivePaperTrader
 from btcbot.market_discovery import find_current_market
-from btcbot.ml_model import MLModelError, load_model, save_model
-from btcbot.ml_pipeline import MLPipelineError, train_and_validate, train_and_validate_from_features
+from btcbot.market_level_pipeline import MarketLevelError, train_and_validate_market_level
+from btcbot.ml_model import MLModelError, check_feature_coverage, load_model, save_model
+from btcbot.ml_pipeline import (
+    FEATURE_STORE_ENTRY_FEATURES,
+    MLPipelineError,
+    train_and_validate,
+    train_and_validate_from_features,
+)
 from btcbot.model import CalibrationSummary, compute_calibration_report
 from btcbot.models import Market, OrderBook, ParseError, Series, Side, parse_time
 from btcbot.paper_broker import QueueAssumption
@@ -600,6 +608,7 @@ async def _cmd_validate(args: argparse.Namespace) -> int:
         }
         if args.model:
             model = load_model(Path(args.model))
+            check_feature_coverage(model, FEATURE_STORE_ENTRY_FEATURES)
             results[f"ML model ({args.model})"] = validate(
                 rows, model.predict_proba, train_frac=args.split, embargo=args.embargo, min_test_trades=args.min_test_trades
             )
@@ -680,8 +689,44 @@ async def _cmd_ml_train(args: argparse.Namespace) -> int:
     instead of replaying a recorder database directly -- the richer, book-imbalance/depth/multi-window
     -momentum feature set `btcbot validate`/`btcbot disagree` already share, and its output plugs straight
     into `btcbot validate --model` for a full PnL-level comparison against the bot's current model. Offline
-    either way: no network, no credentials."""
+    either way: no network, no credentials. --history trains the coarser, candle-only market-level model
+    (btcbot.market_level_pipeline) from a `btcbot download-history` database instead -- a calibration
+    correction over the v1 model's own formula, with a DIFFERENT feature schema (`p_model`, `sigma`) that
+    `btcbot ml-ablation` / `btcbot validate --model` cannot load."""
     output = Path(args.out)
+    if args.history:
+        db_path = Path(args.history)
+        if not db_path.is_file():
+            print(f"error: no such database: {db_path}", file=sys.stderr)
+            return 1
+        conn = sqlite3.connect(str(db_path))
+        try:
+            outcomes = load_market_outcomes(conn)
+            candles = load_candles(conn)
+        except sqlite3.OperationalError as exc:
+            print(f"error: {db_path} does not look like a download-history database: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
+        try:
+            model, mreport = train_and_validate_market_level(outcomes, candles, train_fraction=args.split, embargo=args.embargo)
+        except MarketLevelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        output.parent.mkdir(parents=True, exist_ok=True)
+        save_model(model, output)
+        print(
+            f"Trained a market-level calibration model on {mreport.markets_train} settled markets "
+            f"({mreport.train_examples} examples); validated on {mreport.markets_validate} later markets it "
+            f"never trained on ({mreport.validate_examples} examples).\n"
+            f"Brier score: train {mreport.train_brier:.4f}, validate {mreport.validate_brier:.4f}; the v1 "
+            f"model's own p_model, unchanged, scores {mreport.baseline_validate_brier:.4f} on the SAME validate "
+            f"markets -- beats baseline: {'YES' if mreport.beats_baseline else 'no'}.\n"
+            f"Saved to {output}. Feature schema is (p_model, sigma) -- NOT compatible with `btcbot ml-ablation` "
+            "or `btcbot validate --model`, which expect the tick-level or feature-store schemas. A calibration "
+            "measure only: there is no recorded book price this far back to simulate a trade against."
+        )
+        return 0
     if args.features:
         from btcbot.features import read_csv
 
@@ -1189,10 +1234,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ml_train.add_argument("--db", help="path to a recorder SQLite database (tick-level entry/exit model; requires --which)")
     ml_train.add_argument("--features", help="CSV from `btcbot features` instead of --db (richer entry-only model, usable with `btcbot validate --model`)")
+    ml_train.add_argument("--history", help="database from `btcbot download-history` instead of --db/--features (coarse market-level calibration model; p_model/sigma schema, not usable with ml-ablation/validate --model)")
     ml_train.add_argument("--which", choices=["entry", "exit"], help="which model to train (--db mode only; required with --db)")
     ml_train.add_argument("--out", required=True, help="output path for the trained model JSON")
     ml_train.add_argument("--split", type=float, default=0.7, help="fraction of windows used to train; the rest validates it (default: 0.7)")
-    ml_train.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (--features mode only, default: 1)")
+    ml_train.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (--features/--history mode only, default: 1)")
     ml_train.set_defaults(handler=_cmd_ml_train)
 
     ablation = commands.add_parser(
@@ -1346,8 +1392,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not (0.2 <= args.split <= 0.9):
             print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
             return 2
-        if bool(args.db) == bool(args.features):
-            print("error: give exactly one of --db / --features", file=sys.stderr)
+        if sum(1 for source in (args.db, args.features, args.history) if source) != 1:
+            print("error: give exactly one of --db / --features / --history", file=sys.stderr)
             return 2
         if args.db and args.which is None:
             print("error: --which is required with --db", file=sys.stderr)

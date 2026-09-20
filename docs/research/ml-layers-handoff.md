@@ -241,3 +241,57 @@ and CLI tests in `tests/test_cli.py` (`ml-train --features`, `--db`/`--features`
 broken build first (including the resting-order-style precedence bugs' cousins: the coverage-threshold
 direction, the t-stat significance boundary, the `beats_baseline` comparison direction, and the `--db`/
 `--features` XOR check). Full suite: 953 passed, offline only, no key used, no real network reached.
+
+## Review (2026-09-20, continued): closing the third pipeline's parity gap
+
+The previous pass gave two of the three schemas (`ml_features.ENTRY_FEATURES`/`EXIT_FEATURES` and
+`ml_pipeline.FEATURE_STORE_ENTRY_FEATURES`) a `train_and_validate_*` function reporting `beats_baseline`. The
+third, `market_level_pipeline`'s coarse `(p_model, sigma)` schema, still only had `market_level_examples()`
+turning candles into training rows -- no training entry point, and the "What could not be done here" list
+above named this gap explicitly. Closed it, plus one guard the "does the ML model actually beat what's
+running" answer had a hole in:
+
+- **`market_level_pipeline.train_and_validate_market_level()`**: trains a `LogisticModel` on
+  `market_level_examples()`'s rows from the earlier `train_fraction` of settled markets
+  (`split_markets_by_time`'s same embargoed, time-ordered split every other pipeline in this project uses),
+  validates on the later markets it never trained on, and reports `MarketLevelTrainingReport.beats_baseline`
+  against the v1 model's own unmodified `p_model` scored on the SAME held-out markets -- since `p_model` is
+  one of the two features, this answers "does correcting the raw v1 formula with a candle-derived sigma
+  actually help, or is the formula already as good," not a PnL claim (there is no recorded book price this
+  far back to simulate an exit against; `adverse_exit_pnl` is a separate, independent sanity number, never fed
+  into this).
+- **`btcbot ml-train --history <download-history db>`**: the third mode alongside `--db`/`--features`
+  (`cli.py`'s `main()` now requires exactly one of the three), printing the same train/validate/Brier/
+  beats-baseline summary as the other two modes, plus an explicit caveat that this model's `(p_model, sigma)`
+  schema is not usable with `ml-ablation` or `validate --model`.
+- **`check_feature_coverage()` now also gates `validate --model`**, not just `lab._load_ml_model()`: loading a
+  model whose `feature_names` do not overlap `FEATURE_STORE_ENTRY_FEATURES` now fails cleanly (exit code 1,
+  "error: ... different feature schema") instead of `predict_proba` silently degrading to a near-constant
+  prediction on every row.
+
+**A real limit found while testing that guard, worth stating plainly**: `check_feature_coverage()` is a
+name-overlap heuristic, not a semantic one. A model trained on `market_level_pipeline`'s schema has
+`feature_names == ("p_model", "sigma")`, and `FEATURE_STORE_ENTRY_FEATURES` also contains columns literally
+named `p_model` and `sigma` -- so such a model passes the coverage check against the feature-store schema at
+100%, even though `features.py`'s `p_model` is computed at the market's real remaining time and
+`market_level_pipeline`'s is always computed at a fixed `tau_sec=1.0`. The guard would still catch the case it
+was built for (a model with no overlapping names at all, e.g. one trained on `ml_features.ENTRY_FEATURES`),
+but it cannot and does not detect two schemas that happen to share feature names with different meanings.
+Nothing in this codebase currently constructs that specific mismatch by accident (a `--history`-trained
+model's only consumer is documented, in both the CLAUDE.md bullet and `ml-train --history`'s own printed
+output, as not being `ml-ablation`/`validate --model` input) -- but a future schema addition should not assume
+name-overlap coverage is a full compatibility guarantee.
+
+### Tests added in this continued pass
+
+`tests/test_market_level_pipeline.py::TestTrainAndValidateMarketLevel` (a synthetic dataset whose parameters
+are derived from the exact v1 formula -- see the test module's comment -- rather than found by search: a
+sub-dollar final-candle delta against a realistic realized-vol sigma lands `p_model` at a
+weakly-but-consistently-directional ~0.83/~0.17, avoiding both the saturated-clamp and pure-noise failure
+modes `predict_p_yes`'s `tau_sec=1.0` sensitivity makes easy to hit by accident), `tests/test_cli.py`'s
+`TestMlTrainHistoryEndToEnd` and the three-way `--db`/`--features`/`--history` mutual-exclusion test, and
+`tests/test_validation.py::test_a_model_trained_for_a_different_feature_schema_is_rejected`. Every new
+assertion verified to fail against a deliberately broken build first (the `beats_baseline` comparison
+direction in `market_level_pipeline.py`, the three-way mutual-exclusion check in `cli.py`, the missing
+`check_feature_coverage()` call in `_cmd_validate`). Full suite: 972 passed, offline only, no key used, no
+real network reached.

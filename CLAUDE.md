@@ -109,15 +109,24 @@ truth for scope and phases; the README has the phase status and a dated table of
   real run.
 - Three feature schemas now exist for a `ml_model.LogisticModel` (`ml_features.ENTRY_FEATURES`/`EXIT_FEATURES`
   for the tick-level lab/ablation path, `ml_pipeline.FEATURE_STORE_ENTRY_FEATURES` for the `btcbot features`
-  CSV path, `market_level_pipeline`'s `{p_model, sigma}` for the coarse historical dataset) and they are NOT
-  interchangeable -- `LogisticModel.predict_proba()` silently treats an unrecognized feature as its training
-  mean rather than erroring, so a model trained for one schema plugged into a pipeline expecting another would
-  just degrade to a near-constant prediction. `ml_model.check_feature_coverage()`, called by
-  `lab._load_ml_model()`, refuses to load a model whose features do not overlap the pipeline's schema; see
-  `docs/research/ml-layers-handoff.md`'s "Review" section for the full table. `train_and_validate_from_features()`
-  (`btcbot ml-train --features`) trains directly on the richer `btcbot features` schema and scores the bot's
-  own `p_blend` on the same held-out rows so `beats_baseline` answers "does this actually help," and `btcbot
-  validate --model` runs the full time-split harness for a trained model side by side with the current one.
+  CSV path, `market_level_pipeline.MARKET_LEVEL_FEATURES` = `{p_model, sigma}` for the coarse historical
+  dataset) and they are NOT interchangeable -- `LogisticModel.predict_proba()` silently treats an unrecognized
+  feature as its training mean rather than erroring, so a model trained for one schema plugged into a pipeline
+  expecting another would just degrade to a near-constant prediction. `ml_model.check_feature_coverage()`
+  refuses to load a model whose features do not overlap the pipeline's schema (called by both
+  `lab._load_ml_model()` and `cli._cmd_validate`'s `--model` path); see `docs/research/ml-layers-handoff.md`'s
+  "Review" section for the full table. It is a name-overlap heuristic, not a semantic check: because
+  `market_level_pipeline`'s two features are literally named `p_model`/`sigma`, a model trained on that coarse
+  schema passes the coverage check against `FEATURE_STORE_ENTRY_FEATURES` too (which also has `p_model`/`sigma`
+  columns, computed differently, at the real tau rather than a fixed 1 second) -- coverage catches a
+  wrong-schema model with no overlap at all, not one whose overlapping names mean something different.
+  `train_and_validate_from_features()` (`btcbot ml-train --features`) trains directly on the richer `btcbot
+  features` schema and scores the bot's own `p_blend` on the same held-out rows so `beats_baseline` answers
+  "does this actually help," and `btcbot validate --model` runs the full time-split harness for a trained model
+  side by side with the current one. `train_and_validate_market_level()` (`btcbot ml-train --history`, on a
+  `btcbot download-history` database) does the same `beats_baseline` comparison for the third, candle-only
+  schema, baselined against the v1 model's own unmodified `p_model` on the same held-out markets -- a
+  calibration measure only, since there is no recorded book price this far back to simulate a trade against.
 
 ## Commands
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
@@ -139,6 +148,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Rigorous time-split validation (Wilson CI, t-stat, refuses under 30 test trades) of the current model, or --model against it, on a features CSV (offline): `.venv/Scripts/btcbot.exe validate --features data/research/features.csv --model models/entry.json`
 - Train an ML entry/exit model from a recorder database (offline): `.venv/Scripts/btcbot.exe ml-train --db data/recorder-....sqlite --which entry --out models/entry.json`
 - Train an ML entry model from a features CSV instead, with a baseline comparison (offline): `.venv/Scripts/btcbot.exe ml-train --features data/research/features.csv --out models/entry.json`
+- Train the coarse market-level calibration model from a download-history database instead, with a baseline comparison (offline): `.venv/Scripts/btcbot.exe ml-train --history data/history-....sqlite --out models/market_level.json`
 - Compare the four ML entry/exit layers on recorded data (offline): `.venv/Scripts/btcbot.exe ml-ablation --db data/recorder-....sqlite --entry-model models/entry.json --exit-model models/exit.json`
 - ONE-TIME backfill of settled markets + Coinbase candles, needs network (owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe download-history --start 2026-01-01T00:00:00Z --end 2026-09-01T00:00:00Z`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own
