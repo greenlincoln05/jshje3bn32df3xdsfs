@@ -51,6 +51,12 @@ truth for scope and phases; the README has the phase status and a dated table of
   two dollar caps follow the account, otherwise a fixed cap stops bets from growing. `risk_pct_per_trade` is capped
   at 10 in the config on purpose. Percent sizing does not create an edge; do not enable it for real money on the
   strength of a paper or demo result, and never raise a size to recover a loss.
+- Ramp sizing (`sizing.mode: ramp`, the shipped default): `contracts_per_trade` (5), +max(1, `ramp_growth_pct`%) after
+  each SETTLED win, back to base after any loss or breakeven, capped by `risk.max_contracts_per_trade`. Ramp risk
+  rules (`live_paper.py`): each win-level lowers the highest entry price by `ramp_max_price_step` (floor
+  `ramp_max_price_floor`), and `ramp_idle_reset_windows` (2) consecutive windows without opening a position reset
+  the ramp to base. `strategy.ramp_stop_loss_pct` tightens the stop per level; that stop is wired into the
+  lab/backtest only until paper/demo exits land.
 - `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
   and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing

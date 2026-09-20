@@ -61,3 +61,58 @@ class TestLiveTraderRampMode:
 
         assert len(rows) == 5
         assert sizes[-2] == 5 and sizes[-1] == 5  # both losses hold at base; a second loss cannot go lower
+
+
+def test_ramp_max_price_and_stop_tighten_with_level_and_respect_floors():
+    from btcbot.strategy import ramp_max_price, ramp_stop_loss_pct
+    kw = dict(step=D("0.03"), floor=D("0.60"))
+    assert ramp_max_price(D("0.85"), 0, **kw) == D("0.85")
+    assert ramp_max_price(D("0.85"), 3, **kw) == D("0.76")
+    assert ramp_max_price(D("0.85"), 20, **kw) == D("0.60")  # floor
+    assert ramp_max_price(None, 3, **kw) is None
+    sk = dict(tighten_per_level=D(8), floor_pct=D(10))
+    assert ramp_stop_loss_pct(D(50), 0, **sk) == 50
+    assert ramp_stop_loss_pct(D(50), 2, **sk) == 34
+    assert ramp_stop_loss_pct(D(50), 9, **sk) == 10  # floor
+    assert ramp_stop_loss_pct(None, 2, **sk) is None
+
+
+def _trader():
+    import sqlite3
+    from btcbot.config import BotConfig, Sizing
+    from test_live_paper import make_trader
+    return make_trader(sqlite3.connect(":memory:"), config=BotConfig(sizing=Sizing(mode="ramp")))[0]
+
+
+def test_the_ramp_resets_after_two_windows_without_a_position():
+    t = _trader()
+    t._ramp_level, t._ramp_size = 3, D(8)
+    t._current_ticker = "A"
+    t._note_finished_window()
+    assert t._ramp_level == 3 and t._idle_windows == 1           # one idle window: not yet
+    t._current_ticker = "B"
+    t._note_finished_window()
+    assert t._ramp_level == 0 and t._ramp_size is None and t._idle_windows == 0
+
+
+def test_a_traded_window_clears_the_idle_count():
+    t = _trader()
+    t._ramp_level, t._idle_windows = 2, 1
+    t._current_ticker = "A"
+    t.windows_traded.add("A")
+    t._note_finished_window()
+    assert t._idle_windows == 0 and t._ramp_level == 2
+
+
+def test_the_price_cap_drops_as_the_ramp_climbs():
+    t = _trader()
+    base = t._effective_max_price()
+    t._ramp_level = 4
+    assert t._effective_max_price() < base
+
+
+def test_idle_count_does_not_run_at_base_size():
+    t = _trader()
+    t._current_ticker = "A"
+    t._note_finished_window()
+    assert t._idle_windows == 0
