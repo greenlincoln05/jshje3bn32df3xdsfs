@@ -31,3 +31,11 @@ risk:
   daily_loss_limit_usd: 20
   max_consecutive_losses: 5
   max_trades_per_hour: 12
+# Optional early exit (default: hold to settlement, as always). Off unless stop_loss_pct or take_profit_pct
+# is set. Wired into `btcbot backtest`/`btcbot lab` only so far -- not yet into `btcbot paper`/`btcbot demo`;
+# see docs/research/stop-loss-handoff.md.
+exit:
+  stop_loss_pct: null          # exit if the mark (best bid of the held side) falls this % below entry
+  take_profit_pct: null        # exit if the mark rises this % above entry
+  stop_min_hold_sec: 0         # do not exit before holding a position at least this long
+  stop_min_tau_sec: 0          # do not exit within this many seconds of close; hold to settlement instead

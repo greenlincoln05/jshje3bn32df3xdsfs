@@ -43,3 +43,38 @@ share it, and treat stop parameters as one more grid axis judged only on the lat
 - Tests: `.venv/Scripts/python.exe -m pytest` (778 pass at 8974790)
 - Lab: `.venv/Scripts/btcbot.exe lab --grid min_edge=0.04 --grid max_price=none,0.6`
 - Data: `data/paper-KXBTC15M-prod-20260919T*.sqlite` (recorded prod windows)
+
+## Progress (Claude, 2026-09-20): design steps 1-3 built, 4-5 not started
+
+- **`strategy.should_exit(entry_price, current_bid, tau_sec, held_sec, stop_loss_pct, take_profit_pct,
+  stop_min_hold_sec, stop_min_tau_sec) -> "stop_loss" | "take_profit" | None`**: the pure function step 2
+  and the Codex-pipeline note both ask for, so a backtest replay and (later) a live trader can share one
+  decision. `current_bid` must be the best bid of the side actually HELD (what a sell could get), not the
+  mid; `None` (nothing to sell into) or either threshold left `None` means keep holding, i.e. today's
+  behavior when nothing is configured. `decide()` calls it when `has_position` and returns a new
+  `Action.EXIT` (side, price, `exit_reason`) instead of always `HOLD`; a resting order still takes priority
+  over an exit check, unchanged from before.
+- **Config**: `BotConfig.exit: ExitRules` (`stop_loss_pct`, `take_profit_pct`, `stop_min_hold_sec`,
+  `stop_min_tau_sec`), all off/zero by default -- `config.yaml`'s shipped `exit:` block matches the code
+  defaults exactly (a test checks this, same as every other section).
+- **Fill simulation**: `PaperBroker.place_exit_order(side, size, book, ts, worst_price=None)` -- a taker SELL
+  that crosses into `side`'s OWN bid queue (best price first), the mirror of `place_taker_order` (a taker BUY
+  computed from the OPPOSITE side's bids, since there is no separate published ask book). Depth-limited, like
+  any other fill.
+- **Wired into `btcbot.backtest.replay_prepared`** (so both `btcbot backtest` and `btcbot lab` exercise
+  whatever `config.exit` says) -- **not** into `live_paper.py`, so `btcbot paper`/`btcbot demo` are
+  byte-for-byte unchanged until someone deliberately wires step 4 in. `TradeRecord` gained `exit_reason` /
+  `exit_price` (`None` for a settlement-resolved trade); `build_report`'s resolved/unresolved split now reads
+  `pnl_usd is not None` rather than `result is not None`, since an early exit resolves PnL without the market
+  ever settling (same one-line fix applied in `webui.py`). A partial exit fill (thin book) splits the
+  position: the sold part becomes a closed `stop_loss`/`take_profit` trade, the rest keeps its original entry
+  price and rides to settlement like before.
+- **Not done**: `lab.py`'s `LabParams`/grid system has no `stop_loss_pct`/`take_profit_pct` axis yet -- sweep
+  it today by pointing `--config` at a YAML with `exit:` set and comparing separate `btcbot lab` runs, not via
+  `--grid`. Steps 4-5 (execution.py demo backend, live_paper.py wiring, Codex pipeline hookup) are untouched;
+  `btcbot demo`'s real order path cannot exit early yet. No real recorded data was used -- all of the tests
+  below are synthetic fixtures, same caveat as every other phase before a real run.
+- Tests: `tests/test_strategy.py::TestShouldExit`/`TestExit`, `tests/test_paper_broker.py::TestExitOrders`,
+  `tests/test_backtest.py::TestStopLoss` (closes early without settlement, off-by-default holds to
+  settlement as before, a partial fill leaves the remainder tracked to settlement), `tests/test_config.py`'s
+  `exit:` cases. Full suite: 814 passed, offline only, no key used.

@@ -275,6 +275,53 @@ class TestTakerOrders:
         assert sum(f.size for f in fills) == 4
 
 
+class TestExitOrders:
+    def test_rejects_non_positive_size(self):
+        b = PaperBroker()
+        with pytest.raises(PaperBrokerError):
+            b.place_exit_order("yes", Decimal(0), book=book(), ts=T0)
+
+    def test_fills_from_a_single_level(self):
+        b = PaperBroker()
+        # selling YES crosses YES's OWN bid queue directly -- no 1-p derivation, unlike a taker buy
+        fills = b.place_exit_order("yes", Decimal(3), book=book(yes=[("0.60", "10")]), ts=T0)
+        assert len(fills) == 1
+        assert fills[0].price == Decimal("0.60") and fills[0].size == 3 and fills[0].maker is False
+
+    def test_walks_multiple_levels_best_price_first(self):
+        b = PaperBroker()
+        # yes bids at 0.30 and 0.40: best (highest) bid -- 0.40 -- first
+        fills = b.place_exit_order("yes", Decimal(6), book=book(yes=[("0.30", "3"), ("0.40", "5")]), ts=T0)
+        assert [(f.price, f.size) for f in fills] == [(Decimal("0.40"), Decimal(5)), (Decimal("0.30"), Decimal(1))]
+
+    def test_stops_at_worst_price(self):
+        b = PaperBroker()
+        # worst_price is a FLOOR for a sale (the opposite sense from place_taker_order's ceiling)
+        fills = b.place_exit_order(
+            "yes", Decimal(10), book=book(yes=[("0.30", "3"), ("0.40", "5")]), ts=T0, worst_price=Decimal("0.40")
+        )
+        assert [(f.price, f.size) for f in fills] == [(Decimal("0.40"), Decimal(5))]
+
+    def test_partial_fill_when_the_book_runs_out(self):
+        b = PaperBroker()
+        fills = b.place_exit_order("yes", Decimal(100), book=book(yes=[("0.40", "5")]), ts=T0)
+        assert sum(f.size for f in fills) == 5
+
+    def test_empty_own_side_fills_nothing(self):
+        b = PaperBroker()
+        assert b.place_exit_order("yes", Decimal(5), book=book(), ts=T0) == []
+
+    def test_selling_no_crosses_no_bids_not_yes_bids(self):
+        b = PaperBroker()
+        fills = b.place_exit_order("no", Decimal(4), book=book(yes=[("0.90", "100")], no=[("0.08", "10")]), ts=T0)
+        assert len(fills) == 1 and fills[0].price == Decimal("0.08")
+
+    def test_exit_fill_never_exceeds_requested_size(self):
+        b = PaperBroker()
+        fills = b.place_exit_order("yes", Decimal(4), book=book(yes=[("0.90", "100")]), ts=T0)
+        assert sum(f.size for f in fills) == 4
+
+
 class TestQueueInvariants:
     @given(
         initial_depth=st.integers(min_value=0, max_value=50),

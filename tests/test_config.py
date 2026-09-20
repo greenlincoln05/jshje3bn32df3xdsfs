@@ -34,6 +34,8 @@ class TestBotConfig:
         assert cfg.risk.daily_loss_limit_usd == Decimal(20)
         assert cfg.risk.max_consecutive_losses == 5
         assert cfg.risk.max_trades_per_hour == 12
+        assert cfg.exit.stop_loss_pct is None and cfg.exit.take_profit_pct is None
+        assert cfg.exit.stop_min_hold_sec == 0 and cfg.exit.stop_min_tau_sec == 0
 
     def test_code_defaults_and_shipped_file_agree(self):
         assert load_config(PROJECT_ROOT / "config.yaml") == BotConfig()
@@ -91,11 +93,22 @@ class TestBotConfig:
             "sizing:\n  mode: yolo",
             "sizing:\n  kelly_fraction_multiplier: 0",
             "sizing:\n  kelly_fraction_multiplier: 1.01",
+            "exit:\n  stop_loss_pct: 0",
+            "exit:\n  stop_loss_pct: 101",
+            "exit:\n  take_profit_pct: 0",
+            "exit:\n  stop_min_hold_sec: -1",
+            "exit:\n  stop_min_tau_sec: -1",
         ],
     )
     def test_out_of_range_values_are_rejected(self, tmp_path, text):
         with pytest.raises(ConfigError):
             load_config(write_yaml(tmp_path, text + "\n"))
+
+    def test_exit_rules_can_be_configured(self, tmp_path):
+        cfg = load_config(write_yaml(tmp_path, "exit:\n  stop_loss_pct: 20\n  take_profit_pct: 40\n"
+                                                "  stop_min_hold_sec: 30\n  stop_min_tau_sec: 60\n"))
+        assert cfg.exit.stop_loss_pct == Decimal(20) and cfg.exit.take_profit_pct == Decimal(40)
+        assert cfg.exit.stop_min_hold_sec == 30 and cfg.exit.stop_min_tau_sec == 60
 
     def test_min_price_must_be_below_max_price(self, tmp_path):
         with pytest.raises(ConfigError, match="min_price"):

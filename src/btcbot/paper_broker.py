@@ -225,6 +225,32 @@ class PaperBroker:
             remaining -= take
         return fills
 
+    def place_exit_order(
+        self, side: Side, size: Decimal, *, book: OrderBook, ts: datetime, worst_price: Decimal | None = None
+    ) -> list[Fill]:
+        """Simulates an immediate SELL of a held ``side`` position (a stop-loss/take-profit exit): crosses
+        into ``side``'s OWN resting bid queue, best (highest) price first -- the mirror of
+        :meth:`place_taker_order`, which is a taker BUY computed from the OPPOSITE side's bids (there is no
+        separately published ask book; see that method's docstring). Depth limited: a thin book fills only
+        part of ``size``, leaving the caller to track the rest as still held, same as any partial fill.
+        ``worst_price``, if given, is a floor -- never sell for less."""
+        if size <= 0:
+            raise PaperBrokerError("size must be positive")
+        remaining = size
+        fills: list[Fill] = []
+        for level in reversed(book.bids(side)):
+            if remaining <= 0:
+                break
+            if worst_price is not None and level.price < worst_price:
+                break
+            take = min(remaining, level.size)
+            if take <= 0:
+                continue
+            fee = taker_fee(take, level.price)
+            fills.append(Fill(side=side, price=level.price, size=take, fee=fee, maker=False, ts=ts))
+            remaining -= take
+        return fills
+
     # ---- queue simulation
 
     def on_book_update(self, book: OrderBook, *, ts: datetime) -> list[Fill]:

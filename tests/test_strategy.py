@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 
 from btcbot.models import OrderBook, PriceLevel
-from btcbot.strategy import Action, decide, kelly_fraction, kelly_size
+from btcbot.strategy import Action, decide, kelly_fraction, kelly_size, should_exit
 
 
 def book(yes=(), no=()):
@@ -165,6 +165,116 @@ class TestPriceBand:
             min_price=Decimal("0.15"), max_price=Decimal("0.85"),
         )
         assert d.action is Action.REST and d.side == "yes"
+
+
+class TestShouldExit:
+    def test_off_when_neither_threshold_is_set(self):
+        assert should_exit(
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.10"), tau_sec=300, held_sec=300,
+            stop_loss_pct=None, take_profit_pct=None,
+        ) is None
+
+    def test_stop_loss_triggers_when_the_mark_falls_far_enough(self):
+        assert should_exit(  # entry 0.50, bid 0.40: down 20%
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.40"), tau_sec=300, held_sec=300,
+            stop_loss_pct=Decimal("20"), take_profit_pct=None,
+        ) == "stop_loss"
+
+    def test_stop_loss_does_not_trigger_just_short_of_the_threshold(self):
+        assert should_exit(  # down 19%, threshold 20%
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.405"), tau_sec=300, held_sec=300,
+            stop_loss_pct=Decimal("20"), take_profit_pct=None,
+        ) is None
+
+    def test_take_profit_triggers_when_the_mark_rises_far_enough(self):
+        assert should_exit(  # entry 0.50, bid 0.65: up 30%
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.65"), tau_sec=300, held_sec=300,
+            stop_loss_pct=None, take_profit_pct=Decimal("20"),
+        ) == "take_profit"
+
+    def test_no_signal_inside_the_neutral_band(self):
+        assert should_exit(
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.48"), tau_sec=300, held_sec=300,
+            stop_loss_pct=Decimal("20"), take_profit_pct=Decimal("20"),
+        ) is None
+
+    def test_no_depth_on_the_held_side_means_no_signal(self):
+        # nothing to sell into: no exit fill is possible, so there is nothing to do but keep holding.
+        assert should_exit(
+            entry_price=Decimal("0.50"), current_bid=None, tau_sec=300, held_sec=300,
+            stop_loss_pct=Decimal("1"), take_profit_pct=None,
+        ) is None
+
+    def test_a_degenerate_entry_price_is_refused(self):
+        assert should_exit(
+            entry_price=Decimal("0"), current_bid=Decimal("0.10"), tau_sec=300, held_sec=300,
+            stop_loss_pct=Decimal("1"), take_profit_pct=None,
+        ) is None
+
+    def test_minimum_hold_blocks_an_early_exit(self):
+        too_soon = should_exit(
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.30"), tau_sec=300, held_sec=5,
+            stop_loss_pct=Decimal("20"), take_profit_pct=None, stop_min_hold_sec=30,
+        )
+        long_enough = should_exit(
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.30"), tau_sec=300, held_sec=30,
+            stop_loss_pct=Decimal("20"), take_profit_pct=None, stop_min_hold_sec=30,
+        )
+        assert too_soon is None and long_enough == "stop_loss"
+
+    def test_minimum_tau_holds_to_settlement_near_close(self):
+        too_close = should_exit(
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.30"), tau_sec=15, held_sec=300,
+            stop_loss_pct=Decimal("20"), take_profit_pct=None, stop_min_tau_sec=30,
+        )
+        still_time = should_exit(
+            entry_price=Decimal("0.50"), current_bid=Decimal("0.30"), tau_sec=30, held_sec=300,
+            stop_loss_pct=Decimal("20"), take_profit_pct=None, stop_min_tau_sec=30,
+        )
+        assert too_close is None and still_time == "stop_loss"
+
+
+class TestExit:
+    def test_no_exit_signal_holds_as_before(self):
+        d = decide_with(
+            has_position=True, book=book(yes=[("0.50", "20")], no=[("0.45", "20")]),
+            position_side="yes", position_entry_price=Decimal("0.50"), position_held_sec=300,
+        )
+        assert d.action is Action.HOLD
+
+    def test_exits_when_the_stop_triggers(self):
+        d = decide_with(
+            has_position=True, book=book(yes=[("0.35", "20")], no=[("0.60", "20")]),
+            position_side="yes", position_entry_price=Decimal("0.50"), position_held_sec=300,
+            stop_loss_pct=Decimal("20"),
+        )
+        assert d.action is Action.EXIT
+        assert d.side == "yes"
+        assert d.price == Decimal("0.35")
+        assert d.exit_reason == "stop_loss"
+
+    def test_without_position_details_never_exits_even_with_a_stop_configured(self):
+        # decide() cannot check a stop it has no entry price/side for; passing none of the new kwargs
+        # keeps a caller's behavior identical to before this feature existed.
+        d = decide_with(has_position=True, stop_loss_pct=Decimal("0.01"))
+        assert d.action is Action.HOLD
+
+    def test_a_resting_order_still_takes_priority_over_an_exit_check(self):
+        d = decide_with(
+            has_resting_order=True, has_position=True, tau_sec=300,
+            book=book(yes=[("0.10", "20")], no=[("0.85", "20")]),
+            position_side="yes", position_entry_price=Decimal("0.50"), position_held_sec=300,
+            stop_loss_pct=Decimal("1"),
+        )
+        assert d.action is Action.HOLD  # today's guard ordering is unchanged: a resting order is handled first
+
+    def test_no_depth_on_the_held_side_falls_back_to_holding(self):
+        d = decide_with(
+            has_position=True, book=book(yes=[], no=[("0.60", "20")]),
+            position_side="yes", position_entry_price=Decimal("0.50"), position_held_sec=300,
+            stop_loss_pct=Decimal("1"),
+        )
+        assert d.action is Action.HOLD
 
 
 class TestKellyFraction:

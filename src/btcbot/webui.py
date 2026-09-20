@@ -172,8 +172,10 @@ def paper_summary(db_path: Path) -> dict[str, Any]:
         conn.close()
 
     windows_traded = {t.ticker for t in trades}
-    resolved = [t for t in trades if t.result is not None]
-    unresolved = [t for t in trades if t.result is None]
+    # pnl_usd, not result: an early stop-loss/take-profit exit resolves a trade's PnL without the market
+    # itself ever settling (result stays None then) -- see btcbot.backtest.TradeRecord.exit_reason.
+    resolved = [t for t in trades if t.pnl_usd is not None]
+    unresolved = [t for t in trades if t.pnl_usd is None]
     wins = sum(1 for t in resolved if t.pnl_usd is not None and t.pnl_usd > 0)
     total_pnl = sum((t.pnl_usd for t in resolved if t.pnl_usd is not None), Decimal("0"))
 
