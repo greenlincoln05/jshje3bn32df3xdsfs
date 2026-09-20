@@ -42,6 +42,15 @@ truth for scope and phases; the README has the phase status and a dated table of
   prove it. Order/fill/position field names come from docs.kalshi.com (read 2026-09-19) and are strict: a
   missing `fee_cost` is a ParseError, never a silent zero. A session never runs these; the owner does, with
   their own demo key.
+- `btcbot demo` writes a "paper twin" of every real order into the same `demo_orders` row (`demo_*` columns
+  for what the exchange actually did, `paper_*` for what the optimistic queue-model simulation of the same
+  order at the same moment says would have happened) -- `demo_trader.compute_fill_gap()` turns those rows
+  into one quantified answer to the roadmap milestone "a paper-vs-demo fill gap we understand": mean fill-rate
+  gap (paper over-fills relative to demo), mean fill-price gap (on orders where both sides actually filled),
+  and mean settled-PnL gap, each `None` (not a misleading 0) when its denominator is empty. `render_demo_report()`
+  prints it alongside the existing per-order dump, and `btcbot demo-report --db <demo db>` re-renders the whole
+  report offline from an already-recorded database (read-only, no key) -- no need to re-run `btcbot demo` just
+  to review last night's numbers.
 - Sizing modes (`sizing.mode`): `fixed` (default), `kelly`, and `percent`. `percent` stakes a small percent of the
   CURRENT account per order; the account is the starting `account_usd` plus SETTLED profit and loss only, so bets
   grow after wins and shrink after losses (fixed-fractional, the opposite of a martingale). After a settled win the
@@ -143,6 +152,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Strategy placing REAL orders on the DEMO exchange (fake money), with a paper twin of every order, needs YOUR demo key: `.venv/Scripts/btcbot.exe demo --hours 2`
 - Local monitoring dashboard (binds to 127.0.0.1 only): `.venv/Scripts/btcbot.exe dashboard`
 - Health check of the newest paper/demo databases, read-only (offline): `.venv/Scripts/btcbot.exe watch`
+- Re-render the demo-vs-paper fill-gap report from a saved demo database, read-only (offline): `.venv/Scripts/btcbot.exe demo-report --db data/demo-....sqlite`
 - Flatten recorder databases into one model-ready feature CSV (offline): `.venv/Scripts/btcbot.exe features --data-dir data --output data/research/features.csv`
 - Calibration + model-vs-market disagreement report on a features CSV (offline): `.venv/Scripts/btcbot.exe disagree --features data/research/features.csv`
 - Rigorous time-split validation (Wilson CI, t-stat, refuses under 30 test trades) of the current model, or --model against it, on a features CSV (offline): `.venv/Scripts/btcbot.exe validate --features data/research/features.csv --model models/entry.json`

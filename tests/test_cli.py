@@ -607,6 +607,48 @@ class TestMlTrainHistoryEndToEnd:
         assert "error:" in capsys.readouterr().err
 
 
+class TestDemoReportEndToEnd:
+    def test_reports_a_missing_database(self, tmp_path, capsys):
+        exit_code = cli.main(["demo-report", "--db", str(tmp_path / "nope.sqlite")])
+        assert exit_code == 1
+        assert "no such database" in capsys.readouterr().err
+
+    def test_renders_the_fill_gap_report_from_a_saved_database(self, tmp_path, capsys):
+        from btcbot.demo_trader import DEMO_SCHEMA
+
+        db_path = tmp_path / "demo-KXBTC15M-demo-20260101T000000Z.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(DEMO_SCHEMA)
+        conn.execute(
+            """INSERT INTO demo_orders
+               (ticker, side, price, size, placed_ts, order_id, demo_filled, demo_cost, demo_fee,
+                paper_filled, paper_cost, paper_fee, result, demo_pnl, paper_pnl)
+               VALUES ('T0', 'yes', '0.30', '5', '2026-01-01T00:00:00+00:00', 'ord-1',
+                       '5', '1.50', '0', '5', '1.50', '0', 'yes', '1.0', '1.0')"""
+        )
+        conn.commit()
+        conn.close()
+
+        exit_code = cli.main(["demo-report", "--db", str(db_path)])
+
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "fill gap: mean fill-rate gap" in out
+        assert "settled PnL: demo $1.0000" in out
+
+    def test_bad_database_is_reported_cleanly(self, tmp_path, capsys):
+        db_path = tmp_path / "not-a-demo-db.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE something (x INTEGER)")
+        conn.commit()
+        conn.close()
+
+        exit_code = cli.main(["demo-report", "--db", str(db_path)])
+
+        assert exit_code == 1
+        assert "does not look like a demo database" in capsys.readouterr().err
+
+
 class TestMlAblationEndToEnd:
     def test_requires_at_least_one_model(self, tmp_path, capsys):
         assert cli.main(["ml-ablation", "--data-dir", str(tmp_path)]) == 2
