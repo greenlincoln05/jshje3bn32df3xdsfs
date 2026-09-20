@@ -200,3 +200,41 @@ def test_invalid_assumed_balance_is_rejected(tmp_path, balance):
     path = database(tmp_path)
     with pytest.raises(ValueError):
         portfolio_view(path, balance)
+
+
+def test_starting_balance_is_found_automatically(tmp_path):
+    import json
+    import sqlite3
+    from btcbot.dashboard_analytics import portfolio_view
+
+    def db(name, detail=None):
+        path = tmp_path / name
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE run_log (id INTEGER PRIMARY KEY, ts TEXT, level TEXT, event TEXT, detail TEXT)")
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, ticker TEXT, side TEXT, size TEXT, entry_price TEXT, entry_ts TEXT,"
+                     " fee_paid TEXT, p_side_at_entry REAL, result TEXT, pnl_usd TEXT, exit_reason TEXT, exit_price TEXT)")
+        if detail:
+            conn.execute("INSERT INTO run_log (ts, level, event, detail) VALUES ('t','info','account_start',?)", (json.dumps(detail),))
+        conn.commit(); conn.close()
+        return path
+
+    demo = portfolio_view(db("d.sqlite", {"kind": "demo", "available_usd": "116.40", "portfolio_value_usd": "118.13"}))
+    assert str(demo["starting_balance_usd"]) == "118.13" and "demo account" in demo["starting_balance_source"]
+    paper = portfolio_view(db("p.sqlite", {"kind": "paper", "account_usd": "500"}))
+    assert str(paper["starting_balance_usd"]) == "500" and "paper" in paper["starting_balance_source"]
+    old = portfolio_view(db("o.sqlite"), None, "500")                       # recorded before account_start existed
+    assert str(old["starting_balance_usd"]) == "500" and "config" in old["starting_balance_source"]
+    assert str(portfolio_view(db("e.sqlite"), "250")["starting_balance_usd"]) == "250"  # explicit API override still works
+
+
+def test_a_demo_run_without_a_recorded_balance_does_not_borrow_the_config_account(tmp_path):
+    import sqlite3
+    from btcbot.dashboard_analytics import portfolio_view
+    path = tmp_path / "d.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE demo_orders (id INTEGER PRIMARY KEY, ticker TEXT, side TEXT, price TEXT, size TEXT, placed_ts TEXT, order_id TEXT,"
+                 " demo_filled TEXT, demo_cost TEXT, demo_fee TEXT, demo_first_fill_ts TEXT, paper_filled TEXT, paper_cost TEXT,"
+                 " paper_fee TEXT, paper_first_fill_ts TEXT, closed_ts TEXT, result TEXT, demo_pnl TEXT, paper_pnl TEXT)")
+    conn.commit(); conn.close()
+    view = portfolio_view(path, None, "500")
+    assert view["starting_balance_usd"] is None

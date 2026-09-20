@@ -236,6 +236,10 @@ class Recorder:
         )
         self._db.commit()
 
+    def log_event(self, event: str, detail: str, *, level: str = "info") -> None:
+        """Write one row to ``run_log`` (public wrapper, e.g. for ``account_start``)."""
+        self._log(level, event, detail)
+
     def record_spot_tick(self, tick: SpotTick) -> None:
         self._db.execute(
             "INSERT INTO spot_ticks (source, price, source_ts, receive_ts, monotonic_ts) VALUES (?, ?, ?, ?, ?)",

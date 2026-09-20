@@ -947,6 +947,11 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
             client, series_ticker=series_ticker, db_path=db_path, kill_file=args.kill_file,
             poll_interval_sec=args.poll_interval, settle_on_determined=True,
         )
+        # The dashboard reads the run's starting account from here, so nobody types a capital number in.
+        recorder.log_event("account_start", json.dumps({
+            "kind": "demo", "available_usd": str(balance.available), "portfolio_value_usd": str(balance.portfolio_value),
+            "source": "kalshi demo balance at start",
+        }))
         trader_conn = sqlite3.connect(str(db_path))
         spot_buffer = SpotBuffer()
         trader = DemoTrader(
@@ -1060,6 +1065,10 @@ async def _cmd_paper(args: argparse.Namespace) -> int:
             kill_file=args.kill_file,
             poll_interval_sec=args.poll_interval,
         )
+        recorder.log_event("account_start", json.dumps({
+            "kind": "paper", "account_usd": str(config.sizing.account_usd),
+            "source": "config sizing.account_usd (paper has no exchange balance)",
+        }))
         # a second connection to the same file: recorder.py owns the base tables, this owns predictions
         trader_conn = sqlite3.connect(str(db_path))
         spot_buffer = SpotBuffer()
