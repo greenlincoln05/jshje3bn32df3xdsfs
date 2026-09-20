@@ -28,7 +28,7 @@ import sqlite3
 import statistics
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -45,6 +45,7 @@ from btcbot.backtest import (
     replay_prepared,
 )
 from btcbot.config import BotConfig, ExitRules, RiskLimits, Sizing, SizingMode
+from btcbot.ml_model import LogisticModel, load_model
 from btcbot.paper_broker import QueueAssumption
 
 DEFAULT_MAX_COMBOS = 400
@@ -92,6 +93,13 @@ class LabParams:
     take_profit_pct: Decimal | None = None  # exit if the mark rises this % above entry
     stop_min_hold_sec: int = 0              # do not exit before holding a position at least this long
     stop_min_tau_sec: int = 0               # do not exit within this many seconds of close; hold to settlement
+    # ML entry/exit layers (btcbot.ml_model, docs/research/ml-layers-handoff.md), independent of everything
+    # above. A path rather than a loaded model so LabParams stays a plain, JSON-able dataclass like every
+    # other field here; _filters_for loads (and caches) the file. None: off, exactly today's behavior.
+    ml_entry_model_path: str | None = None
+    ml_entry_min_edge: Decimal = Decimal(0)
+    ml_exit_model_path: str | None = None
+    ml_exit_prob_threshold: Decimal = Decimal("0.5")
 
     @classmethod
     def from_config(cls, config: BotConfig) -> LabParams:
@@ -345,6 +353,17 @@ def _config_for(base: BotConfig, params: LabParams, account: AccountSettings) ->
     return BotConfig(**data)
 
 
+_ML_MODEL_CACHE: dict[str, LogisticModel] = {}  # a grid sweep re-evaluates the same path many times
+
+
+def _load_ml_model(path: str | None) -> LogisticModel | None:
+    if path is None:
+        return None
+    if path not in _ML_MODEL_CACHE:
+        _ML_MODEL_CACHE[path] = load_model(Path(path))
+    return _ML_MODEL_CACHE[path]
+
+
 def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
     return EntryFilters(
         min_price=params.min_price, max_price=params.max_price, persist_steps=params.persist_steps,
@@ -357,6 +376,8 @@ def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
         risk_pct_per_trade=None if params.risk_pct is None else params.risk_pct / 100,
         max_growth_pct=params.max_growth_pct,
         ramp_growth_pct=params.ramp_growth_pct,
+        ml_entry_model=_load_ml_model(params.ml_entry_model_path), ml_entry_min_edge=params.ml_entry_min_edge,
+        ml_exit_model=_load_ml_model(params.ml_exit_model_path), ml_exit_prob_threshold=params.ml_exit_prob_threshold,
     )
 
 
@@ -647,4 +668,109 @@ def render_lab_report(report: LabReport) -> str:
     lines += ["", f"Verdict [{report.verdict_level}]: {report.verdict}", ""]
     lines += [f"- {w}" for w in report.warnings]
     lines.append(f"({report.seconds:.1f}s)")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- ML entry/exit ablation
+
+
+@dataclass(frozen=True, slots=True)
+class AblationLayer:
+    name: str
+    description: str
+    train: Metrics
+    test: Metrics
+
+
+@dataclass(frozen=True, slots=True)
+class AblationReport:
+    windows_total: int
+    windows_train: int
+    windows_test: int
+    layers: tuple[AblationLayer, ...]
+    warnings: list[str]
+
+
+def run_ml_ablation(
+    data: ReplayData,
+    base_config: BotConfig,
+    *,
+    ml_entry_model_path: str | None,
+    ml_exit_model_path: str | None,
+    account: AccountSettings | None = None,
+    train_fraction: float = 0.7,
+    queue: QueueAssumption = QueueAssumption.OPTIMISTIC,
+    maker_fee_multiplier: Decimal = Decimal(0),
+    ml_entry_min_edge: Decimal = Decimal(0),
+    ml_exit_prob_threshold: Decimal = Decimal("0.5"),
+) -> AblationReport:
+    """The four independently-testable layers requested for the ML work (docs/research/ml-layers-handoff.md):
+
+    1. current entry filter (``strategy.decide``), hold to settlement
+    2. ML entry model gates entries, hold to settlement
+    3. current entries, ML exit model drives early exits
+    4. ML entry model AND ML exit model together
+
+    Every layer replays the SAME time-ordered, embargoed train/test split (:func:`split_windows`), so the
+    four rows are directly comparable to each other. Each ML layer only re-scores or exits a trade the base
+    strategy already proposed or entered -- it can never create an entry the base strategy would have
+    skipped (see btcbot.ml_features' module docstring). This is a sensitivity comparison across four
+    configurations, not a profitability claim; see this module's own docstring for the same REST-polled-book,
+    simulated-fill caveats every other lab report carries.
+    """
+    if ml_entry_model_path is None and ml_exit_model_path is None:
+        raise LabError("at least one of ml_entry_model_path/ml_exit_model_path must be given")
+    account = account or AccountSettings()
+    base = LabParams.from_config(base_config)
+    train_tickers, test_tickers, ordered = split_windows(data, train_fraction)
+    train_prepared = prepare_replay(data, base_config, tickers=train_tickers, model_blend=base.model_blend)
+    test_prepared = prepare_replay(data, base_config, tickers=test_tickers, model_blend=base.model_blend)
+
+    def layer(name: str, description: str, *, use_entry: bool, use_exit: bool) -> AblationLayer:
+        params = replace(
+            base,
+            ml_entry_model_path=ml_entry_model_path if use_entry else None, ml_entry_min_edge=ml_entry_min_edge,
+            ml_exit_model_path=ml_exit_model_path if use_exit else None, ml_exit_prob_threshold=ml_exit_prob_threshold,
+        )
+        train_metrics = evaluate(train_prepared, base_config, params, account, queue=queue, maker_fee_multiplier=maker_fee_multiplier)
+        test_metrics = evaluate(test_prepared, base_config, params, account, queue=queue, maker_fee_multiplier=maker_fee_multiplier)
+        return AblationLayer(name, description, train_metrics, test_metrics)
+
+    layers = (
+        layer("1", "current entry, settlement hold", use_entry=False, use_exit=False),
+        layer("2", "ML entry filter, settlement hold", use_entry=True, use_exit=False),
+        layer("3", "current entry, ML exit", use_entry=False, use_exit=True),
+        layer("4", "ML entry + ML exit", use_entry=True, use_exit=True),
+    )
+    warnings = [
+        "Sensitivity comparison across four configurations, not a profitability claim -- see btcbot.lab's own "
+        "module docstring (REST-polled books, simulated queue fills, one train/test sample).",
+        "Each ML layer only re-scores or exits a trade the base strategy already proposed/entered; it cannot "
+        "create an entry the base strategy would have skipped.",
+    ]
+    if ml_entry_model_path is None:
+        warnings.append("No ml_entry_model_path given: layers 2 and 4 are identical to layers 1 and 3.")
+    if ml_exit_model_path is None:
+        warnings.append("No ml_exit_model_path given: layers 3 and 4 are identical to layers 1 and 2.")
+    return AblationReport(
+        windows_total=len(ordered), windows_train=len(train_tickers), windows_test=len(test_tickers),
+        layers=layers, warnings=warnings,
+    )
+
+
+def render_ml_ablation_report(report: AblationReport) -> str:
+    def fmt(m: Metrics) -> str:
+        wr = "--" if m.win_rate is None else f"{m.win_rate * 100:.0f}%"
+        t = "--" if m.t_stat is None else f"{m.t_stat:+.1f}"
+        return f"n={m.resolved:<4d} win {wr:>4s}  pnl ${m.pnl:>9,.2f}  t {t:>5s}  dd {m.max_drawdown_pct or 0:>4.1f}%"
+
+    lines = [
+        f"Windows: {report.windows_total} ({report.windows_train} train, {report.windows_test} test, 1 skipped between).",
+        "",
+        f"{'':>4s}  {'TRAIN':<58s}  TEST",
+    ]
+    for layer in report.layers:
+        lines.append(f"{layer.name:>4s}  {fmt(layer.train):<58s}  {fmt(layer.test)}   {layer.description}")
+    lines += ["", "Sensitivity comparison only -- not a profitability claim.", ""]
+    lines += [f"- {w}" for w in report.warnings]
     return "\n".join(lines)

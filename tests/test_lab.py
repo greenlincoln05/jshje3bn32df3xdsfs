@@ -26,12 +26,15 @@ from btcbot.lab import (
     expand_grid,
     parse_values,
     render_lab_report,
+    render_ml_ablation_report,
     run_lab,
+    run_ml_ablation,
     split_windows,
 )
+from btcbot.ml_model import save_model
 from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder
-from test_backtest import FULL_FILL_SIZES, seed_window_with_price_drop
+from test_backtest import FULL_FILL_SIZES, _constant_model, seed_window_with_price_drop
 
 T0 = datetime(2026, 9, 19, 0, 0, 0, tzinfo=timezone.utc)
 WIN = 1000  # seconds between window starts
@@ -393,6 +396,61 @@ class TestRunLab:
         data = seeded(tmp_path, ["yes", "no"])
         with pytest.raises(LabError, match="96 per day"):
             run_lab(data, BotConfig(), self.grid())
+
+
+class TestMLAblation:
+    """The four independently-testable layers requested in docs/research/ml-layers-handoff.md: current entry
+    + settlement hold, ML entry + settlement hold, current entry + ML exit, ML entry + ML exit -- all four
+    sharing the same train/test split so they are directly comparable."""
+
+    def test_requires_at_least_one_model_path(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        with pytest.raises(LabError, match="at least one"):
+            run_ml_ablation(data, BotConfig(), ml_entry_model_path=None, ml_exit_model_path=None)
+
+    def test_four_layers_share_the_same_train_test_split(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        entry_path = tmp_path / "entry.json"
+        save_model(_constant_model(1.0), entry_path)
+
+        report = run_ml_ablation(data, BotConfig(), ml_entry_model_path=str(entry_path), ml_exit_model_path=None)
+
+        assert [layer.name for layer in report.layers] == ["1", "2", "3", "4"]
+        assert report.windows_train + report.windows_test == report.windows_total - 1  # one window embargoed
+
+    def test_without_an_exit_model_layers_3_and_4_equal_1_and_2(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        entry_path = tmp_path / "entry.json"
+        save_model(_constant_model(1.0), entry_path)
+
+        report = run_ml_ablation(data, BotConfig(), ml_entry_model_path=str(entry_path), ml_exit_model_path=None)
+        by_name = {layer.name: layer for layer in report.layers}
+
+        assert by_name["1"].test.pnl == by_name["3"].test.pnl
+        assert by_name["2"].test.pnl == by_name["4"].test.pnl
+        assert "layers 3 and 4 are identical" in " ".join(report.warnings)
+
+    def test_a_confident_no_entry_model_blocks_every_trade_without_touching_the_baseline(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        entry_path = tmp_path / "entry.json"
+        save_model(_constant_model(0.0), entry_path)
+
+        report = run_ml_ablation(data, BotConfig(), ml_entry_model_path=str(entry_path), ml_exit_model_path=None)
+        by_name = {layer.name: layer for layer in report.layers}
+
+        assert by_name["2"].train.trades == 0 and by_name["4"].train.trades == 0
+        assert by_name["1"].train.trades > 0  # the un-filtered baseline is unaffected
+
+    def test_render_produces_readable_text(self, tmp_path):
+        data = seeded(tmp_path, alternating(12))
+        entry_path = tmp_path / "entry.json"
+        save_model(_constant_model(1.0), entry_path)
+        report = run_ml_ablation(data, BotConfig(), ml_entry_model_path=str(entry_path), ml_exit_model_path=None)
+
+        text = render_ml_ablation_report(report)
+
+        assert "TRAIN" in text and "TEST" in text
+        assert "not a profitability claim" in text
 
 
 class TestEquivalentSettings:

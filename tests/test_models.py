@@ -178,6 +178,16 @@ class TestMarket:
         assert market.raw["price_level_structure"] == "tapered_deci_cent"
         assert "tapered_deci_cent" not in repr(market)
 
+    def test_result_is_none_for_an_open_market(self, payload):
+        assert Market.from_api(payload).result is None
+
+    @pytest.mark.parametrize("result", ["yes", "no"])
+    def test_result_reads_a_settled_markets_outcome(self, payload, result):
+        assert Market.from_api({**payload, "result": result}).result == result
+
+    def test_result_ignores_a_garbage_value(self, payload):
+        assert Market.from_api({**payload, "result": "not_a_side"}).result is None
+
 
 class TestSeriesBalance:
     def test_series_carries_the_fee_model(self, load_fixture):
