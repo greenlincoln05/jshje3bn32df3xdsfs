@@ -22,6 +22,12 @@ Phase 6:
 
 Not a phase (a monitoring tool):
   dashboard   local web UI for backtests, live paper PnL/trades, and local Kalshi settings
+
+ML entry/exit layers (docs/research/ml-layers-handoff.md), owner-driven, not a numbered phase:
+  download-history  ONE-TIME backfill of settled markets + Coinbase candles (public data, no key --
+                     owner-run: this session's environment cannot reach Kalshi/Coinbase, see CLAUDE.md)
+  ml-train          train an entry/exit model from recorded data, validated on markets it never trained on
+  ml-ablation       compare current/ML entries x settlement-hold/ML-exit as four independent layers
 """
 
 from __future__ import annotations
@@ -39,20 +45,41 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+import httpx
 import yaml
 
-from btcbot.backtest import BacktestError, BacktestReport, run_backtest
+from btcbot.backtest import BacktestError, BacktestReport, load_replay_data, run_backtest
 from btcbot.candidate_suite import load_candidate_suite, render_candidate_suite, run_candidate_suite
+from btcbot.coinbase_history import CoinbaseHistoryError, fetch_candle_history
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.demo_check import DemoCheckReport, run_demo_check
+from btcbot.history_pipeline import (
+    HistoryError,
+    fetch_all_settled_markets,
+    init_history_schema,
+    save_candles,
+    save_market_outcomes,
+)
 from btcbot.kalshi_client import HOSTS, KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
-from btcbot.lab import DEFAULT_GRID, AccountSettings, LabError, load_lab_data, parse_values, render_lab_report, run_lab
+from btcbot.lab import (
+    DEFAULT_GRID,
+    AccountSettings,
+    LabError,
+    load_lab_data,
+    parse_values,
+    render_lab_report,
+    render_ml_ablation_report,
+    run_lab,
+    run_ml_ablation,
+)
 from btcbot.demo_check import collateral_preflight
 from btcbot.demo_probe import run_probe
 from btcbot.demo_trader import DemoTrader, render_demo_report
 from btcbot.execution import DemoExecutionBackend
 from btcbot.live_paper import LivePaperTrader
 from btcbot.market_discovery import find_current_market
+from btcbot.ml_model import save_model
+from btcbot.ml_pipeline import MLPipelineError, train_and_validate
 from btcbot.model import CalibrationSummary, compute_calibration_report
 from btcbot.models import Market, OrderBook, ParseError, Series, Side, parse_time
 from btcbot.paper_broker import QueueAssumption
@@ -450,6 +477,44 @@ async def _cmd_stream(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_download_history(args: argparse.Namespace) -> int:
+    """ONE-TIME backfill of settled KXBTC15M markets + Coinbase 1-minute candles, for the market-level ML
+    pipeline (docs/research/ml-layers-handoff.md). Public, unauthenticated endpoints only, same as `record` --
+    but this session's own environment cannot reach Kalshi/Coinbase (see CLAUDE.md, docs/running-live.md), so
+    this is the owner's to run, not something a Claude Code session ever executes for real."""
+    env = KalshiEnv(args.env) if args.env else KalshiSettings().env
+    series_ticker = args.series or "KXBTC15M"
+    try:
+        start, end = parse_time(args.start), parse_time(args.end)
+    except ParseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    db_path = Path(args.output) if args.output else data_dir / f"history-{series_ticker}-{env.value}-{timestamp}.sqlite"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        init_history_schema(conn)
+        async with KalshiClient(env) as client:  # public data only, no auth, same rule as `record`
+            markets = await fetch_all_settled_markets(client, series_ticker=series_ticker)
+        written_markets = save_market_outcomes(conn, markets)
+        async with httpx.AsyncClient() as http:
+            candles = await fetch_candle_history(http, start=start, end=end)
+        written_candles = save_candles(conn, candles)
+    except (KalshiError, CoinbaseHistoryError, HistoryError, ParseError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(
+        f"Wrote {written_markets} settled markets and {written_candles} Coinbase 1-minute candles to {db_path}.\n"
+        "This is raw historical data, not a profitability claim; see btcbot ml-train / btcbot.market_level_pipeline."
+    )
+    return 0
+
+
 async def _cmd_lab(args: argparse.Namespace) -> int:
     """Sweep entry timing / price band / trend / account size / risk sizing on recorded data, ranked on a
     training slice and judged on a held-out test slice. Offline: no network, no credentials."""
@@ -558,6 +623,69 @@ async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     output.write_text(json.dumps(report, default=str, indent=2), encoding="utf-8")
     print(render_candidate_suite(report))
     print(f"\nFull ledger: {output}")
+    return 0
+
+
+async def _cmd_ml_train(args: argparse.Namespace) -> int:
+    """Train an ML entry or exit model from a recorder database, validated on markets it never trained on
+    (docs/research/ml-layers-handoff.md). Offline: no network, no credentials."""
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        print(f"error: no such database: {db_path}", file=sys.stderr)
+        return 1
+    config = load_config(args.config)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        data = load_replay_data(conn)
+    except sqlite3.OperationalError as exc:
+        print(f"error: {db_path} does not look like a recorder database: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    try:
+        model, report = train_and_validate(data, config, which=args.which, train_fraction=args.split)
+    except (MLPipelineError, LabError, BacktestError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    output = Path(args.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    save_model(model, output)
+    print(
+        f"Trained a {report.which} model on {report.windows_train} windows ({report.train_examples} examples); "
+        f"validated on {report.windows_validate} later windows it never trained on ({report.validate_examples} examples).\n"
+        f"Brier score: train {report.train_brier:.4f}, validate {report.validate_brier:.4f} "
+        "(lower is better; a much higher validate score than train means it fit noise in training).\n"
+        f"Saved to {output}. This is a calibration measure, not a profitability claim."
+    )
+    return 0
+
+
+async def _cmd_ml_ablation(args: argparse.Namespace) -> int:
+    """Compare current-entry/ML-entry x settlement-hold/ML-exit as four independent layers on the same
+    train/test split (docs/research/ml-layers-handoff.md). Offline: no network, no credentials."""
+    paths = [Path(p) for p in args.db]
+    if not paths:
+        found = sorted(Path(args.data_dir).glob("*.sqlite"))
+        paths = [p for p in found if "-demo-" not in p.name]
+    if not paths:
+        print(f"error: no data files. Run `btcbot paper` or `btcbot record` first (looked in {args.data_dir}).", file=sys.stderr)
+        return 1
+    config = load_config(args.config)
+    account = AccountSettings(
+        account_usd=Decimal(args.account), max_exposure_pct=Decimal(args.exposure_pct),
+        daily_loss_pct=Decimal(args.daily_loss_pct),
+    )
+    try:
+        data = load_lab_data(paths)
+        report = run_ml_ablation(
+            data, config, ml_entry_model_path=args.entry_model, ml_exit_model_path=args.exit_model,
+            account=account, train_fraction=args.split, queue=QueueAssumption(args.queue),
+            maker_fee_multiplier=Decimal(args.maker_fee_multiplier),
+        )
+    except (LabError, BacktestError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(render_ml_ablation_report(report))
     return 0
 
 
@@ -901,6 +1029,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stream.set_defaults(handler=_cmd_stream)
 
+    download = commands.add_parser(
+        "download-history",
+        help="ONE-TIME backfill: settled KXBTC15M markets + Coinbase 1-minute candles into SQLite "
+        "(public data, no key -- owner-run: this session's environment cannot reach Kalshi/Coinbase)",
+    )
+    download.add_argument("--env", choices=envs, help="Kalshi environment (default: KALSHI_ENV, else demo)")
+    download.add_argument("--series", help="override series_ticker from config.yaml")
+    download.add_argument("--start", required=True, help="ISO 8601 start of the Coinbase candle range")
+    download.add_argument("--end", required=True, help="ISO 8601 end of the Coinbase candle range")
+    download.add_argument("--data-dir", default="data", help="directory for the SQLite database (default: ./data)")
+    download.add_argument("--output", help="explicit database path (default: a timestamped file in --data-dir)")
+    download.set_defaults(handler=_cmd_download_history)
+
     lab = commands.add_parser(
         "lab",
         help="strategy lab: sweep entry timing, price band, trend, account size, risk sizing; judged on held-out windows",
@@ -952,6 +1093,32 @@ def build_parser() -> argparse.ArgumentParser:
     suite.add_argument("--after", help="only evaluate market windows first observed at/after this ISO timestamp")
     suite.add_argument("--output", default="data/research/candidate-suite-latest.json", help="full JSON ledger output")
     suite.set_defaults(handler=_cmd_lab_suite)
+
+    ml_train = commands.add_parser(
+        "ml-train",
+        help="train an ML entry/exit model from recorded data, validated on later markets it never trained on (offline)",
+    )
+    ml_train.add_argument("--db", required=True, help="path to a recorder SQLite database")
+    ml_train.add_argument("--which", choices=["entry", "exit"], required=True, help="which model to train")
+    ml_train.add_argument("--out", required=True, help="output path for the trained model JSON")
+    ml_train.add_argument("--split", type=float, default=0.7, help="fraction of windows used to train; the rest validates it (default: 0.7)")
+    ml_train.set_defaults(handler=_cmd_ml_train)
+
+    ablation = commands.add_parser(
+        "ml-ablation",
+        help="compare current-entry/ML-entry x settlement-hold/ML-exit as four independent layers on the same train/test split (offline)",
+    )
+    ablation.add_argument("--db", action="append", default=[], help="recorded database (repeatable; default: every *.sqlite in --data-dir)")
+    ablation.add_argument("--data-dir", default="data", help="where to look when no --db is given (default: ./data)")
+    ablation.add_argument("--entry-model", help="path to a trained entry model JSON (btcbot ml-train --which entry)")
+    ablation.add_argument("--exit-model", help="path to a trained exit model JSON (btcbot ml-train --which exit)")
+    ablation.add_argument("--account", default="500", help="pretend account size in USD (default: 500)")
+    ablation.add_argument("--exposure-pct", default="25", help="max percent of the account at risk at once (default: 25)")
+    ablation.add_argument("--daily-loss-pct", default="10", help="daily loss percent that halts new orders (default: 10)")
+    ablation.add_argument("--split", type=float, default=0.7, help="fraction of windows used for ranking; the rest is the held-out test (default: 0.7)")
+    ablation.add_argument("--queue", choices=[q.value for q in QueueAssumption], default="optimistic", help="queue-fill assumption (default: optimistic, a best case)")
+    ablation.add_argument("--maker-fee-multiplier", default="0", help="a non-negative number (default: 0)")
+    ablation.set_defaults(handler=_cmd_ml_ablation)
 
     demo = commands.add_parser(
         "demo",
@@ -1083,6 +1250,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         if args.top < 1 or args.min_train_trades < 1 or args.max_combos < 1:
             print("error: --top, --min-train-trades and --max-combos must be at least 1", file=sys.stderr)
+            return 2
+    if args.command == "ml-train" and not (0.2 <= args.split <= 0.9):
+        print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
+        return 2
+    if args.command == "ml-ablation":
+        if args.entry_model is None and args.exit_model is None:
+            print("error: give at least one of --entry-model / --exit-model", file=sys.stderr)
+            return 2
+        if not _is_non_negative_decimal(args.maker_fee_multiplier):
+            print("error: --maker-fee-multiplier must be a non-negative number", file=sys.stderr)
+            return 2
+        for name, value in (("--account", args.account), ("--exposure-pct", args.exposure_pct), ("--daily-loss-pct", args.daily_loss_pct)):
+            if not _is_non_negative_decimal(value) or Decimal(value) == 0:
+                print(f"error: {name} must be a positive number", file=sys.stderr)
+                return 2
+        if not (0.2 <= args.split <= 0.9):
+            print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
             return 2
     if args.command == "demo-allocate" and not 1 <= args.percent <= 100:
         print("error: --percent must be between 1 and 100", file=sys.stderr)

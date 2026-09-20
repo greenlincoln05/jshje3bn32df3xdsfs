@@ -443,6 +443,115 @@ class TestBacktestEndToEnd:
         assert "--maker-fee-multiplier" in capsys.readouterr().err
 
 
+class TestDownloadHistoryEndToEnd:
+    def test_rejects_a_malformed_start(self, capsys):
+        assert cli.main(["download-history", "--start", "not-a-date", "--end", "2026-09-19T00:00:00Z"]) == 2
+        assert "error:" in capsys.readouterr().err
+
+    def test_writes_settled_markets_and_candles(self, monkeypatch, tmp_path, capsys):
+        settled_payload = {
+            "markets": [{
+                "ticker": "KXBTC15M-26SEP180000-00", "event_ticker": "KXBTC15M-26SEP180000",
+                "status": "settled", "title": "t", "open_time": "2026-09-18T00:00:00Z",
+                "close_time": "2026-09-18T00:15:00Z", "floor_strike": "80000", "result": "yes",
+            }]
+        }
+        candle_rows = [[1758153600, "80000", "80100", "80000", "80050", "5.0"]]
+        install_mock_api(monkeypatch, lambda request: httpx.Response(200, json=settled_payload))
+        real_async_client = httpx.AsyncClient
+
+        def fake_async_client(**kw):
+            # KalshiClient's own construction (patched above) already passes its own `transport`; only
+            # inject the Coinbase mock when nothing else already supplied one.
+            kw.setdefault("transport", httpx.MockTransport(lambda request: httpx.Response(200, json=candle_rows)))
+            return real_async_client(**kw)
+
+        monkeypatch.setattr(cli.httpx, "AsyncClient", fake_async_client)
+        data_dir = tmp_path / "data"
+
+        exit_code = cli.main([
+            "download-history", "--env", "prod", "--start", "2026-09-18T00:00:00Z", "--end", "2026-09-18T00:05:00Z",
+            "--data-dir", str(data_dir),
+        ])
+
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "Wrote 1 settled markets and 1 Coinbase 1-minute candles" in out
+        assert list(data_dir.glob("history-*.sqlite"))
+
+
+def make_ml_training_db(tmp_path, *, n=30):
+    from test_backtest import FULL_FILL_SIZES, insert_settlement, make_db, seed_fillable_window
+
+    conn = make_db(tmp_path, "paper.sqlite")
+    for i in range(n):
+        start = datetime(2026, 9, 19, tzinfo=UTC) + timedelta(seconds=i * 700)
+        ticker = f"T{i:03d}"
+        close_time = seed_fillable_window(conn, ticker, start_ts=start, sizes=FULL_FILL_SIZES)
+        insert_settlement(conn, ticker, "yes" if i % 3 else "no", strike=Decimal("80000"), close_time=close_time)
+    conn.close()
+    return tmp_path / "paper.sqlite"
+
+
+class TestMlTrainEndToEnd:
+    def test_reports_a_missing_database(self, tmp_path, capsys):
+        assert cli.main([
+            "ml-train", "--db", str(tmp_path / "nope.sqlite"), "--which", "entry", "--out", str(tmp_path / "m.json"),
+        ]) == 1
+        assert "no such database" in capsys.readouterr().err
+
+    def test_rejects_a_bad_split(self, tmp_path, capsys):
+        assert cli.main([
+            "ml-train", "--db", str(tmp_path / "nope.sqlite"), "--which", "entry", "--out", str(tmp_path / "m.json"),
+            "--split", "0.95",
+        ]) == 2
+        assert "--split" in capsys.readouterr().err
+
+    def test_trains_and_saves_a_model(self, tmp_path, capsys):
+        db_path = make_ml_training_db(tmp_path)
+        out_path = tmp_path / "entry.json"
+
+        exit_code = cli.main(["--config", CONFIG, "ml-train", "--db", str(db_path), "--which", "entry", "--out", str(out_path)])
+
+        assert exit_code == 0
+        assert out_path.is_file()
+        out = capsys.readouterr().out
+        assert "Brier score" in out and "not a profitability claim" in out
+
+
+class TestMlAblationEndToEnd:
+    def test_requires_at_least_one_model(self, tmp_path, capsys):
+        assert cli.main(["ml-ablation", "--data-dir", str(tmp_path)]) == 2
+        assert "--entry-model" in capsys.readouterr().err
+
+    def test_reports_no_data_files(self, tmp_path, capsys):
+        from btcbot.ml_model import save_model
+        from test_backtest import _constant_model
+
+        entry_path = tmp_path / "entry.json"
+        save_model(_constant_model(1.0), entry_path)
+
+        assert cli.main(["ml-ablation", "--data-dir", str(tmp_path), "--entry-model", str(entry_path)]) == 1
+        assert "no data files" in capsys.readouterr().err
+
+    def test_runs_and_prints_a_report(self, tmp_path, capsys):
+        from btcbot.ml_model import save_model
+        from test_backtest import _constant_model
+
+        db_path = make_ml_training_db(tmp_path, n=12)
+        entry_path = tmp_path / "entry.json"
+        save_model(_constant_model(1.0), entry_path)
+
+        exit_code = cli.main([
+            "--config", CONFIG, "ml-ablation", "--db", str(db_path), "--entry-model", str(entry_path),
+        ])
+
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "TRAIN" in out and "TEST" in out
+        assert "not a profitability claim" in out
+
+
 class TestDemoAllocation:
     def test_the_markets_shard_gets_the_percent_and_the_rest_stays_on_shard_zero(self):
         assert cli.allocation_for(2, 100) == {2: 100}

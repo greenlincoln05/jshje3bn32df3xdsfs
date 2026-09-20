@@ -184,6 +184,15 @@ class Market:
     def seconds_to_close(self, now: datetime) -> float:
         return (self.close_time - now).total_seconds()
 
+    @property
+    def result(self) -> str | None:
+        """The settlement outcome ("yes"/"no") for a settled market, or None (open, or a payload -- e.g. an
+        older fixture -- that never carried one). Kalshi's ``/markets`` response only sets this field once a
+        market has actually settled, so this is the historical-download counterpart of
+        btcbot.backtest.Settlement (which reads the same field from the recorder's own live poll)."""
+        raw = self.raw.get("result")
+        return raw if raw in ("yes", "no") else None
+
 
 @dataclass(frozen=True)
 class Series:
