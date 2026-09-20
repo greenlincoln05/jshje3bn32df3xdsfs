@@ -297,6 +297,8 @@ class DemoTrader(LivePaperTrader):
             rec.closed = True
             self._save(rec, closed_ts=self.last_ts)
         self._resting_order_id = None
+        self._resting_order_side = None
+        self._resting_order_price = None
 
     async def _roll_over(self, poll_ts: datetime) -> None:
         if self._resting_order_id is not None:
