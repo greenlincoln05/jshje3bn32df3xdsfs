@@ -133,7 +133,7 @@ class TestPriceBandAndKellySizing:
 
     async def test_the_default_price_band_refuses_a_trade_the_model_would_otherwise_take(self, tmp_path):
         conn = sqlite3.connect(":memory:")
-        trader, buffer = make_trader(conn)  # default BotConfig: max_price=0.85
+        trader, buffer = make_trader(conn)  # default BotConfig: max_price=0.65
         feed_fresh_spot(trader, buffer, Decimal("80000"), ts=T0)
         market = make_market(TICKER, strike="70000")
         book = make_book(yes_price="0.90", yes_size="20", no_price="0.05", no_size="20")  # yes ask price band

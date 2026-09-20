@@ -129,7 +129,7 @@ class BotConfig(_Strict):
     # yet (see btcbot.strategy's module docstring and btcbot.calibrate). Refusing the extremes by default
     # is a reasoned starting guardrail, not a backtested-optimal cutoff -- tune it with `btcbot lab`.
     min_price: Decimal | None = Field(Decimal("0.15"), ge=0, lt=1)
-    max_price: Decimal | None = Field(Decimal("0.85"), gt=0, le=1)
+    max_price: Decimal | None = Field(Decimal("0.65"), gt=0, le=1)  # was 0.85; see config.yaml
     sizing: Sizing = Field(default_factory=Sizing)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     exit: ExitRules = Field(default_factory=ExitRules)

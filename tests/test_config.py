@@ -25,7 +25,7 @@ class TestBotConfig:
         assert (cfg.vol_window_sec, cfg.vol_method, cfg.model_blend) == (900, "ewma", 0.5)
         assert (cfg.min_edge, cfg.min_depth, cfg.max_spread) == (Decimal("0.04"), Decimal(10), Decimal("0.06"))
         assert (cfg.min_tau_sec, cfg.max_tau_sec, cfg.cancel_before_close_sec) == (30, 780, 20)
-        assert (cfg.min_price, cfg.max_price) == (Decimal("0.15"), Decimal("0.85"))
+        assert (cfg.min_price, cfg.max_price) == (Decimal("0.15"), Decimal("0.65"))
         assert cfg.sizing.contracts_per_trade == 5
         assert cfg.sizing.mode is SizingMode.PERCENT
         assert cfg.sizing.kelly_fraction_multiplier == 0.2

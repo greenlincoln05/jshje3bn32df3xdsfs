@@ -112,7 +112,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - `strategy.decide()` takes an optional `min_price`/`max_price` band and reports each `Decision`'s Kelly
   fraction (`kelly_fraction()`, `(p - price) / (1 - price)`) -- added after real `btcbot demo` trading took a
   thin-edge trade on a badly asymmetric payout, which a flat `min_edge` never screens for. `BotConfig`
-  defaults the band to `[0.15, 0.85]`: a reasoned guardrail, not a backtested-optimal cutoff, since the
+  defaults the band to `[0.15, 0.65]` (the top was 0.85 until 2026-09-20, when recorded prod paper entries above 0.65 won ~60% against a model that said 80-85%; an in-sample finding still to be forward-tested): a guardrail, not a backtested-optimal cutoff, since the
   model has no calibration check at the extremes yet (`btcbot calibrate`) -- tune it with `btcbot lab`.
   `sizing.mode: kelly` sizes by that fraction (times `kelly_fraction_multiplier`, default 0.2 -- full Kelly
   is most aggressive exactly where the model is least trustworthy, near a price of 0 or 1) against

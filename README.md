@@ -85,8 +85,9 @@ real capture once you're on a machine with real network access.
 a risk-adjusted bar -- the same raw edge is roughly even stakes at a price near 0.5, but a small, capped win
 against a much larger loss (or the reverse) near a price of 0 or 1, exactly where the model has never been
 calibration-checked (`btcbot calibrate`). `strategy.decide()` now takes an optional `min_price`/`max_price`
-band (`BotConfig` defaults to `[0.15, 0.85]` -- a reasoned starting guardrail, not a backtested-optimal
-cutoff; tune it with `btcbot lab`) and reports each `Decision`'s Kelly-optimal bankroll fraction
+band (`BotConfig` defaults to `[0.15, 0.65]`, lowered from 0.85 on 2026-09-20 after recorded prod paper entries above 0.65 won
+~60% against a model that said 80-85% -- an in-sample guardrail, not a backtested-optimal cutoff; forward-test it and
+tune it with `btcbot lab`) and reports each `Decision`'s Kelly-optimal bankroll fraction
 (`kelly_fraction()`: `(p - price) / (1 - price)`, the standard formula for a $1-payout binary bet). Kelly's
 own math is most aggressive exactly where a probability estimate is least trustworthy -- for a fixed edge,
 the fraction grows without bound as price approaches 1 -- so `sizing.mode: kelly` in `config.yaml` stakes
