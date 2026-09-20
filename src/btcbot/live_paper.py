@@ -33,14 +33,16 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from btcbot.backtest import BacktestReport, TradeRecord, build_report, init_trades_schema, log_trade
+from btcbot.backtest import BacktestReport, TradeRecord, _apply_exit, build_report, init_trades_schema, log_trade
 from btcbot.config import SizingMode
 from btcbot.execution import PaperExecutionBackend
 from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictions_schema, log_prediction, predict
 from btcbot.models import Market, OrderBook, Side
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, Decision, decide, kelly_size, percent_size, ramp_max_price, ramp_next_size
+from btcbot.strategy import (
+    Action, Decision, decide, kelly_size, percent_size, ramp_max_price, ramp_next_size, ramp_stop_loss_pct,
+)
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -51,6 +53,11 @@ class LivePaperTrader:
     """Owns per-tick trading state. Feed it from a live source: ``on_spot_tick`` from a spot feed's
     ``on_tick``, ``on_orderbook_snapshot``/``on_settlement`` from :class:`btcbot.recorder.Recorder`'s hooks
     of the same names. Call :meth:`shutdown` once the recorder loop stops, then :meth:`report`."""
+
+    # Whether this trader can actually sell a held position early. The paper trader can (simulated); a subclass
+    # that places real orders must implement ``_exit_position`` for real before setting this True (DemoTrader
+    # does not yet), otherwise an exit decision would only close the paper side and diverge from the exchange.
+    _supports_exits = True
 
     def __init__(
         self,
@@ -89,6 +96,7 @@ class LivePaperTrader:
         self._ramp_size: Decimal | None = None  # sizing mode "ramp": next order size, moved only by settlements
         self._ramp_level = 0  # consecutive settled wins in the current ramp (0 = base size)
         self._idle_windows = 0  # consecutive finished windows in which no position was opened
+        self._position_level = 0  # ramp level when the current position was opened (the stop tightens with it)
         self._last_result: str | None = None  # "win" or "loss" of the most recent settled trade
         if config.sizing.mode is SizingMode.PERCENT:
             self._risk.set_account_value(self._bankroll)
@@ -166,6 +174,13 @@ class LivePaperTrader:
             has_position=self._position is not None,
             min_price=self._config.min_price,
             max_price=self._effective_max_price(),
+            position_side=None if self._position is None else self._position.side,
+            position_entry_price=None if self._position is None else self._position.entry_price,
+            position_held_sec=None if self._position is None else (poll_ts - self._position.entry_ts).total_seconds(),
+            stop_loss_pct=self._effective_stop_loss_pct(),
+            take_profit_pct=self._config.exit.take_profit_pct if self._supports_exits else None,
+            stop_min_hold_sec=self._config.exit.stop_min_hold_sec,
+            stop_min_tau_sec=self._config.exit.stop_min_tau_sec,
             resting_side=self._resting_order_side,
             resting_price=self._resting_order_price,
         )
@@ -203,6 +218,8 @@ class LivePaperTrader:
                     self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
         elif decision.action is Action.CANCEL and self._resting_order_id is not None:
             await self._cancel_resting()
+        elif decision.action is Action.EXIT and self._position is not None:
+            await self._exit_position(decision, poll_ts)
 
     async def on_settlement(self, market: Market) -> None:
         result = market.raw.get("result") or None
@@ -258,6 +275,7 @@ class LivePaperTrader:
 
     def _apply_fill(self, ticker: str, fill: Fill, poll_ts: datetime, p_blend: float) -> None:
         if self._position is None:
+            self._position_level = self._ramp_level
             self._position = TradeRecord(
                 ticker=ticker,
                 side=fill.side,
@@ -278,6 +296,16 @@ class LivePaperTrader:
     async def _sync_fills(self, book: OrderBook, poll_ts: datetime) -> list[Fill]:
         return self._backend.sync_market(book, poll_ts)
 
+    async def _exit_position(self, decision: Decision, poll_ts: datetime) -> None:
+        """Stop-loss / take-profit: sell the held position now into the best bids (simulated). A thin book may fill
+        only part of it; the rest stays held, at its original entry price, and the stop is re-evaluated next tick."""
+        position = self._position
+        fills = await self._backend.place_exit_order(position.side, position.size)
+        closed, remaining = _apply_exit(position, fills, decision.exit_reason or "exit")
+        self._position = remaining
+        if closed is not None:
+            self._book_result(closed, closed.pnl_usd, closed.entry_price * closed.size, poll_ts)
+
     def _resting_order_filled(self) -> bool:
         return self._broker.get_order(self._resting_order_id).status == "filled"
 
@@ -293,6 +321,17 @@ class LivePaperTrader:
         self._resting_order_id = None
         self._resting_order_side = None
         self._resting_order_price = None
+
+    def _effective_stop_loss_pct(self) -> Decimal | None:
+        """The stop percent for the position held right now: tighter the higher the ramp was when it was opened.
+        None (no stop) when exits are off or this trader cannot place them (see ``_supports_exits``)."""
+        if not self._supports_exits:
+            return None
+        ex, sz = self._config.exit, self._config.sizing
+        if sz.mode is not SizingMode.RAMP:
+            return ex.stop_loss_pct
+        return ramp_stop_loss_pct(ex.stop_loss_pct, self._position_level, tighten_per_level=ex.stop_loss_tighten_pct_per_level,
+                                  floor_pct=ex.stop_loss_floor_pct)
 
     def _effective_max_price(self) -> Decimal | None:
         sz = self._config.sizing
@@ -333,7 +372,11 @@ class LivePaperTrader:
         exposure = pending.entry_price * pending.size
         payout = settle(pending.side, pending.size, result)
         pnl = payout - exposure - pending.fee_paid
-        resolved = replace(pending, result=result, pnl_usd=pnl)
+        self._book_result(replace(pending, result=result, pnl_usd=pnl), pnl, exposure, settled_ts)
+
+    def _book_result(self, resolved: TradeRecord, pnl: Decimal, exposure: Decimal, settled_ts: datetime) -> None:
+        """Record a finished trade (settled OR closed early by an exit) and move the account, ramp and risk state."""
+        pending = resolved
         self.trades.append(resolved)
         log_trade(self._conn, resolved)
         self._bankroll += pnl

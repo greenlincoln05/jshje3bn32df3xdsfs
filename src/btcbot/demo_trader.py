@@ -111,6 +111,8 @@ class DemoStats:
 
 
 class DemoTrader(LivePaperTrader):
+    _supports_exits = False  # real exit orders are not built yet; a paper-only exit would diverge from the exchange
+
     def __init__(
         self,
         conn: sqlite3.Connection,
