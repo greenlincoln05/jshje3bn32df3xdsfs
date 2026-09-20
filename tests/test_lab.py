@@ -168,6 +168,16 @@ class TestFilters:
         too_strict = replay(data, filters=EntryFilters(trend_mode="with", trend_lookback_sec=60, trend_min_move_usd=Decimal(500)))
         assert too_strict.trades == []
 
+    def test_missing_trend_history_is_not_also_counted_as_a_trend_direction_rejection(self, tmp_path):
+        # Each seeded window only has ~110s of prior spot history, so a lookback well past that (and past
+        # the gap between windows) can never resolve: those decisions belong in "trend_missing_history"
+        # only, not double-booked into "trend" (a real direction rejection) too.
+        data = seeded(tmp_path, ["yes"] * 3)
+        result = replay(data, filters=EntryFilters(trend_mode="with", trend_lookback_sec=200, trend_min_move_usd=Decimal(5)))
+        assert result.trades == []
+        assert result.filter_counts["trend_missing_history"] > 0
+        assert result.filter_counts["trend"] == 0
+
     def test_percent_of_account_sizing_and_bankroll(self, tmp_path):
         data = seeded(tmp_path, ["yes", "yes", "no", "yes"])
         config = BotConfig()
@@ -281,7 +291,10 @@ class TestAuditFixes:
         data = seeded(tmp_path, ['yes'])
         result = replay(data, filters=EntryFilters(trend_mode='aligned4'))
         assert not result.trades
-        assert result.filter_counts['trend'] > 0
+        # Missing history (aligned4 needs 24h of it) is its own bucket, not also counted as a direction
+        # rejection: there was never enough data to judge a direction at all.
+        assert result.filter_counts['trend_missing_history'] > 0
+        assert result.filter_counts['trend'] == 0
 
     def test_aligned4_uses_four_causal_lookbacks(self, tmp_path, monkeypatch):
         from btcbot.backtest import SpotSeries

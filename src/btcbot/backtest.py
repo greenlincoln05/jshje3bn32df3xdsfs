@@ -459,8 +459,9 @@ def replay_prepared(
             moves = [prepared.spot_series.move(ts, lookback) for lookback in lookbacks]
             if any(move is None for move in moves):
                 counts["trend_missing_history"] += 1
-            toward_yes = all(move is not None and move > 0 and move >= filters.trend_min_move_usd for move in moves)
-            toward_no = all(move is not None and move < 0 and move <= -filters.trend_min_move_usd for move in moves)
+                return None
+            toward_yes = all(move > 0 and move >= filters.trend_min_move_usd for move in moves)
+            toward_no = all(move < 0 and move <= -filters.trend_min_move_usd for move in moves)
             wanted = toward_yes if decision.side == "yes" else toward_no
             if filters.trend_mode == "against":
                 wanted = toward_no if decision.side == "yes" else toward_yes
