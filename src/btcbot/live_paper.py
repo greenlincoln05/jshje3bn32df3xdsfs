@@ -28,7 +28,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING
 
 from btcbot.backtest import BacktestReport, TradeRecord, build_report, init_trades_schema, log_trade
@@ -182,12 +182,19 @@ class LivePaperTrader:
             else:
                 decision = Decision(Action.SKIP, reason="account too small for one contract at this risk percent")
         if decision.action is Action.REST:
+            sz = self._config.sizing
+            base_size = decision.size  # growth rules (percent_size) build on this, never on the boosted size
+            if (sz.boost_multiplier > 1 and sz.boost_min_price <= decision.price <= sz.boost_max_price
+                    and self._last_result != "loss"):
+                boosted = min((decision.size * sz.boost_multiplier).to_integral_value(rounding=ROUND_FLOOR),
+                              Decimal(self._config.risk.max_contracts_per_trade))
+                decision = replace(decision, size=boosted)
             approval = self._risk.check_new_order(size=decision.size, price=decision.price, now=poll_ts)
             if approval.approved:
                 order_id = await self._place_resting(decision, poll_ts)
                 if order_id is not None:  # None: the exchange rejected it, so nothing rests and no exposure is taken
                     self._resting_order_id = order_id
-                    self._last_order_size = decision.size
+                    self._last_order_size = base_size
                     self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
         elif decision.action is Action.CANCEL and self._resting_order_id is not None:
             await self._cancel_resting()

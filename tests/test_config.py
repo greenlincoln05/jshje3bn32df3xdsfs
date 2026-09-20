@@ -38,7 +38,9 @@ class TestBotConfig:
         assert cfg.exit.stop_min_hold_sec == 0 and cfg.exit.stop_min_tau_sec == 0
 
     def test_code_defaults_and_shipped_file_agree(self):
-        assert load_config(PROJECT_ROOT / "config.yaml") == BotConfig()
+        shipped = load_config(PROJECT_ROOT / "config.yaml")
+        assert shipped.sizing.boost_multiplier == 2  # the shipped file opts in; the code default is off (1)
+        assert shipped.model_copy(update={"sizing": shipped.sizing.model_copy(update={"boost_multiplier": Decimal(1)})}) == BotConfig()
 
     def test_default_mode_is_paper(self):
         assert BotConfig().mode is Mode.PAPER
