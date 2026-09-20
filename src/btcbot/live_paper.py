@@ -284,7 +284,13 @@ class LivePaperTrader:
         self._persist_monitor(ts, stopped=True)
 
     def _persist_monitor(self, ts: datetime, *, stopped: bool = False) -> None:
-        """Persist monitoring state only; never affect order or risk decisions."""
+        """Persist monitoring state only; never affect order or risk decisions, and never raise into the trading loop."""
+        try:
+            self._persist_monitor_unsafe(ts, stopped=stopped)
+        except Exception:
+            logging.getLogger(__name__).warning("Paper monitoring snapshot failed", exc_info=True)
+
+    def _persist_monitor_unsafe(self, ts: datetime, *, stopped: bool = False) -> None:
         if not self._monitor_enabled:
             return
         orders = []
