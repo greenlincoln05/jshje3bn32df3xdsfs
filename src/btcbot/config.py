@@ -118,6 +118,10 @@ class BotConfig(_Strict):
     sizing: Sizing = Field(default_factory=Sizing)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     exit: ExitRules = Field(default_factory=ExitRules)
+    # DEMO PLUMBING ONLY (btcbot demo --plumbing sets it; leave 0 everywhere else): bid this many cents inside the
+    # spread so a thin demo book's few sellers can reach the order. It exists to exercise placement, fills,
+    # settlement and sizing bookkeeping, not to test the strategy.
+    bid_improve_ticks: int = Field(0, ge=0, le=20)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
