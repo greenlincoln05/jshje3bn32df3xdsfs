@@ -54,6 +54,13 @@ class Sizing(_Strict):
     # account_usd and moves only with SETTLED profit and loss. After a win the next order may grow by at most
     # max_growth_per_win_pct percent; after a loss it can never grow (btcbot.strategy.percent_size).
     ramp_growth_pct: Decimal = Field(Decimal("20"), ge=0, le=100)  # mode "ramp": growth per settled win (min +1)
+    # Ramp risk rules: each win-level of the ramp lowers the highest price the bot will pay by ramp_max_price_step
+    # (never below ramp_max_price_floor), because a big order at a dear price risks a lot to win a little. And if the
+    # bot opens no position in ramp_idle_reset_windows consecutive windows while ramped up, the ramp resets to base
+    # (0 turns that off): a ramp that finds no trade has drifted away from what the market is offering.
+    ramp_max_price_step: Decimal = Field(Decimal("0.03"), ge=0, lt=1)
+    ramp_max_price_floor: Decimal = Field(Decimal("0.60"), gt=0, le=1)
+    ramp_idle_reset_windows: int = Field(2, ge=0)
     account_usd: Decimal = Field(Decimal("500"), gt=0)
     risk_pct_per_trade: Decimal = Field(Decimal("2"), gt=0, le=10)
     max_growth_per_win_pct: Decimal = Field(Decimal("20"), ge=0, le=100)
@@ -84,6 +91,9 @@ class ExitRules(_Strict):
     take_profit_pct: Decimal | None = Field(None, gt=0)  # exit if the mark rises this % above entry
     stop_min_hold_sec: int = Field(0, ge=0)  # do not exit before holding a position at least this long
     stop_min_tau_sec: int = Field(0, ge=0)  # do not exit within this many seconds of close; hold to settlement instead
+    # With ramp sizing the stop tightens by this many percentage points per ramp level, never below the floor.
+    stop_loss_tighten_pct_per_level: Decimal = Field(Decimal("8"), ge=0)
+    stop_loss_floor_pct: Decimal = Field(Decimal("10"), gt=0, le=100)
 
 
 class BotConfig(_Strict):

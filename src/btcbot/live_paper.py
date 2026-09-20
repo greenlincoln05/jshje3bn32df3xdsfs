@@ -25,6 +25,8 @@ guessed at as a loss.
 
 from __future__ import annotations
 
+import logging
+
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -38,7 +40,7 @@ from btcbot.model import TimedVolatility, ModelState, Prediction, init_predictio
 from btcbot.models import Market, OrderBook, Side
 from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
-from btcbot.strategy import Action, Decision, decide, kelly_size, percent_size, ramp_next_size
+from btcbot.strategy import Action, Decision, decide, kelly_size, percent_size, ramp_max_price, ramp_next_size
 
 if TYPE_CHECKING:
     from btcbot.config import BotConfig
@@ -85,6 +87,8 @@ class LivePaperTrader:
         self._bankroll: Decimal = config.sizing.account_usd
         self._last_order_size: Decimal | None = None
         self._ramp_size: Decimal | None = None  # sizing mode "ramp": next order size, moved only by settlements
+        self._ramp_level = 0  # consecutive settled wins in the current ramp (0 = base size)
+        self._idle_windows = 0  # consecutive finished windows in which no position was opened
         self._last_result: str | None = None  # "win" or "loss" of the most recent settled trade
         if config.sizing.mode is SizingMode.PERCENT:
             self._risk.set_account_value(self._bankroll)
@@ -161,7 +165,7 @@ class LivePaperTrader:
             has_resting_order=self._resting_order_id is not None,
             has_position=self._position is not None,
             min_price=self._config.min_price,
-            max_price=self._config.max_price,
+            max_price=self._effective_max_price(),
             resting_side=self._resting_order_side,
             resting_price=self._resting_order_price,
         )
@@ -290,9 +294,37 @@ class LivePaperTrader:
         self._resting_order_side = None
         self._resting_order_price = None
 
+    def _effective_max_price(self) -> Decimal | None:
+        sz = self._config.sizing
+        if sz.mode is not SizingMode.RAMP:
+            return self._config.max_price
+        return ramp_max_price(self._config.max_price, self._ramp_level, step=sz.ramp_max_price_step,
+                              floor=sz.ramp_max_price_floor)
+
+    def _note_finished_window(self) -> None:
+        """Ramp idle reset: after ``ramp_idle_reset_windows`` finished windows in a row without opening a position
+        while ramped up, go back to the base size (and base price cap)."""
+        sz = self._config.sizing
+        if sz.mode is not SizingMode.RAMP or sz.ramp_idle_reset_windows == 0:
+            return
+        if self._ramp_level == 0:
+            self._idle_windows = 0  # only a ramped-up size can be "too far": nothing to reset at base
+            return
+        if self._current_ticker in self.windows_traded or self._position is not None:
+            self._idle_windows = 0  # (a fill found late, e.g. by the demo trader's cancel-race catch-up, counts too)
+            return
+        self._idle_windows += 1
+        if self._idle_windows >= sz.ramp_idle_reset_windows and self._ramp_level > 0:
+            logging.getLogger(__name__).warning(
+                "ramp reset to base size: no position in %d consecutive windows", self._idle_windows)
+            self._ramp_size = None
+            self._ramp_level = 0
+            self._idle_windows = 0
+
     async def _roll_over(self, poll_ts: datetime) -> None:
         if self._resting_order_id is not None:
             await self._cancel_resting()
+        self._note_finished_window()
         if self._position is not None:
             self._pending_settlements[self._current_ticker] = self._position
             self._position = None
@@ -307,6 +339,7 @@ class LivePaperTrader:
         self._bankroll += pnl
         self._last_result = "loss" if pnl < 0 else "win"
         if self._config.sizing.mode is SizingMode.RAMP:
+            self._ramp_level = self._ramp_level + 1 if pnl > 0 else 0
             self._ramp_size = ramp_next_size(
                 pending.size, pnl > 0, base=Decimal(self._config.sizing.contracts_per_trade),
                 growth_pct=self._config.sizing.ramp_growth_pct,
