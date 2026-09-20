@@ -1286,6 +1286,7 @@ const LAB_FIELDS = [
   ["risk_pct", "Risk per trade (% of account)", "1, 2, 5", "Blank = fixed number of contracts instead."],
   ["max_growth_pct", "Max growth per win (%)", "none, 10, 25", "With risk %: after a win the next order may be at most this much larger. Never grows after a loss."],
   ["contracts", "Fixed contracts", "5, 10", "Used when risk % is blank."],
+  ["ramp_growth_pct", "Ramp growth per win (contracts %)", "none, 20, 50", "Independent of risk %: after a win the next order grows by at least 1 contract, or this % of the last order, whichever is more. Any loss resets straight back to the fixed contracts above. This is sizing.mode 'ramp', the live default -- 'none' turns it off (flat contracts every time)."],
 ];
 const LAB_PRESETS = {
   "Entry timing": { max_tau_sec: "480, 600, 780", min_tau_sec: "30, 60, 120, 300" },

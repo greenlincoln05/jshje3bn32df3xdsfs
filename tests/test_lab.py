@@ -16,7 +16,7 @@ from btcbot.backtest import (
     replay_prepared,
     run_backtest,
 )
-from btcbot.config import BotConfig
+from btcbot.config import BotConfig, Sizing
 from btcbot.candidate_suite import load_candidate_suite, render_candidate_suite, run_candidate_suite
 from btcbot.lab import (
     AccountSettings,
@@ -30,6 +30,7 @@ from btcbot.lab import (
 )
 from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder
+from test_backtest import FULL_FILL_SIZES
 
 T0 = datetime(2026, 9, 19, 0, 0, 0, tzinfo=timezone.utc)
 WIN = 1000  # seconds between window starts
@@ -41,9 +42,11 @@ def make_db(tmp_path, name="lab.sqlite"):
     return sqlite3.connect(str(db_path))
 
 
-def seed_window(conn, index, result, *, yes_price="0.30", start=T0):
-    """One window that produces exactly one maker fill of 4 contracts (the depth shrinks, then refills), with
-    spot drifting up ~+15 USD per minute. Same shape as tests/test_backtest.py's seed_fillable_window."""
+def seed_window(conn, index, result, *, yes_price="0.30", start=T0, sizes=None):
+    """One window that, with the default ``sizes``, produces exactly one maker fill of 4 contracts (the depth
+    shrinks, then refills), with spot drifting up ~+15 USD per minute. Same shape as
+    tests/test_backtest.py's seed_fillable_window, including its optional full-filling ``sizes`` override."""
+    sizes = sizes if sizes is not None else [15, 14, 13, 12, 11, 10, 14, 0]
     ticker = f"KXBTC15M-LAB{index:03d}-00"
     start_ts = start + timedelta(seconds=index * WIN)
     close_time = start_ts + timedelta(seconds=500)
@@ -59,7 +62,7 @@ def seed_window(conn, index, result, *, yes_price="0.30", start=T0):
            VALUES (?,?,?,?,?,?,?,?,?)""",
         (ticker, ticker.rsplit("-", 1)[0], open_time.isoformat(), "active", "80000", open_time.isoformat(),
          close_time.isoformat(), "0", "0"))
-    for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+    for offset, size in enumerate(sizes):
         ts = start_ts + timedelta(seconds=offset)
         payload = json.dumps({"yes": [[yes_price, str(size)]], "no": [["0.68", "15"]]})
         conn.execute(
@@ -218,6 +221,39 @@ class TestFilters:
         train, test, _ = split_windows(data, 0.7)
         assert {t.ticker for t in replay(data, tickers=train).trades} <= train
         assert {t.ticker for t in replay(data, tickers=test).trades} <= test
+
+
+class TestRampSizing:
+    """sizing.mode "ramp" is the shipped live default, but the lab's replay only ever sized flat contracts
+    unless a caller passed EntryFilters.ramp_growth_pct explicitly -- so btcbot lab did not reflect live
+    sizing (docs/research/overnight-handoff.md). FULL_FILL_SIZES (unlike seed_window's own default, a
+    deliberately partial fill) fills whatever is actually ordered, so trade sizes below are the true ramped
+    order sizes, not a fixed partial-fill amount."""
+
+    def test_a_loss_resets_to_base_and_a_later_win_ramps_again(self, tmp_path):
+        conn = make_db(tmp_path)
+        for i, result in enumerate(["yes", "no", "yes", "yes"]):
+            seed_window(conn, i, result, sizes=FULL_FILL_SIZES)
+        config = BotConfig()  # default sizing: ramp, contracts_per_trade=5, ramp_growth_pct=20
+
+        result = replay(load_replay_data(conn), config, filters=EntryFilters(ramp_growth_pct=config.sizing.ramp_growth_pct))
+
+        sizes = [t.size for t in sorted(result.trades, key=lambda t: t.entry_ts)]
+        assert sizes == [Decimal(5), Decimal(6), Decimal(5), Decimal(6)]
+
+    def test_the_lab_baseline_reflects_the_shipped_ramp_default(self):
+        params = LabParams.from_config(BotConfig())
+        assert params.ramp_growth_pct == Decimal(20)
+
+    def test_from_config_does_not_apply_ramp_for_other_sizing_modes(self):
+        params = LabParams.from_config(BotConfig(sizing=Sizing(mode="fixed")))
+        assert params.ramp_growth_pct is None
+
+    def test_ramp_growth_pct_is_a_sweepable_grid_axis(self):
+        assert parse_values("ramp_growth_pct", "0, 20, none") == [Decimal(0), Decimal(20), None]
+        base = LabParams.from_config(BotConfig())
+        combos = expand_grid(base, {"ramp_growth_pct": [Decimal(0), Decimal(20), None]})
+        assert {c.ramp_growth_pct for c in combos} == {Decimal(0), Decimal(20), None}
 
 
 # --------------------------------------------------------------------------- merge
