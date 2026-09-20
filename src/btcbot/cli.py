@@ -524,7 +524,7 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
 
     try:
         print(render(compare(args.demo_db, args.prod_db)))
-    except (CompareError, BacktestError, sqlite3.Error) as exc:
+    except (CompareError, BacktestError, sqlite3.Error, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

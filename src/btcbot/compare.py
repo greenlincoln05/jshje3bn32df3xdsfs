@@ -31,7 +31,7 @@ def _per_window(rows: list[dict]) -> dict[str, dict]:
     for w in out.values():
         rs = w["rows"]
         w["mid"], w["spread"] = _med(r["yes_mid"] for r in rs), _med(r["yes_spread"] for r in rs)
-        w["depth"] = _med((r["yes_depth3"] or 0) + (r["no_depth3"] or 0) for r in rs)
+        w["depth"] = _med(r["yes_depth3"] + r["no_depth3"] for r in rs if r["yes_depth3"] is not None and r["no_depth3"] is not None)
         w["by_sec"] = {r["ts"][:19]: r["yes_mid"] for r in rs if r["yes_mid"] is not None}
         w["outcome"] = next((r["outcome_yes"] for r in rs if r["outcome_yes"] is not None), None)
     return out
@@ -64,13 +64,13 @@ def compare(demo_db: str | Path, prod_db: str | Path) -> dict:
         secs = set(d[t]["by_sec"]) & set(p[t]["by_sec"])
         gaps = [abs(d[t]["by_sec"][s] - p[t]["by_sec"][s]) for s in secs]
         diffs += gaps
-        pnl = lambda ts: None if not ts else sum(float(x.pnl_usd) for x in ts if x.pnl_usd is not None)
+        pnl = lambda ts: (sum(float(x.pnl_usd) for x in ts if x.pnl_usd is not None) if any(x.pnl_usd is not None for x in ts) else None)
         rows.append({
             "ticker": t, "demo_mid": d[t]["mid"], "prod_mid": p[t]["mid"],
             "demo_spread": d[t]["spread"], "prod_spread": p[t]["spread"],
             "demo_depth": d[t]["depth"], "prod_depth": p[t]["depth"],
             "median_abs_mid_gap": _med(gaps), "demo_trades": len(dt.get(t, [])), "prod_trades": len(pt.get(t, [])),
-            "demo_pnl": pnl(dt.get(t)), "prod_pnl": pnl(pt.get(t)), "outcome_yes": p[t]["outcome"],
+            "demo_pnl": pnl(dt.get(t)), "prod_pnl": pnl(pt.get(t)), "outcome_yes": p[t]["outcome"] if p[t]["outcome"] is not None else d[t]["outcome"],
         })
     return {"windows": rows, "median_abs_mid_gap": _med(diffs), "n_windows": len(common)}
 
@@ -84,7 +84,7 @@ def render(report: dict) -> str:
         lines.append(f"{w['ticker'][-13:]:<20} {f(w['demo_mid']):>8} {f(w['prod_mid']):>8} {f(w['median_abs_mid_gap']):>6} "
                      f"{f(w['demo_spread']):>7} {f(w['prod_spread']):>7} {f(w['demo_depth'], 0):>6} {f(w['prod_depth'], 0):>6}  "
                      f"{w['demo_trades']}/{w['prod_trades']}        {f(w['demo_pnl'], 2)}/{f(w['prod_pnl'], 2)}")
-    lines.append(f"windows compared: {report['n_windows']}; median |demo mid - prod mid| at the same second: "
+    lines.append(f"windows compared: {report['n_windows']}; median |demo mid - prod mid| at the same second (windows with overlapping seconds only): "
                  f"{f(report['median_abs_mid_gap'], 4)}")
     lines.append("Small samples: a handful of windows says the books differ, not which one is right.")
     return "\n".join(lines)
