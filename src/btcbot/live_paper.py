@@ -96,8 +96,8 @@ class LivePaperTrader:
         self._ramp_size: Decimal | None = None  # sizing mode "ramp": next order size, moved only by settlements
         self._ramp_level = 0  # consecutive settled wins in the current ramp (0 = base size)
         self._idle_windows = 0  # consecutive finished windows in which no position was opened
-        self._carried_pnl = Decimal(0)  # realized P&L of earlier PARTIAL early exits of the position still held
-        self._carried_size = Decimal(0)
+        # realized (pnl, size) of earlier PARTIAL early exits, per market: the position they came from may settle later
+        self._carried: dict[str, tuple[Decimal, Decimal]] = {}
         self._position_level = 0  # ramp level when the current position was opened (the stop tightens with it)
         self._last_result: str | None = None  # "win" or "loss" of the most recent settled trade
         if config.sizing.mode is SizingMode.PERCENT:
@@ -386,13 +386,13 @@ class LivePaperTrader:
         self.trades.append(resolved)
         log_trade(self._conn, resolved)
         self._bankroll += pnl
+        carried_pnl, carried_size = self._carried.get(resolved.ticker, (Decimal(0), Decimal(0)))
         if not final:
-            self._carried_pnl += pnl
-            self._carried_size += resolved.size
+            self._carried[resolved.ticker] = (carried_pnl + pnl, carried_size + resolved.size)
             self._risk.release_exposure(exposure)
             return
-        total_pnl, total_size = pnl + self._carried_pnl, resolved.size + self._carried_size
-        self._carried_pnl, self._carried_size = Decimal(0), Decimal(0)
+        self._carried.pop(resolved.ticker, None)
+        total_pnl, total_size = pnl + carried_pnl, resolved.size + carried_size
         self._last_result = "loss" if total_pnl < 0 else "win"
         if self._config.sizing.mode is SizingMode.RAMP:
             self._ramp_level = self._ramp_level + 1 if total_pnl > 0 else 0
