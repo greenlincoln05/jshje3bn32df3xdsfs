@@ -73,6 +73,19 @@ class RiskLimits(_Strict):
     daily_loss_limit_pct: Decimal | None = Field(None, gt=0, le=100)
 
 
+class ExitRules(_Strict):
+    """Optional early exit, off unless a threshold is set (the default is still hold-to-settlement,
+    per strategy.py's module docstring). See btcbot.strategy.should_exit for the shared pure decision
+    function a backtest/lab replay and (later) a live trader both go through, per
+    docs/research/stop-loss-handoff.md. Wired into btcbot.backtest's replay only for now; btcbot paper/demo
+    are unchanged until that handoff's later steps land."""
+
+    stop_loss_pct: Decimal | None = Field(None, gt=0, le=100)  # exit if the mark (best bid of the held side) falls this % below entry
+    take_profit_pct: Decimal | None = Field(None, gt=0)  # exit if the mark rises this % above entry
+    stop_min_hold_sec: int = Field(0, ge=0)  # do not exit before holding a position at least this long
+    stop_min_tau_sec: int = Field(0, ge=0)  # do not exit within this many seconds of close; hold to settlement instead
+
+
 class BotConfig(_Strict):
     mode: Mode = Mode.PAPER
     series_ticker: str = Field("KXBTC15M", min_length=1)
@@ -94,6 +107,7 @@ class BotConfig(_Strict):
     max_price: Decimal | None = Field(Decimal("0.85"), gt=0, le=1)
     sizing: Sizing = Field(default_factory=Sizing)
     risk: RiskLimits = Field(default_factory=RiskLimits)
+    exit: ExitRules = Field(default_factory=ExitRules)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:

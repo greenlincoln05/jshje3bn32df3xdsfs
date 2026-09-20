@@ -2,8 +2,11 @@
 
 v1 only ever proposes resting (maker) orders at the current best bid -- joining the existing queue, never
 improving on it or crossing the spread -- which is what "prefer resting limit orders over crossing the
-spread" comes down to once crossing is simply never chosen. Exit is always hold-to-settlement (section 5's
-default); the optional take-profit/stop-loss exits it mentions are off by default and not implemented here.
+spread" comes down to once crossing is simply never chosen. Exit is hold-to-settlement by default; an
+optional stop-loss/take-profit early exit (:func:`should_exit`, per docs/research/stop-loss-handoff.md) is
+off unless a caller passes a threshold, so nothing here changes behavior until one is configured. It is
+wired into :mod:`btcbot.backtest`'s replay (so `btcbot backtest`/`btcbot lab` can measure it) but not yet
+into `btcbot paper`/`btcbot demo` -- that is a later step of the same handoff.
 
 This module never touches risk or execution: it proposes a :class:`Decision`, and the caller (a live loop or
 :mod:`btcbot.backtest`) is responsible for getting it past :class:`btcbot.risk.RiskManager` before acting on
@@ -34,6 +37,7 @@ class Action(StrEnum):
     REST = "rest"  # place a new resting maker order
     CANCEL = "cancel"  # cancel the resting order (the close is near)
     HOLD = "hold"  # already resting, or already positioned: nothing to do this tick
+    EXIT = "exit"  # close an open position early (stop-loss/take-profit); see should_exit()
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +49,7 @@ class Decision:
     reason: str = ""
     edge: float | None = None  # modeled probability minus price minus fee, for the chosen side
     kelly_fraction: float | None = None  # full-Kelly bankroll fraction for this side/price; see kelly_fraction()
+    exit_reason: str | None = None  # "stop_loss" | "take_profit", set only when action is EXIT
 
 
 def kelly_fraction(p: float, price: Decimal) -> float:
@@ -129,6 +134,47 @@ def percent_size(
     return min(target, previous_size + step)
 
 
+def should_exit(
+    *,
+    entry_price: Decimal,
+    current_bid: Decimal | None,
+    tau_sec: float,
+    held_sec: float,
+    stop_loss_pct: Decimal | None,
+    take_profit_pct: Decimal | None,
+    stop_min_hold_sec: float = 0,
+    stop_min_tau_sec: float = 0,
+) -> str | None:
+    """Whether a held position should be closed early, and why: ``"stop_loss"``, ``"take_profit"``, or
+    ``None`` (keep holding to settlement, today's only behavior). A pure function of (entry, current best
+    bid, tau) per docs/research/stop-loss-handoff.md, so a backtest replay and a live trader can share one
+    decision instead of two copies of the same math drifting apart.
+
+    ``current_bid`` must be the best bid of the SIDE ACTUALLY HELD -- what an immediate sale could get, not
+    the market mid -- because that is the only price a real exit order could fill at; it is None when that
+    side's book has no depth to sell into at all, in which case there is nothing to do but keep holding.
+
+    Off entirely when both ``stop_loss_pct`` and ``take_profit_pct`` are None (the default), so a caller
+    that never sets either keeps exactly today's hold-to-settlement behavior. ``stop_min_hold_sec`` and
+    ``stop_min_tau_sec`` guard against reacting to noise right after entry and against chasing an exit fill
+    on a thin book in the closing seconds, when holding to settlement is simpler and no worse.
+    """
+    if stop_loss_pct is None and take_profit_pct is None:
+        return None
+    if current_bid is None or entry_price <= 0:
+        return None
+    if held_sec < stop_min_hold_sec:
+        return None
+    if tau_sec < stop_min_tau_sec:
+        return None
+    change_pct = (current_bid - entry_price) / entry_price * 100
+    if stop_loss_pct is not None and change_pct <= -stop_loss_pct:
+        return "stop_loss"
+    if take_profit_pct is not None and change_pct >= take_profit_pct:
+        return "take_profit"
+    return None
+
+
 def decide(
     *,
     book: OrderBook,
@@ -147,6 +193,13 @@ def decide(
     has_position: bool,
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
+    position_side: Side | None = None,
+    position_entry_price: Decimal | None = None,
+    position_held_sec: float | None = None,
+    stop_loss_pct: Decimal | None = None,
+    take_profit_pct: Decimal | None = None,
+    stop_min_hold_sec: float = 0,
+    stop_min_tau_sec: float = 0,
 ) -> Decision:
     if has_resting_order:
         if spot_is_stale:
@@ -155,6 +208,25 @@ def decide(
             return Decision(Action.CANCEL, reason="cancelling before close")
         return Decision(Action.HOLD, reason="order already resting")
     if has_position:
+        exit_reason = None
+        current_bid = None
+        if position_side is not None and position_entry_price is not None and position_held_sec is not None:
+            current_bid = book.best_bid(position_side)
+            exit_reason = should_exit(
+                entry_price=position_entry_price,
+                current_bid=current_bid.price if current_bid is not None else None,
+                tau_sec=tau_sec,
+                held_sec=position_held_sec,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                stop_min_hold_sec=stop_min_hold_sec,
+                stop_min_tau_sec=stop_min_tau_sec,
+            )
+        if exit_reason is not None:
+            return Decision(
+                Action.EXIT, side=position_side, price=current_bid.price, reason=f"{exit_reason} triggered",
+                exit_reason=exit_reason,
+            )
         return Decision(Action.HOLD, reason="already positioned; holding to settlement")
     if spot_is_stale:
         return Decision(Action.SKIP, reason="stale spot feed")

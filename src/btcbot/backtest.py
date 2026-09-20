@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 from btcbot.model import TimedVolatility, ModelState, predict
 from btcbot.models import OrderBook, ParseError, PriceLevel, Side, parse_time
-from btcbot.paper_broker import PaperBroker, QueueAssumption, settle
+from btcbot.paper_broker import Fill, PaperBroker, QueueAssumption, settle
 from btcbot.risk import RiskManager, TradeOutcome
 from btcbot.strategy import Action, Decision, decide, percent_size
 
@@ -107,6 +107,11 @@ class TradeRecord:
     p_side_at_entry: float
     result: Side | None = None
     pnl_usd: Decimal | None = None
+    # None: held to settlement (result carries the outcome instead). "stop_loss"/"take_profit": closed early
+    # by btcbot.strategy.should_exit -- result stays None since the MARKET never settled, only this position
+    # closed; pnl_usd/exit_price come from the exit sale, not from btcbot.paper_broker.settle().
+    exit_reason: str | None = None
+    exit_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +147,9 @@ CREATE TABLE IF NOT EXISTS trades (
     fee_paid TEXT NOT NULL,
     p_side_at_entry REAL NOT NULL,
     result TEXT,
-    pnl_usd TEXT
+    pnl_usd TEXT,
+    exit_reason TEXT,
+    exit_price TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_entry_ts ON trades (entry_ts);
 """
@@ -158,8 +165,8 @@ def init_trades_schema(conn: sqlite3.Connection) -> None:
 
 def log_trade(conn: sqlite3.Connection, trade: TradeRecord) -> None:
     conn.execute(
-        """INSERT INTO trades (ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO trades (ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd,
+           exit_reason, exit_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             trade.ticker,
             trade.side,
@@ -170,6 +177,8 @@ def log_trade(conn: sqlite3.Connection, trade: TradeRecord) -> None:
             trade.p_side_at_entry,
             trade.result,
             None if trade.pnl_usd is None else str(trade.pnl_usd),
+            trade.exit_reason,
+            None if trade.exit_price is None else str(trade.exit_price),
         ),
     )
     conn.commit()
@@ -177,8 +186,8 @@ def log_trade(conn: sqlite3.Connection, trade: TradeRecord) -> None:
 
 def load_trades(conn: sqlite3.Connection) -> list[TradeRecord]:
     rows = conn.execute(
-        """SELECT ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd
-           FROM trades ORDER BY entry_ts"""
+        """SELECT ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd,
+           exit_reason, exit_price FROM trades ORDER BY entry_ts"""
     ).fetchall()
     return [
         TradeRecord(
@@ -191,8 +200,10 @@ def load_trades(conn: sqlite3.Connection) -> list[TradeRecord]:
             p_side_at_entry=p_side_at_entry,
             result=result,
             pnl_usd=None if pnl_usd is None else Decimal(pnl_usd),
+            exit_reason=exit_reason,
+            exit_price=None if exit_price is None else Decimal(exit_price),
         )
-        for ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd in rows
+        for ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry, result, pnl_usd, exit_reason, exit_price in rows
     ]
 
 
@@ -391,6 +402,29 @@ class ReplayResult:
     equity_curve: list[tuple[datetime, Decimal]]
 
 
+def _apply_exit(position: TradeRecord, fills: list[Fill], reason: str) -> tuple[TradeRecord | None, TradeRecord | None]:
+    """Split a held position by an early stop-loss/take-profit sale. Returns ``(closed, remaining)``: a thin
+    book (:meth:`btcbot.paper_broker.PaperBroker.place_exit_order` is depth-limited) can fill only part of
+    the position, in which case ``remaining`` stays open at the SAME entry price, tracked exactly as before
+    -- selling part of a position does not change what the rest cost -- and ``closed`` is None. ``closed``
+    never carries more than ``position.size``, however many fills are passed in."""
+    sold_size = min(sum((f.size for f in fills), Decimal(0)), position.size)
+    if sold_size <= 0:
+        return None, position
+    proceeds = sum((f.price * f.size for f in fills), Decimal(0))
+    exit_fee = sum((f.fee for f in fills), Decimal(0))
+    entry_fee_share = position.fee_paid * sold_size / position.size
+    pnl = proceeds - position.entry_price * sold_size - entry_fee_share - exit_fee
+    closed = replace(
+        position, size=sold_size, fee_paid=entry_fee_share + exit_fee, pnl_usd=pnl,
+        exit_reason=reason, exit_price=proceeds / sold_size,
+    )
+    remaining_size = position.size - sold_size
+    if remaining_size <= 0:
+        return closed, None
+    return closed, replace(position, size=remaining_size, fee_paid=position.fee_paid - entry_fee_share)
+
+
 def replay_prepared(
     prepared: PreparedReplay,
     config: BotConfig,
@@ -422,8 +456,23 @@ def replay_prepared(
     if bankroll is not None and filters.risk_pct_per_trade is not None:
         risk.set_account_value(bankroll)
 
-    def resolve_available(now: datetime) -> None:
+    def finalize_trade(record: TradeRecord, ts: datetime, *, exposure_released_usd: Decimal) -> None:
+        """Record a trade whose PnL is now known -- by settlement or by an early exit -- and update
+        risk/bankroll state the same way regardless of which one closed it."""
         nonlocal bankroll, last_result
+        assert record.pnl_usd is not None
+        trades.append(record)
+        risk.record_trade_closed(
+            TradeOutcome(ts=ts, size=record.size, pnl_usd=record.pnl_usd), exposure_released_usd=exposure_released_usd
+        )
+        last_result = "loss" if record.pnl_usd < 0 else "win"
+        if bankroll is not None:
+            bankroll += record.pnl_usd
+            equity.append((ts, bankroll))
+            if filters is not None and filters.risk_pct_per_trade is not None:
+                risk.set_account_value(bankroll)
+
+    def resolve_available(now: datetime) -> None:
         available = sorted(
             ((ticker, settlements.get(ticker)) for ticker in pending),
             key=lambda item: item[1].available_ts if item[1] is not None else now,
@@ -434,17 +483,8 @@ def replay_prepared(
             held = pending.pop(ticker)
             exposure = held.entry_price * held.size
             pnl = settle(held.side, held.size, settlement.result) - exposure - held.fee_paid
-            trades.append(replace(held, result=settlement.result, pnl_usd=pnl))
-            risk.record_trade_closed(
-                TradeOutcome(ts=settlement.available_ts, size=held.size, pnl_usd=pnl),
-                exposure_released_usd=exposure,
-            )
-            last_result = "loss" if pnl < 0 else "win"
-            if bankroll is not None:
-                bankroll += pnl
-                equity.append((settlement.available_ts, bankroll))
-                if filters is not None and filters.risk_pct_per_trade is not None:
-                    risk.set_account_value(bankroll)
+            finalize_trade(replace(held, result=settlement.result, pnl_usd=pnl), settlement.available_ts,
+                            exposure_released_usd=exposure)
 
     def finalize_window(ticker: str, ts: datetime) -> None:
         nonlocal resting_order_id, position
@@ -593,6 +633,13 @@ def replay_prepared(
             maker_fee_multiplier=maker_fee_multiplier,
             has_resting_order=resting_order_id is not None,
             has_position=position is not None,
+            position_side=position.side if position is not None else None,
+            position_entry_price=position.entry_price if position is not None else None,
+            position_held_sec=(snap.poll_ts - position.entry_ts).total_seconds() if position is not None else None,
+            stop_loss_pct=config.exit.stop_loss_pct,
+            take_profit_pct=config.exit.take_profit_pct,
+            stop_min_hold_sec=config.exit.stop_min_hold_sec,
+            stop_min_tau_sec=config.exit.stop_min_tau_sec,
         )
 
         if decision.action is Action.REST:
@@ -620,6 +667,11 @@ def replay_prepared(
             if unfilled > 0:
                 risk.release_exposure(unfilled * order.price)
             resting_order_id = None
+        elif decision.action is Action.EXIT and position is not None:
+            exit_fills = broker.place_exit_order(position.side, position.size, book=snap.book, ts=snap.poll_ts)
+            closed, position = _apply_exit(position, exit_fills, decision.exit_reason or "exit")
+            if closed is not None:
+                finalize_trade(closed, snap.poll_ts, exposure_released_usd=closed.entry_price * closed.size)
 
     if current_ticker is not None:
         finalize_window(current_ticker, prepared.last_ts)
@@ -680,8 +732,11 @@ def build_report(
     """Shared by ``run_backtest`` and :mod:`btcbot.live_paper`, so a live run and a backtest replay of the
     same recorded data produce directly comparable reports (spec section 8.5's "compare live paper results
     to the backtest")."""
-    resolved = [t for t in trades if t.result is not None]
-    unresolved = [t for t in trades if t.result is None]
+    # "Resolved" means a real PnL is known -- either the market settled (result is set) or a stop-loss/
+    # take-profit closed the position early (exit_reason is set, result stays None: the market itself never
+    # settled). pnl_usd is set in both cases and in neither other case, so it is the one signal that covers both.
+    resolved = [t for t in trades if t.pnl_usd is not None]
+    unresolved = [t for t in trades if t.pnl_usd is None]
     wins = sum(1 for t in resolved if t.pnl_usd is not None and t.pnl_usd > 0)
     losses = sum(1 for t in resolved if t.pnl_usd is not None and t.pnl_usd < 0)
     total_pnl = sum((t.pnl_usd for t in resolved if t.pnl_usd is not None), Decimal(0))

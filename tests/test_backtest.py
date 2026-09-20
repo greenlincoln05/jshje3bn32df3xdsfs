@@ -8,15 +8,18 @@ import pytest
 from btcbot.backtest import (
     BacktestError,
     Settlement,
+    load_replay_data,
     load_settlements,
     load_snapshots,
     load_spot_ticks,
     load_windows,
+    prepare_replay,
+    replay_prepared,
     run_backtest,
 )
-from btcbot.config import BotConfig
+from btcbot.config import BotConfig, ExitRules
 from btcbot.models import ParseError
-from btcbot.paper_broker import QueueAssumption
+from btcbot.paper_broker import QueueAssumption, taker_fee
 from btcbot.recorder import Recorder
 
 T0 = datetime(2026, 9, 19, 0, 0, 0, tzinfo=timezone.utc)
@@ -90,6 +93,28 @@ def seed_fillable_window(conn, ticker, *, start_ts, strike=Decimal("80000"), clo
             yes=[(yes_price, str(size))], no=[(no_price, "15")],
         )
     return close_time
+
+
+FULL_FILL_SIZES = [15, 14, 13, 12, 11, 10, 14, 0, 5, 0]  # seed_fillable_window's own sequence leaves 1 of 5
+# contracts still resting (a deliberate partial fill for its own tests); the last two ticks here mop that
+# remaining contract up too, so the order clears completely and decide()'s exit check (which only ever runs
+# once has_resting_order is False) has something to act on.
+
+
+def seed_window_with_price_drop(conn, ticker, *, start_ts, strike=Decimal("80000"), entry_price="0.30",
+                                 drop_price="0.20", drop_depth="20", close_time=None):
+    """A resting order that fills COMPLETELY (all 5 contracts, see FULL_FILL_SIZES), followed by the YES
+    book resting at a materially lower ``drop_price`` with ``drop_depth`` contracts of depth -- enough to
+    fill a stop-loss exit sale, partially if ``drop_depth`` is less than the position size."""
+    close_time = seed_fillable_window(conn, ticker, start_ts=start_ts, strike=strike, close_time=close_time,
+                                       sizes=FULL_FILL_SIZES, yes_price=entry_price)
+    for offset in range(len(FULL_FILL_SIZES), len(FULL_FILL_SIZES) + 8):
+        insert_snapshot(conn, ticker, start_ts + timedelta(seconds=offset), yes=[(drop_price, drop_depth)], no=[("0.79", "20")])
+    return close_time
+
+
+def replay(conn, config):
+    return replay_prepared(prepare_replay(load_replay_data(conn), config), config)
 
 
 class TestLoaders:
@@ -283,6 +308,56 @@ class TestRollover:
         assert report.windows_seen == 1
         assert report.windows_traded == 0
         assert report.trades == 0
+
+
+class TestStopLoss:
+    def test_closes_the_position_early_without_waiting_for_settlement(self, tmp_path):
+        conn = make_db(tmp_path)
+        seed_window_with_price_drop(conn, TICKER, start_ts=T0)  # no settlement row inserted at all
+        config = BotConfig(exit=ExitRules(stop_loss_pct=Decimal("20")))
+
+        result = replay(conn, config)
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "stop_loss"
+        assert trade.result is None  # the MARKET never settled; only this position closed early
+        assert trade.size == Decimal(5) and trade.exit_price == Decimal("0.20")
+        expected_fee = taker_fee(Decimal(5), Decimal("0.20"))
+        assert trade.fee_paid == expected_fee
+        assert trade.pnl_usd == Decimal(5) * (Decimal("0.20") - Decimal("0.30")) - expected_fee
+
+    def test_without_stop_loss_configured_holds_to_settlement_as_before(self, tmp_path):
+        conn = make_db(tmp_path)
+        close_time = seed_window_with_price_drop(conn, TICKER, start_ts=T0)
+        insert_settlement(conn, TICKER, "no", strike=Decimal("80000"), close_time=close_time)
+
+        result = replay(conn, BotConfig())  # exit rules default to off
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason is None
+        assert trade.result == "no"  # held all the way to settlement, exactly as before this feature existed
+
+    def test_a_partial_exit_fill_leaves_the_remainder_tracked_to_settlement(self, tmp_path):
+        conn = make_db(tmp_path)
+        strike = Decimal("80000")
+        close_time = seed_fillable_window(conn, TICKER, start_ts=T0, strike=strike, sizes=FULL_FILL_SIZES)
+        # exactly one tick with a stop-triggering price and only 2 of the 5 held contracts' worth of resting
+        # depth to sell into -- then nothing more for this ticker, so the unsold remainder rides to settlement
+        # instead of a later, identical tick offering the same "fresh" depth and closing the rest too.
+        insert_snapshot(conn, TICKER, T0 + timedelta(seconds=len(FULL_FILL_SIZES)), yes=[("0.20", "2")], no=[("0.79", "20")])
+        insert_settlement(conn, TICKER, "no", strike=strike, close_time=close_time)
+        config = BotConfig(exit=ExitRules(stop_loss_pct=Decimal("20")))
+
+        result = replay(conn, config)
+
+        assert len(result.trades) == 2  # the exit-closed part and the settlement-resolved remainder
+        by_reason = {t.exit_reason: t for t in result.trades}
+        exited, held = by_reason["stop_loss"], by_reason[None]
+        assert exited.size == Decimal(2) and held.size == Decimal(3)
+        assert exited.exit_price == Decimal("0.20")
+        assert held.result == "no" and held.entry_price == Decimal("0.30")  # unchanged cost basis for the rest
 
 
 class TestReportShape:
