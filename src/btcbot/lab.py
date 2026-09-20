@@ -73,6 +73,9 @@ class LabParams:
     trend_mode: str = "off"
     trend_lookback_sec: int = 60
     trend_min_move_usd: Decimal = Decimal(0)
+    book_move_mode: str = "off"
+    book_move_lookback_sec: int = 60
+    book_move_min: Decimal = Decimal(0)
     model_blend: float = 0.5
     risk_pct: Decimal | None = None   # percent of bankroll risked per trade; None = fixed contracts
     max_growth_pct: Decimal | None = None  # with risk_pct: a win may raise the next order by at most this percent
@@ -112,13 +115,14 @@ class AccountSettings:
 
 _DECIMAL_KEYS = {
     "min_edge", "max_spread", "min_depth", "min_price", "max_price", "trend_min_move_usd", "risk_pct", "min_stake_pct",
-    "min_p_side", "max_growth_pct",
+    "min_p_side", "max_growth_pct", "book_move_min",
 }
-_INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "contracts", "persist_steps"}
+_INT_KEYS = {"min_tau_sec", "max_tau_sec", "trend_lookback_sec", "book_move_lookback_sec", "contracts", "persist_steps"}
 _FLOAT_KEYS = {"model_blend"}
 _OPTIONAL_KEYS = {"min_price", "max_price", "risk_pct", "min_p_side", "max_growth_pct"}
-TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode"}))
+TUNABLE = tuple(sorted(_DECIMAL_KEYS | _INT_KEYS | _FLOAT_KEYS | {"trend_mode", "book_move_mode"}))
 _TREND_MODES = ("off", "with", "against", "aligned4")
+_BOOK_MOVE_MODES = ("off", "with", "against")
 
 
 def _check(key: str, value: Any) -> Any:
@@ -132,14 +136,17 @@ def _check(key: str, value: Any) -> Any:
         "max_growth_pct": lambda v: v is None or 0 <= v <= 500,
         "persist_steps": lambda v: 1 <= v <= 300,
         "trend_min_move_usd": lambda v: v >= 0,
+        "book_move_min": lambda v: 0 <= v < 1,
         "min_stake_pct": lambda v: 0 <= v <= 100,
         "risk_pct": lambda v: v is None or 0 < v <= 100,
         "min_tau_sec": lambda v: 0 <= v <= 900,
         "max_tau_sec": lambda v: 0 < v <= 900,
         "trend_lookback_sec": lambda v: 5 <= v <= 900,
+        "book_move_lookback_sec": lambda v: 5 <= v <= 900,
         "contracts": lambda v: v >= 1,
         "model_blend": lambda v: 0 <= v <= 1,
         "trend_mode": lambda v: v in _TREND_MODES,
+        "book_move_mode": lambda v: v in _BOOK_MOVE_MODES,
     }[key]
     if not ok(value):
         raise LabError(f"{key}: {value!r} is out of range")
@@ -309,6 +316,8 @@ def _filters_for(params: LabParams, account: AccountSettings) -> EntryFilters:
         min_price=params.min_price, max_price=params.max_price, persist_steps=params.persist_steps,
         min_p_side=params.min_p_side, trend_mode=params.trend_mode,
         trend_lookback_sec=params.trend_lookback_sec, trend_min_move_usd=params.trend_min_move_usd,
+        book_move_mode=params.book_move_mode, book_move_lookback_sec=params.book_move_lookback_sec,
+        book_move_min=params.book_move_min,
         account_usd=account.account_usd,
         min_stake_usd=account.account_usd * params.min_stake_pct / 100,
         risk_pct_per_trade=None if params.risk_pct is None else params.risk_pct / 100,

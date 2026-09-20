@@ -39,7 +39,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+import yaml
+
 from btcbot.backtest import BacktestError, BacktestReport, run_backtest
+from btcbot.candidate_suite import load_candidate_suite, render_candidate_suite, run_candidate_suite
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.kalshi_client import HOSTS, KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
@@ -51,7 +54,7 @@ from btcbot.execution import DemoExecutionBackend
 from btcbot.live_paper import LivePaperTrader
 from btcbot.market_discovery import find_current_market
 from btcbot.model import CalibrationSummary, compute_calibration_report
-from btcbot.models import Market, OrderBook, ParseError, Series, Side
+from btcbot.models import Market, OrderBook, ParseError, Series, Side, parse_time
 from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder, RecorderSummary
 from btcbot.spot_feed import CoinbaseSpotFeed, SpotBuffer
@@ -495,6 +498,30 @@ async def _cmd_lab(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_lab_suite(args: argparse.Namespace) -> int:
+    """Evaluate a frozen set of named candidates against shared recorded data."""
+    config = load_config(args.config)
+    paths = [Path(path) for path in args.db]
+    if not paths:
+        paths = sorted(path for path in Path(args.data_dir).glob("*.sqlite") if "-demo-" not in path.name)
+    if not paths:
+        print("error: no production recording files found", file=sys.stderr)
+        return 1
+    try:
+        suite = load_candidate_suite(args.suite, config)
+        cutoff = None if args.after is None else parse_time(args.after)
+        report = run_candidate_suite(load_lab_data(paths), config, suite, after=cutoff)
+    except (LabError, BacktestError, KeyError, TypeError, yaml.YAMLError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, default=str, indent=2), encoding="utf-8")
+    print(render_candidate_suite(report))
+    print(f"\nFull ledger: {output}")
+    return 0
+
+
 ORDER_AUDIT_FILE = Path("data") / "order-audit.jsonl"
 
 
@@ -857,6 +884,17 @@ def build_parser() -> argparse.ArgumentParser:
     lab.add_argument("--min-train-trades", type=int, default=20, help="combinations with fewer resolved training trades are not ranked (default: 20)")
     lab.add_argument("--max-combos", type=int, default=400, help="refuse grids larger than this (default: 400)")
     lab.set_defaults(handler=_cmd_lab)
+
+    suite = commands.add_parser(
+        "lab-suite",
+        help="replay a frozen named candidate suite without placing orders",
+    )
+    suite.add_argument("--suite", default="docs/research/candidate-suite-v1.yaml", help="frozen candidate YAML")
+    suite.add_argument("--db", action="append", default=[], help="recorded production database (repeatable)")
+    suite.add_argument("--data-dir", default="data", help="where to look when no --db is given")
+    suite.add_argument("--after", help="only evaluate market windows first observed at/after this ISO timestamp")
+    suite.add_argument("--output", default="data/research/candidate-suite-latest.json", help="full JSON ledger output")
+    suite.set_defaults(handler=_cmd_lab_suite)
 
     demo = commands.add_parser(
         "demo",

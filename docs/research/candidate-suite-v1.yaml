@@ -1,0 +1,111 @@
+version: 1
+frozen_at: 2026-09-20T03:00:31Z
+description: >-
+  Pre-registered non-order Candidate A variants. The September 19 design set and the
+  externally reported Turbine regime change motivated these hypotheses. Results after
+  frozen_at are confirmation data and must not be used to change this file in place;
+  create a new suite version instead.
+
+assumptions:
+  account_sizes: [100, 500, 1000, 5000]
+  max_exposure_pct: 25
+  daily_loss_pct: 10
+  queue: optimistic
+  maker_fee_multiplier: 0.25
+
+candidates:
+  - name: A-baseline
+    hypothesis: Frozen Candidate A with live price bounds and simulated maker fees.
+    params: {}
+
+  - name: B-cap-070
+    hypothesis: Avoiding expensive contracts reduces asymmetric losses.
+    params: {max_price: 0.70}
+
+  - name: C-cap-065
+    hypothesis: A tighter price cap improves payoff asymmetry.
+    params: {max_price: 0.65}
+
+  - name: D-late-5to8
+    hypothesis: Entering with five to eight minutes left improves directional accuracy.
+    params: {min_tau_sec: 300, max_tau_sec: 480}
+
+  - name: E-late-2to10
+    hypothesis: Removing very early and final-minute entries improves stability.
+    params: {min_tau_sec: 120, max_tau_sec: 600}
+
+  - name: F-cap070-late
+    hypothesis: Combine the 70-cent cap with the five-to-eight-minute window.
+    params: {max_price: 0.70, min_tau_sec: 300, max_tau_sec: 480}
+
+  - name: G-cap065-late
+    hypothesis: Combine tighter payoff asymmetry with later entry.
+    params: {max_price: 0.65, min_tau_sec: 300, max_tau_sec: 480}
+
+  - name: H-model-075
+    hypothesis: More model weight may improve selection, despite prior calibration concerns.
+    params: {model_blend: 0.75}
+
+  - name: I-model-100
+    hypothesis: Pure model probability tests whether market blending dilutes the signal.
+    params: {model_blend: 1.0}
+
+  - name: J-trend-15m
+    hypothesis: Follow the fifteen-minute spot direction.
+    params: {trend_mode: with, trend_lookback_sec: 900, trend_min_move_usd: 10}
+
+  - name: K-aligned4
+    hypothesis: Require 15m, 30m, 1h and 24h spot directions to agree.
+    params: {trend_mode: aligned4, trend_min_move_usd: 10}
+
+  - name: L-aligned4-band
+    hypothesis: Multi-timeframe agreement is strongest for 55-to-65-cent contracts.
+    params: {trend_mode: aligned4, trend_min_move_usd: 10, min_price: 0.55, max_price: 0.65}
+
+  - name: M-manual-shape
+    hypothesis: Approximate the owner's manual entry shape without discretionary switching.
+    params: {min_price: 0.55, max_price: 0.65, min_tau_sec: 480, max_tau_sec: 600}
+
+  - name: N-aligned-manual
+    hypothesis: Combine manual entry shape with four-horizon directional agreement.
+    params: {trend_mode: aligned4, trend_min_move_usd: 10, min_price: 0.55, max_price: 0.65, min_tau_sec: 480, max_tau_sec: 600}
+
+  - name: O-confidence-060
+    hypothesis: Require at least 60 percent estimated probability for the chosen side.
+    params: {min_p_side: 0.60}
+
+  - name: P-persist-5
+    hypothesis: Require five consecutive agreeing decisions before placing an order.
+    params: {persist_steps: 5}
+
+  - name: Q-risk1-growth10
+    hypothesis: One-percent sizing with a ten-percent post-win ramp reduces drawdown.
+    params: {risk_pct: 1, max_growth_pct: 10, min_stake_pct: 0}
+
+  - name: R-risk2-growth10
+    hypothesis: Two-percent sizing with a ten-percent post-win ramp balances growth and drawdown.
+    params: {risk_pct: 2, max_growth_pct: 10, min_stake_pct: 0}
+
+  - name: S-book-fade-3c-30s
+    hypothesis: Fade a YES midpoint shock of at least three cents over thirty seconds.
+    params: {book_move_mode: against, book_move_lookback_sec: 30, book_move_min: 0.03}
+
+  - name: T-book-fade-4c-30s
+    hypothesis: Fade a stronger four-cent YES midpoint shock over thirty seconds.
+    params: {book_move_mode: against, book_move_lookback_sec: 30, book_move_min: 0.04}
+
+  - name: U-book-fade-4c-60s
+    hypothesis: Fade a four-cent YES midpoint shock sustained over one minute.
+    params: {book_move_mode: against, book_move_lookback_sec: 60, book_move_min: 0.04}
+
+  - name: V-book-fade-8c-60s
+    hypothesis: Fade only an eight-cent one-minute contract-price panic.
+    params: {book_move_mode: against, book_move_lookback_sec: 60, book_move_min: 0.08}
+
+  - name: W-book-momentum-3c
+    hypothesis: Follow rather than fade a three-cent thirty-second midpoint move to detect the active regime.
+    params: {book_move_mode: with, book_move_lookback_sec: 30, book_move_min: 0.03}
+
+  - name: X-short-momentum-band
+    hypothesis: Follow one-minute BTC direction inside a broad 35-to-70-cent band with under seven minutes left.
+    params: {trend_mode: with, trend_lookback_sec: 60, trend_min_move_usd: 10, min_price: 0.35, max_price: 0.70, min_tau_sec: 60, max_tau_sec: 420}
