@@ -10,7 +10,7 @@ import pytest
 from test_execution import make_fill
 from test_live_paper import NO_KILL_FILE, T0, TICKER, feed_fresh_spot, make_book, make_market
 
-from btcbot.config import BotConfig, KalshiEnv
+from btcbot.config import BotConfig, KalshiEnv, Sizing
 from btcbot.demo_trader import DemoTrader, compute_fill_gap, render_demo_report
 from btcbot.kalshi_client import KalshiAPIError, KalshiConnectionError, KalshiWriteNotAllowedError
 from btcbot.models import ParseError
@@ -58,7 +58,11 @@ def make_trader(client=None):
     conn = sqlite3.connect(":memory:")
     buffer = SpotBuffer(window_sec=5.0, stale_after_sec=3.0)
     client = client or FakeDemoClient()
-    return DemoTrader(conn, BotConfig(), buffer, client, kill_file=NO_KILL_FILE), buffer, client, conn
+    # Fixed-size: percent-of-account is the shipped live default (test_percent_sizing.py), but every test in
+    # this file relies on a deterministic "5 contracts every order" for its own order/fill/exposure
+    # assertions, unrelated to sizing mode.
+    config = BotConfig(sizing=Sizing(mode="fixed"))
+    return DemoTrader(conn, config, buffer, client, kill_file=NO_KILL_FILE), buffer, client, conn
 
 
 async def drive(trader, buffer, client, *, real_fill=None, ticker=TICKER, start_ts=T0, upto=len(SIZES)):

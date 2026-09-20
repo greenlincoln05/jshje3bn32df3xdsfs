@@ -42,7 +42,10 @@ def make_book(yes_price="0.30", yes_size="15", no_price="0.68", no_size="15"):
 
 def make_trader(conn, *, config=None, buffer=None, **kwargs):
     buffer = buffer or SpotBuffer(window_sec=5.0, stale_after_sec=3.0)
-    trader = LivePaperTrader(conn, config or BotConfig(), buffer, kill_file=NO_KILL_FILE, **kwargs)
+    # Fixed-size by default: percent-of-account is the shipped live default (test_percent_sizing.py), but a
+    # bare "5 contracts every order" is what most of this file's tests actually rely on for order-mechanics
+    # assertions unrelated to sizing mode. Tests exercising a specific mode pass their own `config=`.
+    trader = LivePaperTrader(conn, config or BotConfig(sizing=Sizing(mode="fixed")), buffer, kill_file=NO_KILL_FILE, **kwargs)
     return trader, buffer
 
 

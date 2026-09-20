@@ -1,7 +1,7 @@
 import sqlite3
 from decimal import Decimal as D
 
-from btcbot.config import BotConfig
+from btcbot.config import BotConfig, Sizing
 from btcbot.strategy import ramp_next_size
 from test_live_paper import make_trader
 from test_percent_sizing import run_windows
@@ -29,9 +29,10 @@ def test_loss_resets_to_base_regardless_of_how_far_it_had_ramped():
 
 
 class TestLiveTraderRampMode:
-    """SizingMode.RAMP is the default, so this drives the actual live/paper/demo decision loop
-    (LivePaperTrader), not just the pure ramp_next_size function -- confirming the wiring in
-    live_paper.py's _resolve() (which calls ramp_next_size on every settlement) behaves the same way.
+    """sizing.mode "ramp" is opt-in (percent-of-account is the shipped default -- see test_percent_sizing.py),
+    still fully supported and driving the same live/paper/demo decision loop (LivePaperTrader), not just the
+    pure ramp_next_size function -- confirming the wiring in live_paper.py's _resolve() (which calls
+    ramp_next_size on every settlement) behaves the same way.
 
     fill_a_window's fixed order-book shrink pattern only ever fills 4 of whatever size is ordered, and
     only manages to fill every OTHER window (a known test-harness limit of chaining LivePaperTrader windows
@@ -40,7 +41,7 @@ class TestLiveTraderRampMode:
     """
 
     async def test_a_loss_resets_to_base_and_a_later_win_ramps_again(self):
-        trader, buffer = make_trader(sqlite3.connect(":memory:"), config=BotConfig())  # default sizing: ramp
+        trader, buffer = make_trader(sqlite3.connect(":memory:"), config=BotConfig(sizing=Sizing(mode="ramp")))
 
         # win, (skip), LOSS, (skip), win, (skip), win, (skip) -- results at odd indices are never used, since
         # no order is ever placed for those windows.
@@ -54,7 +55,7 @@ class TestLiveTraderRampMode:
         assert sizes[3] == 6   # and a later settled win ramps it up again, exactly as the first win did
 
     async def test_two_losses_in_a_row_never_drop_below_base(self):
-        trader, buffer = make_trader(sqlite3.connect(":memory:"), config=BotConfig())
+        trader, buffer = make_trader(sqlite3.connect(":memory:"), config=BotConfig(sizing=Sizing(mode="ramp")))
 
         rows = await run_windows(trader, buffer, ["yes", "yes", "yes", "yes", "no", "yes", "no", "yes", "yes", "yes"])
         sizes = [r[1] for r in rows]
