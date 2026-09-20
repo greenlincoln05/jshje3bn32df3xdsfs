@@ -563,6 +563,45 @@ async def _cmd_lab(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_features(args: argparse.Namespace) -> int:
+    """Flatten recorder databases into one model-ready CSV. Offline: no network, no key."""
+    from btcbot.features import FeatureError, build_rows, write_csv
+
+    paths = [Path(path) for path in args.db]
+    if not paths:
+        paths = sorted(path for path in Path(args.data_dir).glob("*.sqlite") if args.include_demo or "-demo-" not in path.name)
+    try:
+        rows = build_rows(paths, step_sec=args.step_sec)
+    except (FeatureError, BacktestError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    n = write_csv(rows, output)
+    labeled = sum(1 for r in rows if r["outcome_yes"] is not None)
+    print(f"wrote {n} rows ({labeled} with a settled outcome) from {len(paths)} database(s) to {output}")
+    return 0
+
+
+async def _cmd_validate(args: argparse.Namespace) -> int:
+    """Time-split validation of the recorded model probabilities on a features CSV. Offline: no network, no key."""
+    from btcbot.features import read_csv
+    from btcbot.validation import ValidationError, blend_predictor, validate
+
+    try:
+        out = validate(read_csv(args.features), blend_predictor, train_frac=args.split, embargo=args.embargo,
+                       min_test_trades=args.min_test_trades)
+    except (ValidationError, OSError, ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for name, ev in out.items():
+        rate = "-" if ev.win_rate is None else f"{ev.win_rate:.0%} (95% {ev.ci95[0]:.0%}-{ev.ci95[1]:.0%})"
+        brier = "-" if ev.brier is None else f"{ev.brier:.4f}"
+        print(f"{name}: windows {ev.windows}, trades {ev.trades}, wins {ev.wins}, win rate {rate}, "
+              f"pnl/contract ${ev.pnl_per_contract:.2f}, brier {brier}\n  verdict: {ev.verdict}")
+    return 0
+
+
 async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     """Evaluate a frozen set of named candidates against shared recorded data."""
     config = load_config(args.config)
@@ -1025,6 +1064,24 @@ def build_parser() -> argparse.ArgumentParser:
     lab.add_argument("--min-train-trades", type=int, default=20, help="combinations with fewer resolved training trades are not ranked (default: 20)")
     lab.add_argument("--max-combos", type=int, default=400, help="refuse grids larger than this (default: 400)")
     lab.set_defaults(handler=_cmd_lab)
+
+    features = commands.add_parser(
+        "features", help="flatten recorder databases into one model-ready CSV of per-snapshot features (offline)"
+    )
+    features.add_argument("--db", action="append", default=[], help="recorded database (repeatable; default: every prod *.sqlite in --data-dir)")
+    features.add_argument("--data-dir", default="data")
+    features.add_argument("--include-demo", action="store_true", help="also read demo-* databases when no --db is given")
+    features.add_argument("--step-sec", type=float, default=5.0, help="keep at most one row per window per this many seconds (default: 5)")
+    features.add_argument("--output", default="data/research/features.csv")
+    features.set_defaults(handler=_cmd_features)
+
+    validate_cmd = commands.add_parser(
+        "validate", help="time-split validation of the bot's recorded model on a features CSV (offline)")
+    validate_cmd.add_argument("--features", default="data/research/features.csv", help="CSV from `btcbot features`")
+    validate_cmd.add_argument("--split", type=float, default=0.7)
+    validate_cmd.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (default: 1)")
+    validate_cmd.add_argument("--min-test-trades", type=int, default=30)
+    validate_cmd.set_defaults(handler=_cmd_validate)
 
     suite = commands.add_parser(
         "lab-suite",
