@@ -679,6 +679,18 @@ async def _cmd_demo_report(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_fillcheck(args: argparse.Namespace) -> int:
+    """Check recorded fills against the public trade tape. Offline: no network, no key."""
+    from btcbot.fillcheck import FillCheckError, check_fills, render
+
+    try:
+        print(render(check_fills(args.db, before_sec=args.before_sec)))
+    except (FillCheckError, sqlite3.Error, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 async def _cmd_lab_suite(args: argparse.Namespace) -> int:
     """Evaluate a frozen set of named candidates against shared recorded data."""
     config = load_config(args.config)
@@ -1239,6 +1251,12 @@ def build_parser() -> argparse.ArgumentParser:
     disagree.add_argument("--at-tau", type=float, default=300.0, help="read each window this many seconds before close (default: 300)")
     disagree.add_argument("--min-n", type=int, default=10, help="buckets with fewer windows are marked small (default: 10)")
     disagree.set_defaults(handler=_cmd_disagree)
+
+    fillcheck = commands.add_parser(
+        "fillcheck", help="check recorded paper/demo fills against the public trade tape (offline)")
+    fillcheck.add_argument("--db", required=True, help="a paper-* or demo-* database recorded with the trade tape")
+    fillcheck.add_argument("--before-sec", type=float, default=120.0, help="look this far before each fill for a print (default: 120)")
+    fillcheck.set_defaults(handler=_cmd_fillcheck)
 
     watch = commands.add_parser("watch", help="health check + summary of the newest paper/demo databases (read-only)")
     watch.add_argument("--data-dir", default="data")

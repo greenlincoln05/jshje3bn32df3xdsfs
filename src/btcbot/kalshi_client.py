@@ -49,6 +49,7 @@ from btcbot.models import (
     Position,
     Series,
     Side,
+    Trade,
     require,
 )
 
@@ -287,6 +288,28 @@ class KalshiClient:
     async def get_market(self, ticker: str) -> Market:
         data = await self._request("GET", f"/markets/{quote(ticker, safe='')}")
         return Market.from_api(require(data, "market", "market response"))
+
+    async def get_trades(self, ticker: str, *, min_ts: datetime | None = None, max_pages: int = 20) -> list[Trade]:
+        """Public trade prints for one market since ``min_ts`` (returned oldest first). No key needed. A page cap
+        bounds the work if a busy market has more history than we want."""
+        params = {"ticker": ticker, "limit": "1000"}
+        if min_ts is not None:
+            params["min_ts"] = str(int(min_ts.timestamp()))
+        trades: list[Trade] = []
+        seen_cursors: set[str] = set()
+        for _ in range(max_pages):
+            data = await self._request("GET", "/markets/trades", params=params)
+            page = require(data, "trades", "trades response")
+            if not isinstance(page, list):
+                raise ParseError("trades response: trades must be an array")
+            trades.extend(Trade.from_api(t) for t in page)
+            cursor = data.get("cursor")
+            if not cursor or not isinstance(cursor, str) or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
+        trades.sort(key=lambda t: (t.created_time, t.trade_id))
+        return trades
 
     async def get_orderbook(self, ticker: str, *, depth: int = 0) -> OrderBook:
         """Resting bids for both sides. ``depth`` 0 returns every level; 1-100 limits it."""

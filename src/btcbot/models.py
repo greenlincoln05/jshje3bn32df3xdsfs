@@ -311,6 +311,36 @@ class KalshiOrder:
 
 
 @dataclass(frozen=True, slots=True)
+class Trade:
+    """One public trade print from ``GET /markets/trades`` (no key needed): who crossed, at what price, how many.
+    ``taker_side`` is the outcome the TAKER bought; the maker on the other side had a resting order on the opposite
+    outcome (a taker buying NO at ``no_price`` hit a YES bid at ``yes_price``). Read from the live API 2026-09-20."""
+
+    ticker: str
+    trade_id: str
+    count: Decimal
+    yes_price: Decimal
+    no_price: Decimal
+    taker_side: Side
+    created_time: datetime
+
+    @classmethod
+    def from_api(cls, payload: Mapping[str, Any]) -> Self:
+        taker = require(payload, "taker_side", "trade")
+        if taker not in ("yes", "no"):
+            raise ParseError(f"trade: taker_side must be yes or no, got {taker!r}")
+        return cls(
+            ticker=require(payload, "ticker", "trade"),
+            trade_id=require(payload, "trade_id", "trade"),
+            count=_require_decimal(payload.get("count_fp"), "trade count_fp"),
+            yes_price=_require_decimal(payload.get("yes_price_dollars"), "trade yes_price_dollars"),
+            no_price=_require_decimal(payload.get("no_price_dollars"), "trade no_price_dollars"),
+            taker_side=taker,
+            created_time=parse_time(require(payload, "created_time", "trade"), "trade created_time"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class KalshiFill:
     """A real fill from ``GET /portfolio/fills`` (Phase 6). Distinct from :class:`btcbot.paper_broker.Fill`,
     which is simulated. Same docs-as-read-2026-09-19 caveat as :class:`KalshiOrder`; ``fee_cost`` and
