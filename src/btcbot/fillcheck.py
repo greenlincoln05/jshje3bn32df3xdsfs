@@ -5,7 +5,8 @@ The paper broker decides a resting bid filled from order-book size changes alone
 did a taker actually print at or through our price around that time, and was there enough volume for our size?
 A resting YES bid at ``p`` is hit by a taker BUYING NO with ``yes_price <= p`` (a NO bid at ``q`` by a taker buying YES with
 ``no_price <= q``). A fill with no such print is one paper credited that real flow would not have delivered.
-Offline, read-only, no network and no key. Recordings made before the tape existed have no tape and cannot be checked.
+Offline, read-only, no network and no key. Recordings made before the tape existed have no tape and cannot be checked. Caveats: time priority and other fills
+consuming the same volume are not modelled, so 'covered' is optimistic, and overlapping fills can each count one print.
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ def check_fills(db_path: str | Path, *, before_sec: float = 120.0, after_sec: fl
             price, size = Decimal(price), Decimal(size)
             taker, col = ("no", "yes_price") if side == "yes" else ("yes", "no_price")
             rows = conn.execute(
-                f"SELECT contracts, prints FROM trade_tape WHERE ticker = ? AND taker_side = ? AND CAST({col} AS REAL) <= ? "
+                f"SELECT contracts, prints FROM trade_tape WHERE ticker = ? AND taker_side = ? AND CAST({col} AS REAL) <= ? + 0.0000001 "
                 "AND second_ts >= ? AND second_ts <= ?",
                 (ticker, taker, float(price), lo, hi),
             ).fetchall()

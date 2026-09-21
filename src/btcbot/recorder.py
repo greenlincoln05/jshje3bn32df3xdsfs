@@ -266,8 +266,13 @@ class Recorder:
         self._tape_due = now + self._tape_interval
         since = self._tape_last.get(ticker)
         try:
-            trades = await get_trades(ticker, min_ts=None if since is None else since - timedelta(seconds=3))
-        except (KalshiError, ParseError) as exc:
+            # A generous overlap (the id set makes it safe) so a stalled poll cannot leave a gap; a hard timeout so a slow
+            # /trades call cannot hold up the order-book poll that follows.
+            trades = await asyncio.wait_for(
+                get_trades(ticker, min_ts=None if since is None else since - timedelta(seconds=15)), timeout=8.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # any tape failure, never a reason to stop the recording
             self._tape_errors += 1
             if self._tape_errors <= 3 or self._tape_errors % 50 == 0:
                 self._log("warning", "tape_error", f"trades {ticker}: {exc}")
@@ -289,6 +294,9 @@ class Recorder:
         if trades:
             self._tape_last[ticker] = since
         self._db.commit()
+        if force:  # a forced poll is the final sweep of a market that just closed: free its dedupe set
+            self._tape_seen.pop(ticker, None)
+            self._tape_last.pop(ticker, None)
 
     def log_event(self, event: str, detail: str, *, level: str = "info") -> None:
         """Write one row to ``run_log`` (public wrapper, e.g. for ``account_start``)."""
