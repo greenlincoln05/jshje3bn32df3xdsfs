@@ -185,6 +185,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Rigorous time-split validation (Wilson CI, t-stat, refuses under 30 test trades) of the current model, or --model against it, on a features CSV (offline): `.venv/Scripts/btcbot.exe validate --features data/research/features.csv --model models/entry.json`
 - Train an ML entry/exit model from a recorder database (offline): `.venv/Scripts/btcbot.exe ml-train --db data/recorder-....sqlite --which entry --out models/entry.json`
 - Train an ML entry model from a features CSV instead, with a baseline comparison (offline): `.venv/Scripts/btcbot.exe ml-train --features data/research/features.csv --out models/entry.json`
+- One-shot weekly re-check: features + ml-train --features + validate --model chained (offline): `.venv/Scripts/btcbot.exe retrain-check --data-dir data`
 - Train the coarse market-level calibration model from a download-history database instead, with a baseline comparison (offline): `.venv/Scripts/btcbot.exe ml-train --history data/history-....sqlite --out models/market_level.json`
 - Compare the four ML entry/exit layers on recorded data (offline): `.venv/Scripts/btcbot.exe ml-ablation --db data/recorder-....sqlite --entry-model models/entry.json --exit-model models/exit.json`
 - ONE-TIME backfill of settled markets + Coinbase candles, needs network (owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe download-history --start 2026-01-01T00:00:00Z --end 2026-09-01T00:00:00Z`

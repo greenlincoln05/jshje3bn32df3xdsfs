@@ -592,6 +592,28 @@ async def _cmd_features(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_retrain_check(args: argparse.Namespace) -> int:
+    """One-shot weekly check: build the features CSV, train an entry model on it, validate it against the
+    current model on the same held-out windows -- `btcbot features` + `btcbot ml-train --features` +
+    `btcbot validate --model` chained into one call. Offline: no network, no key, nothing wired into
+    `btcbot paper`/`btcbot demo`; only writes the features CSV and the model JSON and prints a report."""
+    from btcbot.retrain_check import RetrainCheckError, render, run_retrain_check
+
+    paths = [Path(path) for path in args.db]
+    if not paths:
+        paths = sorted(path for path in Path(args.data_dir).glob("*.sqlite") if args.include_demo or "-demo-" not in path.name)
+    try:
+        result = run_retrain_check(
+            paths, features_path=args.features_out, model_path=args.model_out, step_sec=args.step_sec,
+            split=args.split, embargo=args.embargo, min_test_trades=args.min_test_trades,
+        )
+    except (RetrainCheckError, BacktestError, MLModelError, sqlite3.Error, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(render(result))
+    return 0
+
+
 async def _cmd_validate(args: argparse.Namespace) -> int:
     """Time-split validation of the recorded model probabilities on a features CSV, optionally alongside a
     trained ML model (--model, btcbot ml-train's output) on the SAME split -- the answer to "does the ML
@@ -1243,6 +1265,21 @@ def build_parser() -> argparse.ArgumentParser:
     features.add_argument("--step-sec", type=float, default=5.0, help="keep at most one row per window per this many seconds (default: 5)")
     features.add_argument("--output", default="data/research/features.csv")
     features.set_defaults(handler=_cmd_features)
+
+    retrain_check = commands.add_parser(
+        "retrain-check",
+        help="one-shot: features + ml-train --features + validate --model chained (offline; for a weekly re-check)",
+    )
+    retrain_check.add_argument("--db", action="append", default=[], help="recorded database (repeatable; default: every prod *.sqlite in --data-dir)")
+    retrain_check.add_argument("--data-dir", default="data")
+    retrain_check.add_argument("--include-demo", action="store_true", help="also read demo-* databases when no --db is given")
+    retrain_check.add_argument("--step-sec", type=float, default=5.0, help="keep at most one row per window per this many seconds (default: 5)")
+    retrain_check.add_argument("--features-out", default="data/research/features-latest.csv")
+    retrain_check.add_argument("--model-out", default="models/entry_latest.json")
+    retrain_check.add_argument("--split", type=float, default=0.7)
+    retrain_check.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (default: 1)")
+    retrain_check.add_argument("--min-test-trades", type=int, default=30)
+    retrain_check.set_defaults(handler=_cmd_retrain_check)
 
     disagree = commands.add_parser(
         "disagree", help="calibration + model-vs-market disagreement report on a features CSV (offline)")
