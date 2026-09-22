@@ -12,6 +12,7 @@ captured the most snapshots of it (same rule as ``btcbot.backtest.merge_replay_d
 from __future__ import annotations
 
 import csv
+import logging
 import sqlite3
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from btcbot.backtest import SpotSeries, load_replay_data, parse_time
+
+log = logging.getLogger(__name__)
 
 SPOT_LOOKBACKS_SEC = (60, 300, 900)
 DEPTH_LEVELS = 3
@@ -76,15 +79,28 @@ def _f(x: Decimal | float | None) -> float | None:
 
 
 def build_rows(db_paths: Sequence[str | Path], *, step_sec: float = 5.0) -> list[dict]:
+    """``db_paths`` must be order-book recorder databases (``btcbot record``/``paper``/``demo`` output). A path
+    that opens fine but has no ``orderbook_snapshots`` table -- e.g. a ``btcbot download-history`` database,
+    a different schema entirely -- is skipped with a warning rather than crashing the whole run, since a
+    default ``--data-dir`` glob commonly picks up more than one kind of ``*.sqlite`` file."""
     if not db_paths:
         raise FeatureError("no databases given")
     parts = []
+    skipped: list[str] = []
     for path in db_paths:
         conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
         try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "orderbook_snapshots" not in tables:
+                skipped.append(Path(path).name)
+                log.warning("features: skipping %s -- not an order-book recorder database (no orderbook_snapshots table)", path)
+                continue
             parts.append((Path(path).name, load_replay_data(conn), _load_preds(conn)))
         finally:
             conn.close()
+    if not parts:
+        detail = f" (skipped, wrong schema: {', '.join(skipped)})" if skipped else ""
+        raise FeatureError(f"no usable order-book recorder databases given{detail}")
     counts: dict[str, tuple[int, int]] = {}
     for i, (_, data, _) in enumerate(parts):
         per: dict[str, int] = {}

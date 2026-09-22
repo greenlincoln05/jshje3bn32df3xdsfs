@@ -57,6 +57,35 @@ def test_no_databases_is_an_error():
         build_rows([])
 
 
+def test_a_non_order_book_database_is_skipped_not_a_crash(tmp_path):
+    """A ``--data-dir`` glob commonly also matches e.g. a `btcbot download-history` database (market_outcomes/
+    spot_candles schema, no order book at all) -- that must be skipped, not crash the whole run."""
+    import sqlite3
+
+    wrong_schema = tmp_path / "history-KXBTC15M-prod-x.sqlite"
+    conn = sqlite3.connect(wrong_schema)
+    conn.execute("CREATE TABLE market_outcomes (ticker TEXT)")
+    conn.commit()
+    conn.close()
+
+    good = two_window_db(tmp_path)
+    rows = build_rows([wrong_schema, good], step_sec=1)
+    assert rows and all(r["source"] != wrong_schema.name for r in rows)
+
+
+def test_only_wrong_schema_databases_is_still_a_clean_error(tmp_path):
+    import sqlite3
+
+    wrong_schema = tmp_path / "history-KXBTC15M-prod-x.sqlite"
+    conn = sqlite3.connect(wrong_schema)
+    conn.execute("CREATE TABLE market_outcomes (ticker TEXT)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(FeatureError, match="wrong schema"):
+        build_rows([wrong_schema])
+
+
 def test_cli_writes_csv(tmp_path, capsys):
     db = two_window_db(tmp_path)
     out = tmp_path / "f.csv"
