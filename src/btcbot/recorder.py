@@ -104,6 +104,17 @@ CREATE TABLE IF NOT EXISTS settlements (
     resolved INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS trade_tape (
+    ticker TEXT NOT NULL,
+    second_ts TEXT NOT NULL,       -- the trade second, UTC (a busy window prints thousands of trades; one row per
+    yes_price TEXT NOT NULL,       -- second/price/taker keeps the tape ~13x smaller than raw prints, plenty for fills)
+    no_price TEXT NOT NULL,
+    taker_side TEXT NOT NULL,
+    contracts REAL NOT NULL,
+    prints INTEGER NOT NULL,
+    PRIMARY KEY (ticker, second_ts, yes_price, taker_side)
+);
+
 CREATE TABLE IF NOT EXISTS run_log (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -193,6 +204,7 @@ class Recorder:
         on_orderbook: Callable[[Market, OrderBook, datetime], Awaitable[None]] | None = None,
         on_settlement: Callable[[Market], Awaitable[None]] | None = None,
         settle_on_determined: bool = False,
+        tape_poll_interval_sec: float = 4.0,
     ) -> None:
         if poll_interval_sec <= 0:
             raise ValueError("poll_interval_sec must be positive")
@@ -201,6 +213,12 @@ class Recorder:
         # set) and never moves them to "finalized" (observed 2026-09-20: nothing after 12:15 ET finalized). Prod
         # finalizes within seconds. Only `btcbot demo` opts in; everywhere else waits for "finalized".
         self._settle_on_determined = settle_on_determined
+        # Public trade tape (who actually crossed, at what price): what a fill model needs and books alone cannot show.
+        self._tape_interval = timedelta(seconds=tape_poll_interval_sec)
+        self._tape_due: datetime | None = None
+        self._tape_last: dict[str, datetime] = {}
+        self._tape_seen: dict[str, set[str]] = {}  # trade ids already folded into an aggregate row, per market
+        self._tape_errors = 0
         self._series_ticker = series_ticker
         self._db_path = Path(db_path)
         self._kill_file = Path(kill_file)
@@ -235,6 +253,50 @@ class Recorder:
             (_iso(self._clock()), level, event, detail),
         )
         self._db.commit()
+
+    async def _poll_tape(self, ticker: str, *, force: bool = False) -> None:
+        """Store new public trades for ``ticker`` (deduped by trade id). Never raises and never counts toward the
+        recorder's failure stop: a missing tape must not end an order-book recording."""
+        get_trades = getattr(self._client, "get_trades", None)
+        if get_trades is None:
+            return
+        now = self._clock()
+        if not force and self._tape_due is not None and now < self._tape_due:
+            return
+        self._tape_due = now + self._tape_interval
+        since = self._tape_last.get(ticker)
+        try:
+            # A generous overlap (the id set makes it safe) so a stalled poll cannot leave a gap; a hard timeout so a slow
+            # /trades call cannot hold up the order-book poll that follows.
+            trades = await asyncio.wait_for(
+                get_trades(ticker, min_ts=None if since is None else since - timedelta(seconds=15)), timeout=8.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # any tape failure, never a reason to stop the recording
+            self._tape_errors += 1
+            if self._tape_errors <= 3 or self._tape_errors % 50 == 0:
+                self._log("warning", "tape_error", f"trades {ticker}: {exc}")
+            return
+        seen = self._tape_seen.setdefault(ticker, set())
+        for t in trades:
+            if t.trade_id in seen:
+                continue  # the overlap between polls re-returns recent prints; count each once
+            seen.add(t.trade_id)
+            second = _iso(t.created_time.replace(microsecond=0))
+            self._db.execute(
+                "INSERT INTO trade_tape (ticker, second_ts, yes_price, no_price, taker_side, contracts, prints)"
+                " VALUES (?, ?, ?, ?, ?, ?, 1) ON CONFLICT (ticker, second_ts, yes_price, taker_side) DO UPDATE SET"
+                " contracts = contracts + excluded.contracts, prints = prints + 1",
+                (t.ticker, second, str(t.yes_price), str(t.no_price), t.taker_side, float(t.count)),
+            )
+            if since is None or t.created_time > since:
+                since = t.created_time
+        if trades:
+            self._tape_last[ticker] = since
+        self._db.commit()
+        if force:  # a forced poll is the final sweep of a market that just closed: free its dedupe set
+            self._tape_seen.pop(ticker, None)
+            self._tape_last.pop(ticker, None)
 
     def log_event(self, event: str, detail: str, *, level: str = "info") -> None:
         """Write one row to ``run_log`` (public wrapper, e.g. for ``account_start``)."""
@@ -428,6 +490,7 @@ class Recorder:
                 if state_key != last_state_key:
                     if last_state_key is not None and last_state_key[0] != market.ticker:
                         pending_settlement.add(last_state_key[0])
+                        await self._poll_tape(last_state_key[0], force=True)  # last trades of the window that just closed
                     self._record_market_state(market, now)
                     stats.market_state_changes += 1
                     last_state_key = state_key
@@ -456,6 +519,7 @@ class Recorder:
                     if self.on_orderbook is not None:
                         await self.on_orderbook(market, book, poll_ts)
 
+                await self._poll_tape(market.ticker)
                 await self._finalize_pending(pending_settlement, stats)
                 # Start-to-start cadence: request time is part of the interval.
                 # On an overrun, retain a full cooldown rather than burst-catching up.

@@ -89,6 +89,10 @@ truth for scope and phases; the README has the phase status and a dated table of
   cents inside the spread, never onto the ask). The demo book's median spread is ~14 cents and depth ~100 contracts, so the
   normal filters reject most of it. Plumbing mode exercises placement, fills, settlement and sizing; it says nothing about the
   strategy, which is judged on prod paper. It is a `demo`-only flag and `bid_improve_ticks` defaults to 0 everywhere else.
+- Trade tape: `Recorder` (so `record`, `paper`, `demo`) also stores the PUBLIC trade prints (`GET /markets/trades`, no key) in a
+  `trade_tape` table, one row per market/second/price/taker side (~13x smaller than raw prints). `btcbot fillcheck` uses it to ask
+  whether a taker really printed at or through the price of each recorded fill; the paper broker itself is unchanged for now. A tape
+  failure never stops a recording. Recordings made before this have no tape.
 - `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
   and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
@@ -184,6 +188,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Train the coarse market-level calibration model from a download-history database instead, with a baseline comparison (offline): `.venv/Scripts/btcbot.exe ml-train --history data/history-....sqlite --out models/market_level.json`
 - Compare the four ML entry/exit layers on recorded data (offline): `.venv/Scripts/btcbot.exe ml-ablation --db data/recorder-....sqlite --entry-model models/entry.json --exit-model models/exit.json`
 - ONE-TIME backfill of settled markets + Coinbase candles, needs network (owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe download-history --start 2026-01-01T00:00:00Z --end 2026-09-01T00:00:00Z`
+- Fill-realism check of recorded fills against the public trade tape (offline): `.venv/Scripts/btcbot.exe fillcheck --db data/paper-....sqlite`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own
   environment cannot reach Kalshi/Coinbase; that has to happen on the owner's machine).
 
