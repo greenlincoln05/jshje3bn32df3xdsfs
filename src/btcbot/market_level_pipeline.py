@@ -71,9 +71,12 @@ def market_level_examples(
         if outcome.strike is None:
             continue
         cut = bisect_right(starts, outcome.close_time)
-        history = ordered[:cut]
-        if len(history) < 2:
+        if cut < 2:
             continue
+        # Only the trailing `vol_window` candles (plus the last close) are ever used below; slicing the whole
+        # prefix (`ordered[:cut]`) instead copies up to the entire candle history PER OUTCOME -- with ~380k
+        # candles and thousands of settled markets that is an O(outcomes * candles) MemoryError in practice.
+        history = ordered[max(0, cut - vol_window - 1):cut]
         sigma = realized_vol_from_candles(history, window=vol_window)
         state = ModelState(spot=history[-1].close, strike=outcome.strike, tau_sec=1.0, sigma=sigma)
         p_yes = predict_p_yes(state)
