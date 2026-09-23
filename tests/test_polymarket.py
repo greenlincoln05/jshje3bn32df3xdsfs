@@ -88,8 +88,18 @@ class TestOrderBookParsing:
         assert book.best_ask().price == Decimal("0.5")  # lowest ask first -> best
 
     def test_empty_book_has_no_best_levels(self):
-        book = OrderBook.from_api("tok", {"bids": [], "asks": []})
+        book = OrderBook.from_api("tok", {"bids": [], "asks": [], "timestamp": "1790000000000"})
         assert book.best_bid() is None and book.best_ask() is None
+
+    def test_a_non_object_level_entry_is_a_parse_error(self):
+        with pytest.raises(ParseError):
+            OrderBook.from_api("tok", book_payload() | {"bids": [["0.4", "10"]]})
+
+    def test_a_missing_or_malformed_timestamp_is_a_parse_error_not_a_silent_now(self):
+        with pytest.raises(ParseError):
+            OrderBook.from_api("tok", {"bids": [], "asks": []})  # no timestamp field at all
+        with pytest.raises(ParseError):
+            OrderBook.from_api("tok", book_payload() | {"timestamp": "not-a-number"})
 
 
 class TestClient:
@@ -147,17 +157,29 @@ class FakeClock:
 
 
 class FakePolymarketClient:
-    """Scriptable stand-in for PolymarketClient."""
+    """Scriptable stand-in for PolymarketClient. Each of events_script/books_script pops its next scripted
+    outcome (last one repeats); an Exception instance in a script is raised instead of returned, same
+    convention as test_recorder.py's FakeKalshiSource."""
 
-    def __init__(self, *, events_script=(), books=None, event_lookup=None):
+    def __init__(self, *, events_script=(), books=None, books_script=None, event_lookup=None):
         self.events_script = list(events_script)
         self.books = books or {}
+        self.books_script = list(books_script) if books_script is not None else None
         self.event_lookup = event_lookup or {}
 
+    @staticmethod
+    def _pop(script):
+        outcome = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
     async def list_recent_updown_events(self, *, horizon, limit=20):
-        return self.events_script.pop(0) if len(self.events_script) > 1 else self.events_script[0]
+        return self._pop(self.events_script)
 
     async def get_order_book(self, token_id):
+        if self.books_script is not None:
+            return self._pop(self.books_script)
         return self.books[token_id]
 
     async def get_event(self, slug):
@@ -245,6 +267,84 @@ class TestRecorder:
         finally:
             recorder.close()
         assert summary.stop_reason == "kill_file"
+
+    async def test_transient_book_errors_are_counted_and_do_not_stop_the_run(self, tmp_path):
+        ev = one_event()
+        good_book = OrderBook.from_api("tok", book_payload())
+        # up and down are each one get_order_book call; the error consumes the first, then this repeats
+        # forever (the shared _pop convention: the last scripted item repeats), so both calls succeed soon after.
+        client = FakePolymarketClient(events_script=[[ev]], books_script=[PolymarketAPIError(503, "unavailable"), good_book])
+        recorder, _ = make_recorder(tmp_path, client, max_consecutive_failures=5, poll_interval_sec=0.5)
+        try:
+            summary = await recorder.run(duration_sec=2.0)
+        finally:
+            recorder.close()
+        assert summary.errors == 0  # a later successful poll reset the streak
+        assert summary.book_polls >= 1
+
+    async def test_repeated_failures_stop_the_recorder(self, tmp_path):
+        client = FakePolymarketClient(events_script=[PolymarketAPIError(500, "boom")])
+        recorder, _ = make_recorder(tmp_path, client, max_consecutive_failures=3, poll_interval_sec=0.001)
+        try:
+            summary = await recorder.run(duration_sec=3600.0)
+        finally:
+            recorder.close()
+        assert summary.stop_reason == "repeated_failures"
+        assert summary.errors == 3
+
+    async def test_a_parse_error_is_a_counted_error_not_a_crash(self, tmp_path):
+        ev = one_event()
+        good_book = OrderBook.from_api("tok", book_payload())
+        client = FakePolymarketClient(events_script=[[ev]], books_script=[ParseError("bad book"), good_book])
+        recorder, _ = make_recorder(tmp_path, client, poll_interval_sec=0.5)
+        try:
+            summary = await recorder.run(duration_sec=2.0)
+        finally:
+            recorder.close()
+        assert summary.errors == 0
+        assert summary.book_polls >= 1
+
+    async def test_an_unexpected_exception_propagates(self, tmp_path):
+        client = FakePolymarketClient(events_script=[RuntimeError("not a Polymarket problem")])
+        recorder, _ = make_recorder(tmp_path, client)
+        with pytest.raises(RuntimeError):
+            await recorder.run(duration_sec=2.0)
+        recorder.close()
+
+    async def test_disk_floor_stops_the_recorder(self, tmp_path):
+        client = FakePolymarketClient(events_script=[[]])
+        recorder, _ = make_recorder(tmp_path, client, min_free_bytes=2_000_000_000, disk_free_bytes=lambda path: 500_000_000)
+        try:
+            summary = await recorder.run(duration_sec=3600.0)
+        finally:
+            recorder.close()
+        assert summary.stop_reason == "disk_floor"
+
+    async def test_db_size_cap_stops_the_recorder(self, tmp_path):
+        client = FakePolymarketClient(events_script=[[]])
+        recorder, _ = make_recorder(tmp_path, client, max_db_bytes=1)
+        try:
+            summary = await recorder.run(duration_sec=3600.0)
+        finally:
+            recorder.close()
+        assert summary.stop_reason == "db_size_cap"
+
+    async def test_cancellation_logs_and_propagates(self, tmp_path):
+        client = FakePolymarketClient(events_script=[[]])
+        recorder, _ = make_recorder(tmp_path, client)
+        task = asyncio.ensure_future(recorder.run(duration_sec=3600.0))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        recorder.close()
+        log_rows = rows(tmp_path / "pm.sqlite", "run_log")
+        assert any("cancelled" in r["detail"] for r in log_rows)
+
+    def test_rejects_non_positive_poll_interval(self, tmp_path):
+        client = FakePolymarketClient(events_script=[[]])
+        with pytest.raises(ValueError):
+            make_recorder(tmp_path, client, poll_interval_sec=0)
 
     async def test_a_write_capable_database_never_gets_kalshi_tables(self, tmp_path):
         """Every table this recorder creates must be pm_-prefixed (or run_log), so btcbot.features'

@@ -129,6 +129,8 @@ class OrderBook:
                 raise ParseError(f"book: {key} must be an array")
             out = []
             for lvl in raw:
+                if not isinstance(lvl, Mapping):
+                    raise ParseError(f"book: {key} entry must be an object, got {type(lvl).__name__}")
                 price = to_decimal(lvl.get("price"), f"{key}.price")
                 size = to_decimal(lvl.get("size"), f"{key}.size")
                 if price is None or size is None:
@@ -138,8 +140,11 @@ class OrderBook:
 
         bids = tuple(sorted(levels("bids"), key=lambda p: p.price))
         asks = tuple(sorted(levels("asks"), key=lambda p: p.price))
-        ts_ms = payload.get("timestamp")
-        ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc) if ts_ms is not None else datetime.now(timezone.utc)
+        ts_ms = require(payload, "timestamp", "book")
+        try:
+            ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError) as exc:
+            raise ParseError(f"book: timestamp must be milliseconds since epoch, got {ts_ms!r}: {exc}") from exc
         return cls(token_id=token_id, bids=bids, asks=asks, timestamp=ts)
 
     def best_bid(self) -> PriceLevel | None:
