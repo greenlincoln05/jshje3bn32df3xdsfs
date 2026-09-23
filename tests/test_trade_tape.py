@@ -29,6 +29,36 @@ class TestTradeModel:
         with pytest.raises(ParseError):
             Trade.from_api({**payload(), **bad})
 
+    # taker_side is marked deprecated by Kalshi (read 2026-09-23) in favor of taker_outcome_side. Both fields
+    # are still sent today; Trade.from_api must handle all four combinations without ever silently guessing.
+    def test_only_taker_outcome_side_present_is_used(self):
+        p = payload(taker="yes")
+        del p["taker_side"]
+        assert Trade.from_api(p).taker_side == "yes"
+
+    def test_only_taker_side_present_is_the_fallback(self):
+        p = payload(taker="no")
+        del p["taker_outcome_side"]
+        assert Trade.from_api(p).taker_side == "no"
+
+    def test_both_present_and_agreeing_is_fine(self):
+        p = payload(taker="yes")
+        assert p["taker_side"] == p["taker_outcome_side"] == "yes"
+        assert Trade.from_api(p).taker_side == "yes"
+
+    def test_both_present_and_disagreeing_is_a_parse_error(self):
+        p = payload(taker="yes")
+        p["taker_side"] = "no"
+        with pytest.raises(ParseError, match="disagree"):
+            Trade.from_api(p)
+
+    def test_neither_field_present_is_a_parse_error(self):
+        p = payload()
+        del p["taker_side"]
+        del p["taker_outcome_side"]
+        with pytest.raises(ParseError):
+            Trade.from_api(p)
+
     def test_a_missing_field_is_an_error(self):
         p = payload()
         del p["trade_id"]
@@ -138,6 +168,29 @@ class TestFillCheck:
         db = make_fill_db(tmp_path, [("no", "0.30", "0.70", "2.00", "2026-09-20T12:00:08+00:00")])
         v = check_fills(db)[0]
         assert v.supported and not v.covered
+
+    def test_runs_against_a_tape_written_by_the_historical_backfill_pipeline(self, tmp_path):
+        """A2/A3's `replace_ticker_tape` (the backfill's writer) must produce a table fillcheck can read with
+        NO changes -- it's the same schema/writer path the live recorder's upsert_trades uses, just a
+        different write pattern. Builds the tape via the real backfill function, not hand-written SQL."""
+        from btcbot.trade_tape import init_trade_tape_schema, replace_ticker_tape
+
+        path = tmp_path / "backfilled.sqlite"
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, ticker TEXT, side TEXT, size TEXT, entry_price TEXT, entry_ts TEXT,"
+                     " fee_paid TEXT, p_side_at_entry REAL, result TEXT, pnl_usd TEXT, exit_reason TEXT, exit_price TEXT)")
+        conn.execute("INSERT INTO trades (ticker, side, size, entry_price, entry_ts, fee_paid, p_side_at_entry) VALUES"
+                     " ('W','yes','5','0.30','2026-09-20T12:00:10+00:00','0',0.5)")
+        conn.commit()
+        init_trade_tape_schema(conn)
+        replace_ticker_tape(conn, "W", [
+            Trade(ticker="W", trade_id="t1", count=D("6.00"), yes_price=D("0.29"), no_price=D("0.71"),
+                 taker_side="no", created_time=datetime.fromisoformat("2026-09-20T12:00:08+00:00")),
+        ])
+        conn.close()
+
+        v = check_fills(path)[0]
+        assert v.supported and v.covered
 
     def test_a_recording_without_a_tape_is_an_error_and_the_cli_reports_it(self, tmp_path, capsys):
         path = tmp_path / "old.sqlite"

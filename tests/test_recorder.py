@@ -40,13 +40,32 @@ def make_orderbook(ticker, *, yes_bid="0.54", yes_size="10", no_bid="0.44", no_s
 
 
 class FakeKalshiSource:
-    """Scriptable stand-in for KalshiClient: each call pops the next outcome (last repeats), like test_client.py's Script."""
+    """Scriptable stand-in for KalshiClient: each call pops the next outcome (last repeats), like test_client.py's Script.
 
-    def __init__(self, *, markets=(), orderbooks=(), market_detail=None):
+    The historical-backfill methods (``list_historical_markets``, ``get_historical_cutoff``,
+    ``get_historical_trades``, ``get_market_candlesticks``, ``get_historical_candlesticks``) default to
+    empty/no-op so every EXISTING test that never passes those kwargs is unaffected; a test that cares about
+    them passes the matching kwarg explicitly, same convention as ``markets``/``orderbooks``."""
+
+    def __init__(
+        self, *, markets=(), orderbooks=(), market_detail=None,
+        historical_markets=(), historical_cutoff=None, live_trades=None, historical_trades=None,
+        live_candles=None, historical_candles=None,
+    ):
         self.markets_script = list(markets)
         self.orderbook_script = list(orderbooks)
         self.market_detail = {k: list(v) for k, v in (market_detail or {}).items()}
-        self.calls = {"list_markets": 0, "get_orderbook": 0, "get_market": 0}
+        self.historical_markets_script = list(historical_markets) if historical_markets else [[]]
+        self._historical_cutoff = historical_cutoff
+        self.live_trades = {k: list(v) for k, v in (live_trades or {}).items()}
+        self.historical_trades = {k: list(v) for k, v in (historical_trades or {}).items()}
+        self.live_candles = {k: list(v) for k, v in (live_candles or {}).items()}
+        self.historical_candles = {k: list(v) for k, v in (historical_candles or {}).items()}
+        self.calls = {
+            "list_markets": 0, "get_orderbook": 0, "get_market": 0, "list_historical_markets": 0,
+            "get_historical_cutoff": 0, "get_historical_trades": 0, "get_market_candlesticks": 0,
+            "get_historical_candlesticks": 0, "get_trades": 0,
+        }
 
     @staticmethod
     def _pop(script):
@@ -66,6 +85,44 @@ class FakeKalshiSource:
     async def get_market(self, ticker):
         self.calls["get_market"] += 1
         return self._pop(self.market_detail[ticker])
+
+    async def list_historical_markets(self, *, series_ticker):
+        self.calls["list_historical_markets"] += 1
+        return self._pop(self.historical_markets_script)
+
+    async def get_historical_cutoff(self):
+        self.calls["get_historical_cutoff"] += 1
+        if isinstance(self._historical_cutoff, Exception):
+            raise self._historical_cutoff
+        return self._historical_cutoff
+
+    async def get_trades(self, ticker, *, min_ts=None, max_pages=20):
+        self.calls["get_trades"] += 1
+        val = self.live_trades.get(ticker, [])
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    async def get_historical_trades(self, ticker, *, min_ts=None, max_ts=None, max_pages=200):
+        self.calls["get_historical_trades"] += 1
+        val = self.historical_trades.get(ticker, [])
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    async def get_market_candlesticks(self, series_ticker, ticker, *, start, end):
+        self.calls["get_market_candlesticks"] += 1
+        val = self.live_candles.get(ticker, [])
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    async def get_historical_candlesticks(self, ticker, *, start, end):
+        self.calls["get_historical_candlesticks"] += 1
+        val = self.historical_candles.get(ticker, [])
+        if isinstance(val, Exception):
+            raise val
+        return val
 
 
 class FakeClock:

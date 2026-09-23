@@ -15,9 +15,11 @@ from btcbot.market_level_pipeline import (
     adverse_exit_price,
     market_level_examples,
     realized_vol_from_candles,
+    rows_for_calibration,
     split_markets_by_time,
     train_and_validate_market_level,
 )
+from btcbot.models import MarketCandle
 from btcbot.model import ModelState, predict_p_yes
 from btcbot.paper_broker import taker_fee
 
@@ -36,6 +38,16 @@ def outcome(ticker, close_time, result, *, strike="80000"):
     return MarketOutcome(
         ticker=ticker, event_ticker=ticker.rsplit("-", 1)[0], open_time=close_time - timedelta(minutes=15),
         close_time=close_time, strike=None if strike is None else Decimal(strike), result=result,
+    )
+
+
+def market_candle(ticker, end_ts, *, yes_bid=None, yes_ask=None):
+    return MarketCandle(
+        ticker=ticker, end_ts=end_ts,
+        yes_bid_open=None, yes_bid_high=None, yes_bid_low=None, yes_bid_close=None if yes_bid is None else Decimal(yes_bid),
+        yes_ask_open=None, yes_ask_high=None, yes_ask_low=None, yes_ask_close=None if yes_ask is None else Decimal(yes_ask),
+        price_open=None, price_high=None, price_low=None, price_close=None, price_mean=None, price_previous=None,
+        volume=Decimal(1), open_interest=Decimal(1),
     )
 
 
@@ -84,6 +96,89 @@ class TestMarketLevelExamples:
         outcomes = [outcome("T0", T0, "yes")]
 
         assert market_level_examples(outcomes, candles) == []
+
+
+class TestMarketLevelExamplesOptionalMarketMid:
+    """A5: market_mid_at_decision is OFF by default and must not change existing (2-feature) behavior."""
+
+    def test_default_stays_off_and_reproduces_the_old_two_feature_schema(self):
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        outcomes = [outcome("T0", T0 + timedelta(minutes=3), "yes")]
+        examples = market_level_examples(outcomes, candles)  # market_candles not passed at all
+        assert set(examples[0][0]) == {"p_model", "sigma"}
+
+    def test_passing_market_candles_adds_the_feature_when_a_bar_exists(self):
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        close = T0 + timedelta(minutes=3)
+        outcomes = [outcome("T0", close, "yes")]
+        bars = {"T0": [market_candle("T0", close - timedelta(seconds=30), yes_bid="0.40", yes_ask="0.44")]}
+
+        examples = market_level_examples(outcomes, candles, market_candles=bars)
+
+        features, _ = examples[0]
+        assert set(features) == {"p_model", "sigma", "market_mid_at_decision"}
+        assert features["market_mid_at_decision"] == pytest.approx(0.42)
+
+    def test_uses_the_latest_bar_at_or_before_close_never_a_later_one(self):
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        close = T0 + timedelta(minutes=3)
+        outcomes = [outcome("T0", close, "yes")]
+        bars = {"T0": [
+            market_candle("T0", close - timedelta(minutes=1), yes_bid="0.30", yes_ask="0.30"),
+            market_candle("T0", close, yes_bid="0.50", yes_ask="0.50"),           # exactly at close: eligible
+            market_candle("T0", close + timedelta(minutes=1), yes_bid="0.90", yes_ask="0.90"),  # after close: must be ignored
+        ]}
+        examples = market_level_examples(outcomes, candles, market_candles=bars)
+        assert examples[0][0]["market_mid_at_decision"] == pytest.approx(0.50)
+
+    def test_no_bar_for_the_ticker_omits_the_feature_not_a_null(self):
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        outcomes = [outcome("T0", T0 + timedelta(minutes=3), "yes")]
+        examples = market_level_examples(outcomes, candles, market_candles={})
+        assert "market_mid_at_decision" not in examples[0][0]
+
+    def test_a_bar_with_no_quote_yet_omits_the_feature(self):
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        close = T0 + timedelta(minutes=3)
+        outcomes = [outcome("T0", close, "yes")]
+        bars = {"T0": [market_candle("T0", close, yes_bid=None, yes_ask=None)]}
+        examples = market_level_examples(outcomes, candles, market_candles=bars)
+        assert "market_mid_at_decision" not in examples[0][0]
+
+
+class TestRowsForCalibration:
+    def test_produces_calibration_report_shaped_rows(self):
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        close = T0 + timedelta(minutes=3)
+        outcomes = [outcome("T0", close, "yes")]
+        bars = {"T0": [market_candle("T0", close, yes_bid="0.40", yes_ask="0.44")]}
+
+        rows = rows_for_calibration(outcomes, candles, bars)
+
+        assert len(rows) == 1
+        r = rows[0]
+        assert set(r) == {"ticker", "tau_sec", "p_model", "yes_mid", "outcome_yes"}
+        assert r["ticker"] == "T0" and r["outcome_yes"] == 1 and r["yes_mid"] == pytest.approx(0.42)
+
+    def test_a_market_with_no_market_price_is_skipped_not_included_with_a_null(self):
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        outcomes = [outcome("T0", T0 + timedelta(minutes=3), "yes")]
+        assert rows_for_calibration(outcomes, candles, {}) == []
+
+    def test_plugs_straight_into_build_report_unchanged(self):
+        from btcbot.calibration_report import build_report
+
+        candles = [candle(T0 + timedelta(minutes=i), "80000") for i in range(5)]
+        rows = []
+        for i in range(12):
+            close = T0 + timedelta(hours=i)
+            rows += rows_for_calibration(
+                [outcome(f"T{i}", close, "yes" if i % 2 == 0 else "no")],
+                [candle(close - timedelta(minutes=j), "80000") for j in range(5)],
+                {f"T{i}": [market_candle(f"T{i}", close, yes_bid="0.40", yes_ask="0.44")]},
+            )
+        report = build_report(rows, at_tau_sec=0.0, min_n=1)
+        assert report["windows"] == 12  # build_report/one_row_per_window ran without modification
 
 
 class TestSplitMarketsByTime:

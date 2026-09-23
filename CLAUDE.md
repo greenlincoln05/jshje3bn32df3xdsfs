@@ -93,6 +93,16 @@ truth for scope and phases; the README has the phase status and a dated table of
   `trade_tape` table, one row per market/second/price/taker side (~13x smaller than raw prints). `btcbot fillcheck` uses it to ask
   whether a taker really printed at or through the price of each recorded fill; the paper broker itself is unchanged for now. A tape
   failure never stops a recording. Recordings made before this have no tape.
+- Historical backfill (`btcbot download-market-history`, `docs/research/kalshi-history-backfill-handoff.md`): a
+  RESUMABLE, PUBLIC/unauthenticated backfill of the trade tape and 1-minute market candlesticks for settled
+  `KXBTC15M` markets, using `/historical/*` (older records) and the existing live endpoints (newer ones), routed by
+  `GET /historical/cutoff`. Writes into the SAME `trade_tape` schema `Recorder` uses (via the shared
+  `btcbot.trade_tape` module: `upsert_trades` for the live poll, `replace_ticker_tape` for the backfill's
+  idempotent re-run) and a new `market_candles` table. Same rule as `record`/`stream`/`demo`/`download-history`: no
+  key, ever, and this session's own environment cannot reach Kalshi, so a real run is the owner's to do, never a
+  Claude Code session's. Kalshi does not serve historical order books at all -- depth still only comes from
+  `record`/`stream`. `market_level_pipeline.market_level_examples`'s optional `market_candles` param and
+  `btcbot disagree --history` are the only things wired to read this data so far; nothing else changed.
 - Polymarket (`polymarket_client.py`, `polymarket_recorder.py`, `btcbot record-polymarket`): READ-ONLY research into a
   SEPARATE venue, owner-driven exploration, not a numbered phase and not integrated with anything Kalshi. Public,
   unauthenticated GETs only (Gamma API for market discovery, CLOB API for order books) against Polymarket's own rolling
@@ -216,6 +226,8 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Train the coarse market-level calibration model from a download-history database instead, with a baseline comparison (offline): `.venv/Scripts/btcbot.exe ml-train --history data/history-....sqlite --out models/market_level.json`
 - Compare the four ML entry/exit layers on recorded data (offline): `.venv/Scripts/btcbot.exe ml-ablation --db data/recorder-....sqlite --entry-model models/entry.json --exit-model models/exit.json`
 - ONE-TIME backfill of settled markets + Coinbase candles, needs network (owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe download-history --start 2026-01-01T00:00:00Z --end 2026-09-01T00:00:00Z`
+- RESUMABLE backfill of the trade tape + 1-minute market candlesticks for settled markets, needs network (owner runs this, never a Claude Code session): `.venv/Scripts/btcbot.exe download-market-history --env prod --limit-markets 20` (smoke test), then `.venv/Scripts/btcbot.exe download-market-history --env prod --since 2026-01-01T00:00:00Z`
+- Model-vs-market disagreement report on a historical backfill instead of a features CSV (offline): `.venv/Scripts/btcbot.exe disagree --history data/history-....sqlite`
 - Fill-realism check of recorded fills against the public trade tape (offline): `.venv/Scripts/btcbot.exe fillcheck --db data/paper-....sqlite`
 - Testing any of the above against the real network: see `docs/running-live.md` (this session's own
   environment cannot reach Kalshi/Coinbase; that has to happen on the owner's machine).

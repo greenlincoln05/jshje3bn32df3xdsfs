@@ -42,7 +42,7 @@ import math
 import sqlite3
 import sys
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -57,12 +57,19 @@ from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.history_pipeline import (
     HistoryError,
     fetch_all_settled_markets,
+    fetch_market_candles,
+    fetch_market_trades,
     init_history_schema,
+    is_market_done,
     load_candles,
     load_market_outcomes,
+    log_run_event,
+    save_backfill_progress,
     save_candles,
+    save_market_candles,
     save_market_outcomes,
 )
+from btcbot.trade_tape import init_trade_tape_schema, replace_ticker_tape
 from btcbot.kalshi_client import HOSTS, KalshiAuth, KalshiAuthError, KalshiClient, KalshiError
 from btcbot.lab import (
     DEFAULT_GRID,
@@ -90,7 +97,7 @@ from btcbot.ml_pipeline import (
     train_and_validate_from_features,
 )
 from btcbot.model import CalibrationSummary, compute_calibration_report
-from btcbot.models import Market, OrderBook, ParseError, Series, Side, parse_time
+from btcbot.models import HistoricalCutoff, Market, OrderBook, ParseError, Series, Side, parse_time
 from btcbot.paper_broker import QueueAssumption
 from btcbot.recorder import Recorder, RecorderSummary
 from btcbot.spot_feed import CoinbaseSpotFeed, SpotBuffer
@@ -568,6 +575,164 @@ async def _cmd_download_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def _newest_history_db(data_dir: Path) -> Path | None:
+    files = sorted(data_dir.glob("history-*.sqlite"), key=lambda p: p.stat().st_mtime)
+    return files[-1] if files else None
+
+
+async def _cmd_download_market_history(args: argparse.Namespace) -> int:
+    """ONE-TIME (well, resumable) backfill of a Kalshi trade tape and 1-minute market candlesticks for
+    settled KXBTC15M markets -- see docs/research/kalshi-history-backfill-handoff.md. Public, unauthenticated
+    endpoints only (``/historical/*`` and the live equivalents), same rule as `download-history`: this
+    session's own environment cannot reach Kalshi, so this is the owner's to run for real, not something a
+    Claude Code session ever executes against a live response. Kalshi does NOT serve historical order books
+    -- depth still only comes from `record`/`stream`; nothing here backfills that."""
+    env = KalshiEnv(args.env) if args.env else KalshiSettings().env
+    series_ticker = args.series or "KXBTC15M"
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.db:
+        db_path, is_new = Path(args.db), not Path(args.db).exists()
+    else:
+        existing = _newest_history_db(data_dir)
+        if existing is not None:
+            db_path, is_new = existing, False
+        else:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            db_path, is_new = data_dir / f"history-{series_ticker}-{env.value}-{timestamp}.sqlite", True
+
+    try:
+        since = parse_time(args.since) if args.since else None
+        until = parse_time(args.until) if args.until else None
+    except ParseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    conn = sqlite3.connect(str(db_path))
+    init_history_schema(conn)
+    init_trade_tape_schema(conn)
+    print(f"{'Creating new' if is_new else 'Resuming'} database {db_path}", flush=True)
+
+    processed = skipped = failed = 0
+    total_trades = total_candles = zero_trade_windows = straddles = 0
+    earliest: datetime | None = None
+    latest: datetime | None = None
+    try:
+        async with KalshiClient(env) as client:
+            print("Backfilling market_outcomes (settled markets, live + historical listings)...", flush=True)
+            markets = await fetch_all_settled_markets(client, series_ticker=series_ticker)
+            written = save_market_outcomes(conn, markets)
+            print(f"  {written} settled markets known ({len(markets)} returned by the API).", flush=True)
+
+            targets = [m for m in markets if m.result is not None]
+            if since is not None:
+                targets = [m for m in targets if m.close_time >= since]
+            if until is not None:
+                targets = [m for m in targets if m.close_time < until]
+            targets.sort(key=lambda m: m.close_time)
+            if args.limit_markets is not None:
+                targets = targets[: args.limit_markets]
+            total = len(targets)
+            print(f"  {total} markets in range to backfill trades/candles for.", flush=True)
+
+            cutoff = await client.get_historical_cutoff()
+            cutoff_fetched_at = datetime.now(timezone.utc)
+            cutoff_lock = asyncio.Lock()
+            sem = asyncio.Semaphore(max(1, args.concurrency))
+            started = datetime.now(timezone.utc)
+
+            # Kalshi's real live/historical boundary keeps advancing while a run over tens of thousands of
+            # markets is in flight (hours, oldest-close-time-first). A cutoff fetched once at the start would
+            # silently stale-route recent/boundary markets to the live-only branch long after the real
+            # boundary moved past them, producing a permanent, undetectable empty result. Refresh it
+            # periodically instead of trusting the run-start snapshot for the whole run.
+            _CUTOFF_REFRESH_INTERVAL = timedelta(minutes=5)
+
+            async def current_cutoff() -> HistoricalCutoff:
+                nonlocal cutoff, cutoff_fetched_at
+                async with cutoff_lock:
+                    if datetime.now(timezone.utc) - cutoff_fetched_at > _CUTOFF_REFRESH_INTERVAL:
+                        cutoff = await client.get_historical_cutoff()
+                        cutoff_fetched_at = datetime.now(timezone.utc)
+                    return cutoff
+
+            async def do_one(i: int, market) -> None:
+                nonlocal processed, skipped, failed, total_trades, total_candles, zero_trade_windows, straddles
+                nonlocal earliest, latest
+                async with sem:
+                    need_trades, need_candles = not args.no_trades, not args.no_candles
+                    if is_market_done(conn, market.ticker, need_trades=need_trades, need_candles=need_candles):
+                        skipped += 1
+                        return
+                    if args.sleep_ms:
+                        await asyncio.sleep(args.sleep_ms / 1000)
+                    try:
+                        this_cutoff = await current_cutoff()
+                        n_trades = n_candles = 0
+                        if not args.no_trades:
+                            trades, straddle = await fetch_market_trades(client, market, this_cutoff)
+                            if straddle is not None:
+                                straddles += 1
+                                log_run_event(conn, "routing_straddle", f"{market.ticker}: trades window straddled the historical/live cutoff")
+                            n_trades = replace_ticker_tape(conn, market.ticker, trades) if trades else 0
+                            if not trades:
+                                zero_trade_windows += 1
+                        if not args.no_candles:
+                            candles, straddle2 = await fetch_market_candles(client, series_ticker, market, this_cutoff)
+                            if straddle2 is not None:
+                                straddles += 1
+                                log_run_event(conn, "routing_straddle", f"{market.ticker}: candles window straddled the historical/live cutoff")
+                            n_candles = save_market_candles(conn, candles)
+                        save_backfill_progress(
+                            conn, market.ticker, trades_done=not args.no_trades, candles_done=not args.no_candles,
+                            trade_count=n_trades, fetched_at=datetime.now(timezone.utc),
+                        )
+                    except (KalshiError, ParseError, sqlite3.Error) as exc:
+                        failed += 1
+                        print(f"  [{i}/{total}] FAILED {market.ticker}: {exc}", file=sys.stderr, flush=True)
+                        return
+                    processed += 1
+                    total_trades += n_trades
+                    total_candles += n_candles
+                    if earliest is None or market.close_time < earliest:
+                        earliest = market.close_time
+                    if latest is None or market.close_time > latest:
+                        latest = market.close_time
+                    if processed % 20 == 0 or processed == total:
+                        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+                        rate = processed / elapsed if elapsed > 0 else 0
+                        remaining = total - processed - skipped - failed
+                        eta = f"{remaining / rate:.0f}s" if rate > 0 else "?"
+                        print(
+                            f"  [{processed + skipped + failed}/{total}] {market.ticker}: "
+                            f"{total_trades} trades, {total_candles} candles so far, ETA {eta}", flush=True,
+                        )
+
+            await asyncio.gather(*(do_one(i, market) for i, market in enumerate(targets, 1)))
+    except (KalshiError, HistoryError, ParseError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        conn.close()
+        return 1
+    except asyncio.CancelledError:
+        conn.close()
+        raise
+    finally:
+        conn.close()
+
+    span = f"{earliest.isoformat()} to {latest.isoformat()}" if earliest and latest else "n/a"
+    print(
+        f"\nDone. Markets: {processed} processed, {skipped} already done (skipped), {failed} failed.\n"
+        f"Trade tape: {total_trades} contracts' worth aggregated. Market candles: {total_candles} bars.\n"
+        f"Windows with zero trades: {zero_trade_windows}. Windows straddling the historical/live cutoff: {straddles}.\n"
+        f"Date span covered this run: {span}.\n"
+        f"Database: {db_path}\n"
+        "This is raw historical data, not a profitability claim; Kalshi does not serve historical order books, "
+        "so depth still only comes from `btcbot record`/`btcbot stream`."
+    )
+    return 0 if failed == 0 else 1
+
+
 async def _cmd_lab(args: argparse.Namespace) -> int:
     """Sweep entry timing / price band / trend / account size / risk sizing on recorded data, ranked on a
     training slice and judged on a held-out test slice. Offline: no network, no credentials."""
@@ -701,13 +866,30 @@ async def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 async def _cmd_disagree(args: argparse.Namespace) -> int:
-    """Calibration and model-vs-market disagreement report on a features CSV. Offline: no network, no key."""
+    """Calibration and model-vs-market disagreement report on a features CSV, OR (``--history``) on a
+    `btcbot download-market-history` database -- the only source with a market price for windows this old.
+    Offline: no network, no key."""
     from btcbot.calibration_report import build_report, render
-    from btcbot.features import read_csv
 
     try:
+        if args.history:
+            from btcbot.history_pipeline import load_candles, load_market_candles, load_market_outcomes
+            from btcbot.market_level_pipeline import rows_for_calibration
+
+            conn = sqlite3.connect(args.history)
+            try:
+                outcomes, candles, mcandles = load_market_outcomes(conn), load_candles(conn), load_market_candles(conn)
+            finally:
+                conn.close()
+            by_ticker: dict[str, list] = {}
+            for c in mcandles:
+                by_ticker.setdefault(c.ticker, []).append(c)
+            rows = rows_for_calibration(outcomes, candles, by_ticker)
+            print(render(build_report(rows, at_tau_sec=0.0, field="p_model", min_n=args.min_n)))
+            return 0
+        from btcbot.features import read_csv
         print(render(build_report(read_csv(args.features), at_tau_sec=args.at_tau, field=args.field, min_n=args.min_n)))
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
@@ -1288,6 +1470,25 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--output", help="explicit database path (default: a timestamped file in --data-dir)")
     download.set_defaults(handler=_cmd_download_history)
 
+    download_mh = commands.add_parser(
+        "download-market-history",
+        help="RESUMABLE backfill: Kalshi trade tape + 1-minute market candlesticks for settled markets into "
+        "SQLite (public data, no key -- owner-run: this session's environment cannot reach Kalshi; no "
+        "historical order books exist, this does not backfill depth)",
+    )
+    download_mh.add_argument("--env", choices=envs, help="Kalshi environment (default: KALSHI_ENV, else demo)")
+    download_mh.add_argument("--series", help="override series_ticker from config.yaml (default: KXBTC15M)")
+    download_mh.add_argument("--db", help="database to write/resume (default: the newest data/history-*.sqlite, or a fresh one)")
+    download_mh.add_argument("--data-dir", default="data", help="directory to look for/create the database in (default: ./data)")
+    download_mh.add_argument("--since", help="only markets closing at/after this ISO 8601 timestamp")
+    download_mh.add_argument("--until", help="only markets closing before this ISO 8601 timestamp")
+    download_mh.add_argument("--limit-markets", type=int, help="stop after this many markets (for a smoke test, e.g. 20)")
+    download_mh.add_argument("--no-trades", action="store_true", help="skip the trade tape, candles only")
+    download_mh.add_argument("--no-candles", action="store_true", help="skip market candlesticks, trades only")
+    download_mh.add_argument("--concurrency", type=int, default=2, help="markets fetched at once (default: 2, be polite)")
+    download_mh.add_argument("--sleep-ms", type=int, default=250, help="pause before each market's requests, in ms (default: 250)")
+    download_mh.set_defaults(handler=_cmd_download_market_history)
+
     lab = commands.add_parser(
         "lab",
         help="strategy lab: sweep entry timing, price band, trend, account size, risk sizing; judged on held-out windows",
@@ -1337,8 +1538,9 @@ def build_parser() -> argparse.ArgumentParser:
     retrain_check.set_defaults(handler=_cmd_retrain_check)
 
     disagree = commands.add_parser(
-        "disagree", help="calibration + model-vs-market disagreement report on a features CSV (offline)")
+        "disagree", help="calibration + model-vs-market disagreement report on a features CSV, or --history (offline)")
     disagree.add_argument("--features", default="data/research/features.csv")
+    disagree.add_argument("--history", help="a `btcbot download-market-history` database instead of --features (uses its market_candles for the market price)")
     disagree.add_argument("--field", choices=["p_model", "p_blend"], default="p_model")
     disagree.add_argument("--at-tau", type=float, default=300.0, help="read each window this many seconds before close (default: 300)")
     disagree.add_argument("--min-n", type=int, default=10, help="buckets with fewer windows are marked small (default: 10)")

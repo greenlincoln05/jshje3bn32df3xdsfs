@@ -204,6 +204,46 @@ the order that lost. Nothing is raised to win a loss back. Test it in the Strate
 `max_growth_pct` are lab keys: `btcbot lab --grid risk_pct=1,2,5 --grid max_growth_pct=none,10,25`), on paper
 or demo only. It compounds whatever the strategy does: with no edge it just loses faster at a larger size.
 
+## 4f. Historical trade tape + market candlestick backfill (no credentials, needs network)
+
+Public/unauthenticated `/historical/*` endpoints, same rule as `download-history` below: no key, ever, and
+this only works on your own machine. **Smoke test first**, small and cheap:
+
+```powershell
+btcbot download-market-history --env prod --limit-markets 20
+```
+
+Check the summary it prints (markets processed/failed, trade tape rows, candle bars, windows with zero
+trades) before committing to a real range. Then the real backfill, which can take a long time (thousands of
+markets, each its own set of requests) and is safe to interrupt with Ctrl-C -- re-running the same command
+resumes from where it left off, skipping markets it already finished:
+
+```powershell
+btcbot download-market-history --env prod --since 2026-01-01T00:00:00Z
+```
+
+`--db <path>` points it at an existing `history-*.sqlite` (e.g. one `download-history` already made, so the
+Coinbase candles it needs for `market_level_pipeline`/`btcbot disagree --history` are already there) instead
+of creating a fresh one. `--no-trades`/`--no-candles` skip one half if you only want the other.
+`--concurrency`/`--sleep-ms` control how polite it is to Kalshi's rate limit (defaults: 2 markets at once,
+250 ms pause before each). Kalshi does not serve historical order books at all -- this never backfills
+depth, only `record`/`stream` do that, live.
+
+```powershell
+btcbot fillcheck --db data/history-KXBTC15M-prod-<timestamp>.sqlite
+```
+
+Runs unchanged against a backfilled database, same as a live recording, once you also have a `trades` table
+to check (from `paper`/`demo`, or a future tape-aware backtest) alongside the backfilled tape.
+
+```powershell
+btcbot disagree --history data/history-KXBTC15M-prod-<timestamp>.sqlite
+```
+
+The model-vs-market-price reliability report, but for historical windows -- needs BOTH the market candles
+this command backfills AND the Coinbase spot candles `download-history` backfills in the same database, or
+it has nothing to price against and reports zero usable windows (not an error, just nothing to show yet).
+
 ## 5. Dashboard (optional, no credentials, no network needed)
 
 ```powershell
