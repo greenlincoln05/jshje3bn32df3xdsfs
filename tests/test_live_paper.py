@@ -386,6 +386,32 @@ class TestRiskIntegration:
         assert any(e[1] == "risk_resumed" for e in events)
         trader.close()
 
+    async def test_a_transient_rejection_is_not_logged_as_the_sticky_pause(self, tmp_path):
+        # exceeds max_open_exposure_usd (unlike the consecutive-loss pause) self-heals on its own as soon as
+        # exposure frees up -- it must never be logged via risk_blocked_order, the event btcbot watch treats
+        # as "still paused, needs a resume-file or restart", or one transient rejection would leave watch.py
+        # falsely reporting RISK-PAUSED forever even after the run goes right back to trading normally.
+        conn = sqlite3.connect(":memory:")
+        config = BotConfig(
+            sizing=Sizing(mode="fixed"),
+            risk={
+                "max_contracts_per_trade": 10, "max_open_exposure_usd": Decimal("0.01"),
+                "daily_loss_limit_usd": Decimal("20"), "max_consecutive_losses": 5, "max_trades_per_hour": 12,
+            },
+        )
+        events = []
+        trader, buffer = make_trader(
+            conn, config=config, log_event=lambda level, event, detail: events.append((level, event, detail))
+        )
+        market = make_market(TICKER)
+        for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+            feed_fresh_spot(trader, buffer, ts=T0 + timedelta(seconds=offset))
+            await trader.on_orderbook_snapshot(market, make_book(yes_size=str(size)), T0 + timedelta(seconds=offset))
+        assert trader.risk.is_paused is False
+        assert trader._resting_order_id is None  # never affordable given the tiny exposure cap
+        assert not any(e[1] == "risk_blocked_order" for e in events)
+        trader.close()
+
 
 class TestSettlementArrivingBeforeTheNextWindow:
     """Regression: on a real prod run, windows 2 and 3 filled but were never logged, because Kalshi finalized them

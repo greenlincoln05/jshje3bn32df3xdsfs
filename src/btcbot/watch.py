@@ -86,7 +86,9 @@ def render(items: list[DbHealth]) -> str:
     lines = []
     for h in items:
         state = "STALE - nothing written recently; the process may have stopped" if h.stale else "ok (written recently)"
-        if h.risk_paused:
+        if h.risk_paused and h.stale:
+            state += " (also RISK-PAUSED as of its last write)"
+        elif h.risk_paused:
             state += " -- BUT RISK-PAUSED: still polling/predicting, but every new order is being vetoed (e.g. " \
                      "max_consecutive_losses); create a resume-file (see `btcbot paper --help`) or restart to trade again"
         wr = "-" if not h.resolved else f"{h.wins}/{h.resolved} ({h.wins / h.resolved:.0%})"
