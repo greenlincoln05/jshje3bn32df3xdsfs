@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -123,6 +123,8 @@ class DemoTrader(LivePaperTrader):
         *,
         maker_fee_multiplier: Decimal = Decimal(0),
         kill_file: str = "KILL",
+        resume_file: str = "RESUME",
+        log_event: Callable[[str, str, str], None] | None = None,
     ) -> None:
         if getattr(client, "env", None) is not KalshiEnv.DEMO:
             raise KalshiWriteNotAllowedError("DemoTrader only runs against the DEMO environment")
@@ -130,6 +132,7 @@ class DemoTrader(LivePaperTrader):
         super().__init__(
             conn, config, spot_buffer, queue_assumption=QueueAssumption.OPTIMISTIC,
             maker_fee_multiplier=maker_fee_multiplier, kill_file=kill_file,
+            resume_file=resume_file, log_event=log_event,
         )
         conn.executescript(DEMO_SCHEMA)
         conn.commit()

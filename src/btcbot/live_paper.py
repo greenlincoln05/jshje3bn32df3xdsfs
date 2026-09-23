@@ -28,9 +28,11 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from btcbot.backtest import BacktestReport, TradeRecord, _apply_exit, build_report, init_trades_schema, log_trade
@@ -68,6 +70,8 @@ class LivePaperTrader:
         queue_assumption: QueueAssumption = QueueAssumption.OPTIMISTIC,
         maker_fee_multiplier: Decimal = Decimal("0"),
         kill_file: str = "KILL",
+        resume_file: str = "RESUME",
+        log_event: Callable[[str, str, str], None] | None = None,
     ) -> None:
         init_predictions_schema(conn)
         init_trades_schema(conn)
@@ -80,6 +84,14 @@ class LivePaperTrader:
         self._backend = PaperExecutionBackend(self._broker)
         self._risk = RiskManager(config.risk, kill_file=kill_file, clock=lambda: self.last_ts or datetime.now(timezone.utc))
         self._vol = TimedVolatility(config.vol_window_sec)
+        # A risk-manager pause (e.g. max_consecutive_losses) blocks every future order with no exception and no
+        # exchange-facing event, so without this it is silent: predictions/orderbook activity looks identical to a
+        # healthy run. ``resume_file`` is the live, no-restart way back (RiskManager.resume() is otherwise never
+        # called); ``log_event`` (typically Recorder.log_event on the same run's database) makes the pause and any
+        # later resume visible in run_log instead of only reconstructable after the fact from trades/settlements.
+        self._resume_file = Path(resume_file)
+        self._on_log_event = log_event
+        self._last_risk_block_reason: str | None = None
 
         self._current_ticker: str | None = None
         self._resting_order_id: str | None = None
@@ -121,6 +133,10 @@ class LivePaperTrader:
     def risk(self) -> RiskManager:
         return self._risk
 
+    def _emit(self, level: str, event: str, detail: str) -> None:
+        if self._on_log_event is not None:
+            self._on_log_event(level, event, detail)
+
     @property
     def bankroll(self) -> Decimal:
         """Starting account plus settled profit and loss (sizing mode "percent" grows bets from this)."""
@@ -143,6 +159,13 @@ class LivePaperTrader:
         self.first_ts = self.first_ts or poll_ts
         self.last_ts = poll_ts
         self._tickers_seen.add(market.ticker)
+
+        if self._risk.is_paused and self._resume_file.exists():
+            losses = self._risk.consecutive_losses
+            self._risk.resume()
+            self._resume_file.unlink(missing_ok=True)  # one-shot: consume the trigger
+            self._last_risk_block_reason = None
+            self._emit("warning", "risk_resumed", f"manually resumed via {self._resume_file} (was paused after {losses} consecutive losses)")
 
         if market.ticker != self._current_ticker:
             if self._current_ticker is not None:
@@ -229,6 +252,7 @@ class LivePaperTrader:
         if decision.action is Action.REST:
             approval = self._risk.check_new_order(size=decision.size, price=decision.price, now=poll_ts)
             if approval.approved:
+                self._last_risk_block_reason = None
                 order_id = await self._place_resting(decision, poll_ts)
                 if order_id is not None:  # None: the exchange rejected it, so nothing rests and no exposure is taken
                     self._resting_order_id = order_id
@@ -236,6 +260,11 @@ class LivePaperTrader:
                     self._resting_order_price = decision.price
                     self._last_order_size = decision.size
                     self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
+            elif approval.reason != self._last_risk_block_reason:
+                # Log only on a change of reason, not every tick: while paused this branch would otherwise fire
+                # once per second for however many hours the pause lasts.
+                self._last_risk_block_reason = approval.reason
+                self._emit("warning", "risk_blocked_order", approval.reason)
         elif decision.action is Action.CANCEL and self._resting_order_id is not None:
             await self._cancel_resting()
         elif decision.action is Action.EXIT and self._position is not None:
@@ -307,12 +336,19 @@ class LivePaperTrader:
                     "exchange_status": "not_applicable",
                 })
         positions = list(self._pending_settlements.values()) + ([self._position] if self._position else [])
-        payload = {"stopped": stopped, "active_orders": orders, "open_positions": [
-            {"ticker": p.ticker, "side": p.side, "size": str(p.size), "entry_price": str(p.entry_price),
-             "entry_ts": p.entry_ts.isoformat(), "fee_paid": str(p.fee_paid),
-             "cost_usd": str(p.entry_price * p.size), "pnl_usd": None, "result": None,
-             "state": "simulated_awaiting_resolution", "source": "paper_runtime"} for p in positions
-        ]}
+        payload = {
+            "stopped": stopped, "active_orders": orders, "open_positions": [
+                {"ticker": p.ticker, "side": p.side, "size": str(p.size), "entry_price": str(p.entry_price),
+                 "entry_ts": p.entry_ts.isoformat(), "fee_paid": str(p.fee_paid),
+                 "cost_usd": str(p.entry_price * p.size), "pnl_usd": None, "result": None,
+                 "state": "simulated_awaiting_resolution", "source": "paper_runtime"} for p in positions
+            ],
+            # A risk-manager pause blocks every future order silently (no exception, nothing exchange-facing) --
+            # without this, a paused run looks identical to a healthy one here: still writing snapshots, still
+            # producing predictions, just never trading again until RiskManager.resume() is called.
+            "risk_paused": self._risk.is_paused,
+            "risk_consecutive_losses": self._risk.consecutive_losses,
+        }
         encoded = json.dumps(payload)
         if (encoded == self._last_monitor_payload and self._last_monitor_ts is not None
                 and 0 <= (ts - self._last_monitor_ts).total_seconds() < 1):

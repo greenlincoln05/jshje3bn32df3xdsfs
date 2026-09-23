@@ -1216,7 +1216,8 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
         spot_buffer = SpotBuffer()
         trader = DemoTrader(
             trader_conn, config, spot_buffer, client, maker_fee_multiplier=maker_fee_multiplier,
-            kill_file=args.kill_file,
+            kill_file=args.kill_file, resume_file=args.resume_file,
+            log_event=lambda level, event, detail: recorder.log_event(event, detail, level=level),
         )
         recorder.on_orderbook = trader.on_orderbook_snapshot
         recorder.on_settlement = trader.on_settlement
@@ -1339,6 +1340,8 @@ async def _cmd_paper(args: argparse.Namespace) -> int:
             queue_assumption=queue_assumption,
             maker_fee_multiplier=maker_fee_multiplier,
             kill_file=args.kill_file,
+            resume_file=args.resume_file,
+            log_event=lambda level, event, detail: recorder.log_event(event, detail, level=level),
         )
         recorder.on_orderbook = trader.on_orderbook_snapshot
         recorder.on_settlement = trader.on_settlement
@@ -1623,6 +1626,10 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument(
         "--kill-file", default="KILL", help="creating this file stops trading and cancels open orders (default: ./KILL)"
     )
+    demo.add_argument(
+        "--resume-file", default="RESUME",
+        help="creating this file clears a risk-manager pause (e.g. max_consecutive_losses) without restarting (default: ./RESUME)",
+    )
     demo.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)")
     demo.add_argument("--plumbing", action="store_true",
                       help="thin-demo-book test mode: relax spread/depth filters and bid inside the spread (tests the machinery, not the strategy)")
@@ -1674,6 +1681,10 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--data-dir", default="data", help="directory for the SQLite database (default: ./data)")
     paper.add_argument(
         "--kill-file", default="KILL", help="creating this file stops trading, cancelling any open order (default: ./KILL)"
+    )
+    paper.add_argument(
+        "--resume-file", default="RESUME",
+        help="creating this file clears a risk-manager pause (e.g. max_consecutive_losses) without restarting (default: ./RESUME)",
     )
     paper.add_argument(
         "--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)"
