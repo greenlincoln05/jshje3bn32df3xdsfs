@@ -63,3 +63,22 @@ def test_no_risk_events_is_not_flagged(tmp_path):
     got = {h.kind: h for h in summarize(tmp_path, stale_min=5)}
     assert got["paper(prod)"].risk_paused is False
     assert "RISK-PAUSED" not in render(list(got.values()))
+
+
+def test_a_stale_and_risk_paused_db_gets_a_non_contradictory_message(tmp_path):
+    # A process that paused and then also stopped writing entirely must not claim it's "still
+    # polling/predicting" (the message the not-stale RISK-PAUSED branch uses) while also being flagged STALE.
+    conn = make_db(tmp_path, "paper-x.sqlite")
+    _log(conn, "risk_blocked_order")
+    conn.close()  # checkpoint WAL back into the main file so no -wal file is left with a fresh mtime
+    old = time.time() - 3600
+    for suffix in ("", "-wal", "-journal", "-shm"):
+        p = tmp_path / f"paper-x.sqlite{suffix}"
+        if p.exists():
+            os.utime(p, (old, old))
+    got = {h.kind: h for h in summarize(tmp_path, stale_min=5)}
+    h = got["paper(prod)"]
+    assert h.stale is True and h.risk_paused is True
+    rendered = render([h])
+    assert "STALE" in rendered and "RISK-PAUSED" in rendered
+    assert "still polling/predicting" not in rendered

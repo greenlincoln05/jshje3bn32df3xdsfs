@@ -40,12 +40,12 @@ def make_book(yes_price="0.30", yes_size="15", no_price="0.68", no_size="15"):
     )
 
 
-def make_trader(conn, *, config=None, buffer=None, **kwargs):
+def make_trader(conn, *, config=None, buffer=None, kill_file=NO_KILL_FILE, **kwargs):
     buffer = buffer or SpotBuffer(window_sec=5.0, stale_after_sec=3.0)
     # Fixed-size by default: percent-of-account is the shipped live default (test_percent_sizing.py), but a
     # bare "5 contracts every order" is what most of this file's tests actually rely on for order-mechanics
     # assertions unrelated to sizing mode. Tests exercising a specific mode pass their own `config=`.
-    trader = LivePaperTrader(conn, config or BotConfig(sizing=Sizing(mode="fixed")), buffer, kill_file=NO_KILL_FILE, **kwargs)
+    trader = LivePaperTrader(conn, config or BotConfig(sizing=Sizing(mode="fixed")), buffer, kill_file=kill_file, **kwargs)
     return trader, buffer
 
 
@@ -410,6 +410,27 @@ class TestRiskIntegration:
         assert trader.risk.is_paused is False
         assert trader._resting_order_id is None  # never affordable given the tiny exposure cap
         assert not any(e[1] == "risk_blocked_order" for e in events)
+        trader.close()
+
+    async def test_a_kill_file_rejection_is_logged_the_same_way_as_a_pause(self, tmp_path):
+        # The KILL file is the OTHER sticky rejection (risk.py's is_paused is not the only one): it never
+        # self-heals either -- only deleting the file clears it -- so it must be logged too, the same as the
+        # consecutive-loss pause, or a kill-switched run would silently look "ok" to btcbot watch.
+        conn = sqlite3.connect(":memory:")
+        kill_file = tmp_path / "KILL"
+        kill_file.write_text("stop")
+        events = []
+        trader, buffer = make_trader(
+            conn, kill_file=str(kill_file),
+            log_event=lambda level, event, detail: events.append((level, event, detail)),
+        )
+        market = make_market(TICKER)
+        for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+            feed_fresh_spot(trader, buffer, ts=T0 + timedelta(seconds=offset))
+            await trader.on_orderbook_snapshot(market, make_book(yes_size=str(size)), T0 + timedelta(seconds=offset))
+        assert trader._resting_order_id is None
+        blocked = [e for e in events if e[1] == "risk_blocked_order"]
+        assert len(blocked) == 1 and "KILL" in blocked[0][2]
         trader.close()
 
 

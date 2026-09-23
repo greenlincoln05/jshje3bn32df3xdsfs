@@ -262,13 +262,14 @@ class LivePaperTrader:
                     self._risk.record_order_opened(size=decision.size, price=decision.price, now=poll_ts)
             elif approval.reason != self._last_risk_block_reason:
                 self._last_risk_block_reason = approval.reason
-                # Only the sticky consecutive-loss pause is worth a run_log event (and the only thing
-                # btcbot watch treats as "still blocked"): every other rejection here (exposure cap,
-                # trades-per-hour, daily loss limit, size-after-a-loss) self-heals within a poll or two as
-                # positions close / the rolling window ages out, with no operator action needed. Logging
-                # those the same way would leave watch.py permanently reporting "RISK-PAUSED" after one
-                # transient, already-resolved rejection.
-                if self._risk.is_paused:
+                # Only the two STICKY rejections are worth a run_log event (and the only things btcbot
+                # watch treats as "still blocked"): the consecutive-loss pause (cleared only by resume())
+                # and the kill-file (cleared only by deleting it). Every other rejection here (exposure
+                # cap, trades-per-hour, daily loss limit, size-after-a-loss) self-heals within a poll or
+                # two as positions close / the rolling window ages out, with no operator action needed.
+                # Logging those the same way would leave watch.py permanently reporting "RISK-PAUSED"
+                # after one transient, already-resolved rejection.
+                if self._risk.is_paused or self._risk.kill_switch_active():
                     self._emit("warning", "risk_blocked_order", approval.reason)
         elif decision.action is Action.CANCEL and self._resting_order_id is not None:
             await self._cancel_resting()
