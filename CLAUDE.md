@@ -111,7 +111,20 @@ truth for scope and phases; the README has the phase status and a dated table of
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
   the file by hand; that is not a Claude Code session using a key (nobody here ever sees the value, since it
   goes from the owner's browser straight to their own disk), and it still doesn't add anywhere for that key
-  to place an order -- the same Phase 6 gate applies to any future addition here.
+  to place an order -- the same Phase 6 gate applies to any future addition here. Its Settings tab also has a
+  "Trading config (config.yaml)" panel (`GET`/`POST /api/config`, `EDITABLE_CONFIG_FIELDS`): a deliberately
+  small, numeric-only allowlist (account size, risk caps, min edge, min/max price, contracts) patched into
+  the raw YAML text line-by-line -- the same "surgical patch, never a full re-serialize" approach
+  `write_env_settings` already used for `.env`, so a heavily-commented `config.yaml` never loses a comment to
+  a plain `yaml.dump` round-trip. Every edit is validated against `BotConfig` BEFORE anything is written;  a
+  bad value (out of range, wrong type) is rejected and the file is left untouched. `sizing.mode` itself (and
+  any other structural choice) is deliberately NOT editable here -- still a file edit, never a dashboard
+  click. The Portfolio tab also shows "windows traded" (distinct 15-min markets with a recorded fill) versus
+  "windows seen" (distinct markets in `orderbook_snapshots`, i.e. the trailing prior dashboard's own
+  `paper_summary()` metric, dropped by the Terminal redesign (PR #52) and restored in `dashboard_analytics.py`).
+  `list_databases()` now labels a `polymarket-*.sqlite` recording as its own kind rather than "unknown", and
+  the Strategy Lab's own recording checklist excludes it explicitly (its `pm_`-prefixed schema has none of
+  the Kalshi tables a lab replay reads).
 
 - `stream_recorder.py` (`btcbot stream`) is a READ-ONLY authenticated WebSocket capture of BRTI
   (`cfbenchmarks_value`, `cfbenchmarks_value_5hz`) and order-book deltas. It sends only `subscribe` /

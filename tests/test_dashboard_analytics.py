@@ -94,6 +94,40 @@ def test_complete_ledger_metrics_use_decimal_and_settlement_order(tmp_path):
     assert [item["ticker"] for item in view["trade_history"]] == ["EVEN", "WIN", "LOSS"]
 
 
+def test_windows_traded_counts_distinct_tickers_not_trades(tmp_path):
+    path = database(tmp_path)
+    trade(path, ticker="A", minute=0, settled_minute=1)
+    trade(path, ticker="A", minute=2, settled_minute=3)  # same window traded twice
+    trade(path, ticker="B", minute=4, settled_minute=5)
+    view = portfolio_view(path, D("100"))
+    assert view["trade_count"] == 3
+    assert view["windows_traded"] == 2  # A and B, not 3
+    assert view["windows_seen"] is None  # no orderbook_snapshots table recorded for this database
+
+
+def test_windows_seen_counts_every_recorded_market_even_untraded_ones(tmp_path):
+    path = database(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE orderbook_snapshots (id INTEGER PRIMARY KEY, ticker TEXT, poll_ts TEXT)")
+        conn.executemany(
+            "INSERT INTO orderbook_snapshots (ticker, poll_ts) VALUES (?, ?)",
+            [("A", timestamp(0)), ("A", timestamp(1)), ("B", timestamp(2)), ("C", timestamp(3))],
+        )
+    trade(path, ticker="A", minute=0, settled_minute=1)
+    view = portfolio_view(path, D("100"))
+    assert view["windows_traded"] == 1
+    assert view["windows_seen"] == 3  # A, B, C recorded; only A was ever traded
+
+
+def test_demo_windows_traded_counts_distinct_tickers_across_demo_orders(tmp_path):
+    path = database(tmp_path, demo=True)
+    demo_order(path, ticker="A", minute=0)
+    demo_order(path, ticker="A", minute=1, price="0.4")
+    demo_order(path, ticker="B", minute=2)
+    view = portfolio_view(path, D("100"))
+    assert view["windows_traded"] == 2
+
+
 def test_missing_settlement_times_are_explicit_entry_proxies(tmp_path):
     path = database(tmp_path)
     trade(path, ticker="A", minute=0, settled_minute=20)

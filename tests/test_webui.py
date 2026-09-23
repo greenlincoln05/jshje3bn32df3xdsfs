@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from btcbot.backtest import TradeRecord, init_trades_schema, log_trade
+from btcbot.config import BotConfig
 from btcbot.recorder import Recorder
 from btcbot.webui import (
     _resolve_db,
@@ -351,6 +352,70 @@ class TestSettingsEndpoint:
         assert status == 400
 
 
+class TestConfigEndpoint:
+    def test_get_reflects_the_loaded_config(self, dashboard):
+        default = BotConfig()
+        status, body = _get(dashboard.base_url, "/api/config")
+        assert status == 200
+        assert body["account_usd"] == str(default.sizing.account_usd)
+        assert body["min_edge"] == str(default.min_edge)
+        assert body["sizing_mode"] == default.sizing.mode.value
+
+    def _write_full_config(self, dashboard):
+        # The fixture's own config.yaml is deliberately minimal ("mode: paper", relying on code defaults),
+        # but a patch can only replace a KEY THAT IS ALREADY WRITTEN OUT -- the same as the real shipped
+        # config.yaml, which spells out every one of these keys explicitly (see test_config.py). Using a
+        # fuller file here matches what this endpoint actually edits in practice.
+        dashboard.config_path.write_text(
+            "mode: paper\nmin_edge: 0.04\nmin_price: 0.15\nmax_price: 0.65   # a comment to prove it survives\n"
+            "sizing:\n  contracts_per_trade: 5\n  account_usd: 500\n  risk_pct_per_trade: 0.5\n"
+            "risk:\n  max_contracts_per_trade: 10\n  max_open_exposure_pct: 5\n  daily_loss_limit_pct: 4\n",
+            encoding="utf-8",
+        )
+
+    def test_post_patches_only_the_requested_keys_and_preserves_the_rest_of_the_file(self, dashboard):
+        self._write_full_config(dashboard)
+        original = dashboard.config_path.read_text(encoding="utf-8")
+        status, body = _post(dashboard.base_url, "/api/config", {"account_usd": "750", "min_edge": "0.06"})
+        assert status == 200
+        assert body["account_usd"] == "750" and body["min_edge"] == "0.06"
+        patched = dashboard.config_path.read_text(encoding="utf-8")
+        assert "account_usd: 750" in patched and "min_edge: 0.06" in patched
+        assert "max_price: 0.65   # a comment to prove it survives" in patched  # untouched, comment intact
+        # every other line is untouched
+        untouched = [line for line in original.splitlines() if "account_usd" not in line and "min_edge" not in line]
+        for line in untouched:
+            assert line in patched.splitlines()
+
+    def test_an_unknown_key_is_rejected_and_nothing_is_written(self, dashboard):
+        self._write_full_config(dashboard)
+        original = dashboard.config_path.read_text(encoding="utf-8")
+        status, body = _post(dashboard.base_url, "/api/config", {"sizing_mode": "ramp"})
+        assert status == 400
+        assert dashboard.config_path.read_text(encoding="utf-8") == original
+
+    def test_a_value_outside_the_valid_range_is_rejected_and_nothing_is_written(self, dashboard):
+        self._write_full_config(dashboard)
+        original = dashboard.config_path.read_text(encoding="utf-8")
+        status, body = _post(dashboard.base_url, "/api/config", {"risk_pct_per_trade": "50"})  # max is 10
+        assert status == 400
+        assert dashboard.config_path.read_text(encoding="utf-8") == original
+
+    def test_a_key_missing_from_the_file_is_a_clean_400_not_a_crash(self, dashboard):
+        # The fixture's bare "mode: paper" never writes out account_usd at all -- this patcher can only
+        # replace an existing line, not invent a new one, so it must fail cleanly rather than silently
+        # doing nothing or corrupting the file.
+        original = dashboard.config_path.read_text(encoding="utf-8")
+        status, body = _post(dashboard.base_url, "/api/config", {"account_usd": "750"})
+        assert status == 400
+        assert dashboard.config_path.read_text(encoding="utf-8") == original
+
+    def test_get_on_a_missing_config_file_is_a_clean_400(self, dashboard):
+        dashboard.config_path.unlink()
+        status, body = _get(dashboard.base_url, "/api/config")
+        assert status == 400
+
+
 class TestMarketEndpointAndNoTradesTable:
     def test_paper_summary_ok_when_database_has_no_trades_table(self, dashboard):
         db_path = make_db(dashboard.data_dir)
@@ -397,6 +462,13 @@ class TestMarketEndpointAndNoTradesTable:
         (tmp_path / "recorder-KXBTC15M-prod-20260919T000000Z.sqlite").write_bytes(b"")
         kinds = {e["name"].split("-")[0]: e["kind"] for e in list_databases(tmp_path)}
         assert kinds == {"stream": "stream", "recorder": "recorder"}
+
+    def test_list_databases_labels_polymarket_files_not_unknown(self, tmp_path):
+        # A separate venue's own pm_-prefixed schema (docs/dashboard-terminal.md, CLAUDE.md): must never be
+        # offered to a Kalshi-only view the same way a genuinely unrecognized file implicitly could be.
+        (tmp_path / "polymarket-btc-updown-15m-20260919T000000Z.sqlite").write_bytes(b"")
+        entries = list_databases(tmp_path)
+        assert len(entries) == 1 and entries[0]["kind"] == "polymarket"
 
 
 class TestStrategyLabEndpoints:
