@@ -40,12 +40,12 @@ def make_book(yes_price="0.30", yes_size="15", no_price="0.68", no_size="15"):
     )
 
 
-def make_trader(conn, *, config=None, buffer=None, **kwargs):
+def make_trader(conn, *, config=None, buffer=None, kill_file=NO_KILL_FILE, **kwargs):
     buffer = buffer or SpotBuffer(window_sec=5.0, stale_after_sec=3.0)
     # Fixed-size by default: percent-of-account is the shipped live default (test_percent_sizing.py), but a
     # bare "5 contracts every order" is what most of this file's tests actually rely on for order-mechanics
     # assertions unrelated to sizing mode. Tests exercising a specific mode pass their own `config=`.
-    trader = LivePaperTrader(conn, config or BotConfig(sizing=Sizing(mode="fixed")), buffer, kill_file=NO_KILL_FILE, **kwargs)
+    trader = LivePaperTrader(conn, config or BotConfig(sizing=Sizing(mode="fixed")), buffer, kill_file=kill_file, **kwargs)
     return trader, buffer
 
 
@@ -324,6 +324,113 @@ class TestRiskIntegration:
                 next_market, make_book(yes_size=str(size)), T0 + timedelta(seconds=610 + offset)
             )
         assert trader._resting_order_id is None and trader._position is None
+        trader.close()
+
+    async def test_a_pause_is_logged_once_not_every_tick(self, tmp_path):
+        # A silent pause is exactly what let this go unnoticed for 6+ hours in production: every subsequent
+        # REST decision must not re-log the same rejection once per poll for however long the pause lasts.
+        conn = sqlite3.connect(":memory:")
+        config = BotConfig(risk={
+            "max_contracts_per_trade": 10, "max_open_exposure_usd": Decimal("25"),
+            "daily_loss_limit_usd": Decimal("20"), "max_consecutive_losses": 1, "max_trades_per_hour": 12,
+        })
+        events = []
+        trader, buffer = make_trader(
+            conn, config=config, log_event=lambda level, event, detail: events.append((level, event, detail))
+        )
+        market = await fill_a_window(trader, buffer)
+        await trader.on_settlement(make_market(market.ticker, status="finalized", raw_extra={"result": "no"}))
+        assert trader.risk.is_paused is True
+
+        # Unlike the ~1500s-close_time windows other tests in this class use for rollover/settlement timing
+        # only, this needs decide() to actually reach Action.REST so check_new_order runs: close_time stays
+        # inside [min_tau_sec, max_tau_sec]=[30, 780] at these offsets, and spot ticks resume within 3s of
+        # fill_a_window's last one (TimedVolatility resets its warmup on any bigger gap, per model.py).
+        next_market = make_market("T2", close_time=T0 + timedelta(seconds=400))
+        for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+            feed_fresh_spot(trader, buffer, ts=T0 + timedelta(seconds=4 + offset))
+            await trader.on_orderbook_snapshot(
+                next_market, make_book(yes_size=str(size)), T0 + timedelta(seconds=4 + offset)
+            )
+        blocked = [e for e in events if e[1] == "risk_blocked_order"]
+        assert len(blocked) == 1  # not one per tick
+        assert blocked[0][0] == "warning" and "consecutive losses" in blocked[0][2]
+        trader.close()
+
+    async def test_resume_file_clears_the_pause_without_a_restart(self, tmp_path):
+        conn = sqlite3.connect(":memory:")
+        config = BotConfig(risk={
+            "max_contracts_per_trade": 10, "max_open_exposure_usd": Decimal("25"),
+            "daily_loss_limit_usd": Decimal("20"), "max_consecutive_losses": 1, "max_trades_per_hour": 12,
+        })
+        resume_file = tmp_path / "RESUME"
+        events = []
+        trader, buffer = make_trader(
+            conn, config=config, resume_file=str(resume_file),
+            log_event=lambda level, event, detail: events.append((level, event, detail)),
+        )
+        market = await fill_a_window(trader, buffer)
+        await trader.on_settlement(make_market(market.ticker, status="finalized", raw_extra={"result": "no"}))
+        assert trader.risk.is_paused is True
+
+        next_market = make_market("T2", close_time=T0 + timedelta(seconds=400))
+        resume_file.write_text("go")
+        for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+            feed_fresh_spot(trader, buffer, ts=T0 + timedelta(seconds=4 + offset))
+            await trader.on_orderbook_snapshot(
+                next_market, make_book(yes_size=str(size)), T0 + timedelta(seconds=4 + offset)
+            )
+        assert trader.risk.is_paused is False
+        assert not resume_file.exists()  # one-shot: consumed on use
+        assert trader._resting_order_id is not None or trader._position is not None  # trading resumed
+        assert any(e[1] == "risk_resumed" for e in events)
+        trader.close()
+
+    async def test_a_transient_rejection_is_not_logged_as_the_sticky_pause(self, tmp_path):
+        # exceeds max_open_exposure_usd (unlike the consecutive-loss pause) self-heals on its own as soon as
+        # exposure frees up -- it must never be logged via risk_blocked_order, the event btcbot watch treats
+        # as "still paused, needs a resume-file or restart", or one transient rejection would leave watch.py
+        # falsely reporting RISK-PAUSED forever even after the run goes right back to trading normally.
+        conn = sqlite3.connect(":memory:")
+        config = BotConfig(
+            sizing=Sizing(mode="fixed"),
+            risk={
+                "max_contracts_per_trade": 10, "max_open_exposure_usd": Decimal("0.01"),
+                "daily_loss_limit_usd": Decimal("20"), "max_consecutive_losses": 5, "max_trades_per_hour": 12,
+            },
+        )
+        events = []
+        trader, buffer = make_trader(
+            conn, config=config, log_event=lambda level, event, detail: events.append((level, event, detail))
+        )
+        market = make_market(TICKER)
+        for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+            feed_fresh_spot(trader, buffer, ts=T0 + timedelta(seconds=offset))
+            await trader.on_orderbook_snapshot(market, make_book(yes_size=str(size)), T0 + timedelta(seconds=offset))
+        assert trader.risk.is_paused is False
+        assert trader._resting_order_id is None  # never affordable given the tiny exposure cap
+        assert not any(e[1] == "risk_blocked_order" for e in events)
+        trader.close()
+
+    async def test_a_kill_file_rejection_is_logged_the_same_way_as_a_pause(self, tmp_path):
+        # The KILL file is the OTHER sticky rejection (risk.py's is_paused is not the only one): it never
+        # self-heals either -- only deleting the file clears it -- so it must be logged too, the same as the
+        # consecutive-loss pause, or a kill-switched run would silently look "ok" to btcbot watch.
+        conn = sqlite3.connect(":memory:")
+        kill_file = tmp_path / "KILL"
+        kill_file.write_text("stop")
+        events = []
+        trader, buffer = make_trader(
+            conn, kill_file=str(kill_file),
+            log_event=lambda level, event, detail: events.append((level, event, detail)),
+        )
+        market = make_market(TICKER)
+        for offset, size in enumerate([15, 14, 13, 12, 11, 10, 14, 0]):
+            feed_fresh_spot(trader, buffer, ts=T0 + timedelta(seconds=offset))
+            await trader.on_orderbook_snapshot(market, make_book(yes_size=str(size)), T0 + timedelta(seconds=offset))
+        assert trader._resting_order_id is None
+        blocked = [e for e in events if e[1] == "risk_blocked_order"]
+        assert len(blocked) == 1 and "KILL" in blocked[0][2]
         trader.close()
 
 

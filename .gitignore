@@ -443,6 +443,7 @@ secrets/
 data/
 logs/
 KILL
+RESUME
 
 # Trained ML model files (btcbot ml-train / retrain-check output; local artifacts, not source)
 models/
