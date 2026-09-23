@@ -379,6 +379,50 @@ async def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def render_polymarket_summary(summary) -> str:
+    lines = [
+        f"Started    : {summary.started_at.isoformat()}",
+        f"Stopped    : {summary.stopped_at.isoformat()} ({summary.stop_reason}: {summary.stop_detail})",
+        f"Book polls : {summary.book_polls:,}",
+        f"Markets    : {summary.market_state_changes:,} seen, {summary.settlements:,} settlements recorded, "
+        f"{summary.rollover_gaps:,} gaps with no open event",
+        f"Errors     : {summary.errors:,}",
+    ]
+    if summary.unresolved_settlements:
+        lines.append(f"Unresolved : {', '.join(summary.unresolved_settlements)}")
+    return "\n".join(lines)
+
+
+async def _cmd_record_polymarket(args: argparse.Namespace) -> int:
+    """READ-ONLY: poll Polymarket's public "Bitcoin Up or Down" series into SQLite. No wallet, no key, no
+    order code -- see polymarket_client.py's module docstring. A separate venue from Kalshi; this command
+    does not place, and cannot place, any order."""
+    from btcbot.polymarket_client import PolymarketClient
+    from btcbot.polymarket_recorder import PolymarketRecorder
+
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    db_path = data_dir / f"polymarket-btc-updown-{args.horizon}-{timestamp}.sqlite"
+
+    async with PolymarketClient() as client:
+        recorder = PolymarketRecorder(
+            client, horizon=args.horizon, db_path=db_path, kill_file=args.kill_file,
+            poll_interval_sec=args.poll_interval,
+        )
+        print(
+            f"Recording Polymarket btc-updown-{args.horizon} (public data only, no wallet/key) to {db_path}\n"
+            f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early.",
+            flush=True,
+        )
+        try:
+            summary = await recorder.run(duration_sec=args.hours * 3600)
+        finally:
+            recorder.close()
+    print(render_polymarket_summary(summary))
+    return 0
+
+
 def render_stream_summary(recorder_summary: RecorderSummary | None, stream: StreamRecorder, db_path: Path) -> str:
     stats = stream.stats
     lines = []
@@ -1199,6 +1243,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--poll-interval", type=float, default=1.0, metavar="SECONDS", help="seconds between polls (default: 1.0)"
     )
     record.set_defaults(handler=_cmd_record)
+
+    record_pm = commands.add_parser(
+        "record-polymarket",
+        help="READ-ONLY: poll Polymarket's public 'Bitcoin Up or Down' order books into SQLite (no wallet/key; a separate venue from Kalshi)",
+    )
+    record_pm.add_argument("--horizon", default="15m", choices=["5m", "15m"], help="which rolling window series to record (default: 15m)")
+    record_pm.add_argument("--hours", type=float, default=9.0, help="stop after this many hours (default: 9)")
+    record_pm.add_argument("--data-dir", default="data", help="directory for the SQLite database (default: ./data)")
+    record_pm.add_argument("--kill-file", default="KILL_PM", help="creating this file stops recording (default: ./KILL_PM)")
+    record_pm.add_argument("--poll-interval", type=float, default=2.0, metavar="SECONDS", help="seconds between book polls (default: 2.0)")
+    record_pm.set_defaults(handler=_cmd_record_polymarket)
 
     stream = commands.add_parser(
         "stream",
