@@ -235,6 +235,100 @@ class TestFillAttribution:
         assert rec_b.demo_filled == Decimal(0)  # not misattributed to the most recently placed order
 
 
+class TestOrderPlacementBackoff:
+    """Regression coverage for a real production incident: Kalshi's order-placement endpoint 503'd for 13
+    seconds straight, and the bot retried once per poll tick (no backoff at all) since create_order's POST is
+    deliberately excluded from kalshi_client's own transport-retry. Nothing broke (a rejected order never
+    rests or takes exposure), but hammering an already-degraded endpoint every second isn't good behavior."""
+
+    def _decision(self):
+        return Decision(Action.REST, side="yes", price=Decimal("0.30"), size=Decimal(5))
+
+    async def test_a_single_server_error_does_not_trigger_a_backoff(self):
+        trader, buffer, client, _ = make_trader()
+        trader._current_ticker = TICKER
+        trader._backend.sync_market(make_book(), T0)
+        client.create_error = KalshiAPIError(503, "service_unavailable")
+
+        result = await trader._place_resting(self._decision(), T0)
+        assert result is None
+        assert trader._order_consecutive_server_failures == 1
+        assert trader._order_backoff_until is None  # below the trigger threshold after just one
+
+    async def test_two_consecutive_server_errors_trigger_a_backoff_that_skips_the_next_attempt(self):
+        trader, buffer, client, conn = make_trader()
+        trader._current_ticker = TICKER
+        trader._backend.sync_market(make_book(), T0)
+        client.create_error = KalshiAPIError(503, "service_unavailable")
+
+        await trader._place_resting(self._decision(), T0)
+        await trader._place_resting(self._decision(), T0 + timedelta(seconds=1))
+        assert trader._order_backoff_until is not None
+        assert conn.execute("SELECT COUNT(*) FROM demo_events WHERE event='order_backoff'").fetchone()[0] == 1
+
+        # If the cooldown were NOT respected, this attempt would actually reach create_order and succeed
+        # (the error is cleared) -- so an empty client.created proves the call was skipped, not retried.
+        client.create_error = None
+        during_cooldown = trader._order_backoff_until - timedelta(milliseconds=1)
+        result = await trader._place_resting(self._decision(), during_cooldown)
+        assert result is None and client.created == []
+
+    async def test_a_new_attempt_is_made_once_the_cooldown_elapses(self):
+        trader, buffer, client, _ = make_trader()
+        trader._current_ticker = TICKER
+        trader._backend.sync_market(make_book(), T0)
+        client.create_error = KalshiAPIError(503, "service_unavailable")
+        await trader._place_resting(self._decision(), T0)
+        await trader._place_resting(self._decision(), T0 + timedelta(seconds=1))
+        backoff_until = trader._order_backoff_until
+        assert backoff_until is not None
+
+        client.create_error = None
+        order_id = await trader._place_resting(self._decision(), backoff_until + timedelta(milliseconds=1))
+        assert order_id is not None and client.created  # attempted and succeeded, not skipped
+        assert trader._order_consecutive_server_failures == 0
+        assert trader._order_backoff_until is None
+
+    async def test_an_ordinary_rejection_never_triggers_a_backoff_no_matter_how_often_it_recurs(self):
+        # Most order_rejected events are completely routine (a post-only bid the book raced past) -- these
+        # must never be throttled, or the strategy would lose real entry opportunities for no reason.
+        trader, buffer, client, conn = make_trader()
+        trader._current_ticker = TICKER
+        trader._backend.sync_market(make_book(), T0)
+        client.create_error = KalshiAPIError(400, "post only cross", code="post_only_cross")
+
+        for i in range(6):
+            result = await trader._place_resting(self._decision(), T0 + timedelta(seconds=i))
+            assert result is None
+        assert trader._order_consecutive_server_failures == 0
+        assert trader._order_backoff_until is None
+        assert conn.execute("SELECT COUNT(*) FROM demo_events WHERE event='order_backoff'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM demo_events WHERE event='order_rejected'").fetchone()[0] == 6
+
+    async def test_a_connection_error_counts_as_server_trouble_too(self):
+        trader, buffer, client, _ = make_trader()
+        trader._current_ticker = TICKER
+        trader._backend.sync_market(make_book(), T0)
+        client.create_error = KalshiConnectionError("network down")
+
+        await trader._place_resting(self._decision(), T0)
+        await trader._place_resting(self._decision(), T0 + timedelta(seconds=1))
+        assert trader._order_backoff_until is not None
+
+    async def test_a_successful_placement_resets_the_failure_count(self):
+        trader, buffer, client, _ = make_trader()
+        trader._current_ticker = TICKER
+        trader._backend.sync_market(make_book(), T0)
+        client.create_error = KalshiAPIError(503, "service_unavailable")
+        await trader._place_resting(self._decision(), T0)
+        assert trader._order_consecutive_server_failures == 1
+
+        client.create_error = None
+        order_id = await trader._place_resting(self._decision(), T0 + timedelta(seconds=1))
+        assert order_id is not None
+        assert trader._order_consecutive_server_failures == 0
+
+
 class TestSettlementAndReport:
     async def test_settlement_before_the_rollover_still_resolves_the_real_position(self):
         trader, buffer, client, conn = make_trader()
