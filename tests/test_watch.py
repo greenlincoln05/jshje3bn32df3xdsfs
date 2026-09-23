@@ -30,11 +30,11 @@ def test_empty_directory(tmp_path, capsys):
     assert "no paper" in capsys.readouterr().out
 
 
-def _log(conn, event, *, ts=None):
+def _log(conn, event, *, ts=None, detail="detail"):
     ts = ts or datetime.now(timezone.utc)
     conn.execute(
         "INSERT INTO run_log (ts, level, event, detail) VALUES (?, 'warning', ?, ?)",
-        (ts.isoformat(), event, "detail"),
+        (ts.isoformat(), event, detail),
     )
     conn.commit()
 
@@ -63,6 +63,26 @@ def test_no_risk_events_is_not_flagged(tmp_path):
     got = {h.kind: h for h in summarize(tmp_path, stale_min=5)}
     assert got["paper(prod)"].risk_paused is False
     assert "RISK-PAUSED" not in render(list(got.values()))
+
+
+def test_a_kill_file_pause_gets_kill_specific_advice_not_the_resume_file_hint(tmp_path):
+    # A resume-file only clears RiskManager's consecutive-loss pause -- it does nothing for a KILL-file
+    # block, so the two must not share the same "create a resume-file" guidance.
+    conn = make_db(tmp_path, "paper-x.sqlite")
+    _log(conn, "risk_blocked_order", detail="KILL file present")
+    got = {h.kind: h for h in summarize(tmp_path, stale_min=5)}
+    rendered = render(list(got.values()))
+    assert "delete it" in rendered
+    assert "create a resume-file" not in rendered
+
+
+def test_a_consecutive_loss_pause_still_gets_the_resume_file_hint(tmp_path):
+    conn = make_db(tmp_path, "paper-x.sqlite")
+    _log(conn, "risk_blocked_order", detail="paused: 5 consecutive losses")
+    got = {h.kind: h for h in summarize(tmp_path, stale_min=5)}
+    rendered = render(list(got.values()))
+    assert "create a resume-file" in rendered
+    assert "delete it" not in rendered
 
 
 def test_a_stale_and_risk_paused_db_gets_a_non_contradictory_message(tmp_path):
