@@ -147,6 +147,10 @@ def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None =
         settled_fees = ZERO
         first_entry = last_entry = None
         recorded_positions = set()
+        tickers_traded: set[str] = set()
+        tickers_seen = None
+        if "orderbook_snapshots" in tables:
+            tickers_seen = {row[0] for row in conn.execute("SELECT DISTINCT ticker FROM orderbook_snapshots")}
         for row in rows:
             is_demo = source == "demo"
             order_count += int(is_demo)
@@ -180,6 +184,7 @@ def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None =
                 if size <= 0:
                     continue
             trade_count += 1
+            tickers_traded.add(row["ticker"])
             first_entry = min(first_entry, entry_ts) if first_entry else entry_ts
             last_entry = max(last_entry, entry_ts) if last_entry else entry_ts
             record = {
@@ -232,6 +237,7 @@ def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None =
                     history.append(position)
                     position_count += 1
                     trade_count += 1
+                    tickers_traded.add(position["ticker"])
                     exposure += _decimal(position["cost_usd"])
                     fees += _decimal(position["fee_paid"])
     finally:
@@ -278,6 +284,8 @@ def portfolio_view(db_path: Path, starting_balance: Decimal | str | int | None =
         "max_drawdown_usd": max_dd, "max_drawdown_pct": max_dd_pct,
         "open_exposure_usd": exposure, "recorded_resting_notional_usd": resting_notional,
         "active_order_count": active_count, "open_position_count": position_count,
+        "windows_seen": len(tickers_seen) if tickers_seen is not None else None,
+        "windows_traded": len(tickers_traded),
         "recorded_closed_remainder_count": closed_remainder_count, "incomplete_settlement_count": incomplete_count,
         "first_entry_ts": first_entry, "last_entry_ts": last_entry, "last_snapshot_ts": last_snapshot,
         "runtime_snapshot_ts": runtime_ts, "runtime_stopped": runtime_stopped,

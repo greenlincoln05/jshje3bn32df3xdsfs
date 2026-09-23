@@ -20,6 +20,7 @@ themselves, exactly as if they'd edited `.env` directly.)
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -32,8 +33,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import yaml
+from pydantic import ValidationError
+
 from btcbot.backtest import BacktestError, load_trades, run_backtest
-from btcbot.config import ConfigError, load_config
+from btcbot.config import BotConfig, ConfigError, load_config
 from btcbot.dashboard_analytics import portfolio_view
 from btcbot.dashboard_jobs import BacktestJobs, BacktestQueueFull
 from btcbot.dashboard_market import market_quote, market_view
@@ -121,6 +125,94 @@ def _settings_updates_from_payload(payload: dict[str, Any]) -> dict[str, str]:
     return updates
 
 
+# --------------------------------------------------------------------------- config.yaml settings
+
+# A deliberately small, numeric-only subset of config.yaml: sizing MODE and any other structural choice
+# stays a file edit, not a dashboard click, but a number the owner already tunes by hand (an account size,
+# a risk cap, a price band) is safe to expose here. None means a top-level key; otherwise the section it
+# lives under.
+EDITABLE_CONFIG_FIELDS: dict[str, str | None] = {
+    "min_edge": None, "min_price": None, "max_price": None,
+    "account_usd": "sizing", "risk_pct_per_trade": "sizing", "contracts_per_trade": "sizing",
+    "max_open_exposure_pct": "risk", "daily_loss_limit_pct": "risk", "max_contracts_per_trade": "risk",
+}
+
+
+def config_summary(config_path: Path) -> dict[str, Any]:
+    """The handful of numbers CLAUDE.md itself calls out as worth seeing/tuning at a glance, read straight
+    off the currently loaded config -- so "what account size/risk caps is the bot actually running with"
+    never requires opening config.yaml by hand. Read-only fields (everything not in
+    EDITABLE_CONFIG_FIELDS) are still shown, just not writable from here."""
+    config = load_config(str(config_path))
+    return {
+        "config_path": str(config_path),
+        "mode": config.mode.value, "sizing_mode": config.sizing.mode.value,
+        "min_edge": str(config.min_edge), "min_price": None if config.min_price is None else str(config.min_price),
+        "max_price": None if config.max_price is None else str(config.max_price),
+        "account_usd": str(config.sizing.account_usd), "risk_pct_per_trade": str(config.sizing.risk_pct_per_trade),
+        "contracts_per_trade": config.sizing.contracts_per_trade,
+        "max_open_exposure_pct": None if config.risk.max_open_exposure_pct is None else str(config.risk.max_open_exposure_pct),
+        "daily_loss_limit_pct": None if config.risk.daily_loss_limit_pct is None else str(config.risk.daily_loss_limit_pct),
+        "max_contracts_per_trade": config.risk.max_contracts_per_trade,
+    }
+
+
+def _patch_config_yaml_value(text: str, key: str, section: str | None, value: str) -> str:
+    """Replaces just ONE key's value in raw config.yaml text, preserving every other line byte-for-byte --
+    comments, ordering, unrelated sections -- the same "surgical text patch, not a re-serialize" approach
+    write_env_settings takes for .env, so a heavily-commented file (this one) never loses its comments to a
+    plain yaml.dump round-trip. A trailing inline comment on the patched line survives too, since the match
+    only spans the key and its value token, never the rest of the line."""
+    lines = text.splitlines(keepends=True)
+    if section is None:
+        pattern = re.compile(rf"^({re.escape(key)}\s*:\s*)(\S+)")
+        for i, line in enumerate(lines):
+            if pattern.match(line):
+                lines[i] = pattern.sub(lambda m: m.group(1) + value, line, count=1)
+                return "".join(lines)
+        raise ValueError(f"could not find top-level key {key!r} in config.yaml")
+    section_pattern = re.compile(rf"^{re.escape(section)}\s*:\s*$")
+    key_pattern = re.compile(rf"^(\s+{re.escape(key)}\s*:\s*)(\S+)")
+    in_section = False
+    for i, line in enumerate(lines):
+        if section_pattern.match(line):
+            in_section = True
+            continue
+        if in_section and line.strip() and not line[0].isspace():
+            in_section = False  # a later top-level key ended the section without finding ours
+        if in_section:
+            m = key_pattern.match(line)
+            if m:
+                lines[i] = key_pattern.sub(lambda mm: mm.group(1) + value, line, count=1)
+                return "".join(lines)
+    raise ValueError(f"could not find {section}.{key} in config.yaml")
+
+
+def write_config_settings(config_path: Path, updates: dict[str, Any]) -> dict[str, Any]:
+    """Validates every patched value against BotConfig BEFORE writing anything to disk -- a bad edit (out of
+    a Field's allowed range, wrong type) is reported cleanly and the file is left untouched, never partially
+    patched or corrupted. Rejects any key not in EDITABLE_CONFIG_FIELDS explicitly rather than silently
+    ignoring a typo."""
+    unknown = set(updates) - set(EDITABLE_CONFIG_FIELDS)
+    if unknown:
+        raise ValueError(f"not editable here: {', '.join(sorted(unknown))}")
+    if not updates:
+        raise ValueError("nothing to update")
+    text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+    for key, raw_value in updates.items():
+        value = str(raw_value).strip()
+        if value.lower() in ("none", ""):
+            value = "null"
+        text = _patch_config_yaml_value(text, key, EDITABLE_CONFIG_FIELDS[key], value)
+    try:
+        parsed = yaml.safe_load(text) or {}
+        BotConfig.model_validate(parsed)
+    except (yaml.YAMLError, ValidationError) as exc:
+        raise ValueError(f"edit would produce an invalid config.yaml: {exc}") from exc
+    config_path.write_text(text, encoding="utf-8")
+    return config_summary(config_path)
+
+
 # --------------------------------------------------------------------------- database views
 
 
@@ -135,6 +227,10 @@ def list_databases(data_dir: Path) -> list[dict[str, Any]]:
             else "recorder" if name.startswith("recorder-")
             else "stream" if name.startswith("stream-")
             else "demo" if name.startswith("demo-")
+            # A separate venue (btcbot record-polymarket): its own pm_-prefixed tables, never Kalshi's
+            # orderbook_snapshots/trades schema, so it must never be offered to the Kalshi-only market/
+            # backtest/lab views the same way an "unknown" file implicitly could be.
+            else "polymarket" if name.startswith("polymarket-")
             else "unknown"
         )
         stat = path.stat()
@@ -493,6 +589,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, job)
             elif parsed.path == "/api/settings":
                 self._send_json(200, settings_status(self.server.env_path))
+            elif parsed.path == "/api/config":
+                try:
+                    self._send_json(200, config_summary(self.server.config_path))
+                except ConfigError as exc:
+                    raise _ApiError(400, str(exc)) from exc
             else:
                 self._send_json(404, {"error": f"no such endpoint: {parsed.path}"})
         except _ApiError as exc:
@@ -511,6 +612,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise _ApiError(400, str(exc)) from exc
                 write_env_settings(self.server.env_path, updates)
                 self._send_json(200, settings_status(self.server.env_path))
+            elif parsed.path == "/api/config":
+                try:
+                    self._send_json(200, write_config_settings(self.server.config_path, self._read_json_body()))
+                except (ValueError, ConfigError) as exc:
+                    raise _ApiError(400, str(exc)) from exc
             elif parsed.path == "/api/lab/preview":
                 try:
                     self._send_json(200, lab_preview(self.server.data_dir, self.server.config_path, self._read_json_body()))

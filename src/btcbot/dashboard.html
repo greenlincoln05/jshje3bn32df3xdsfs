@@ -322,6 +322,21 @@
       <div class="warn" id="prod-warn">Live (prod) is selected. This dashboard still cannot place, cancel, or modify any order -- but Phase 6 did add real (demo-only) order-placing code elsewhere in this repo (`btcbot demo-check`), so a key entered here now lets you run that yourself. Keep this on Demo unless you mean to.</div>
       <div class="row"><button class="action" id="save-settings">Save</button></div>
       <div id="settings-status"></div>
+      <h3 style="margin-top:24px">Trading config (config.yaml)</h3>
+      <p class="note">Mode is <b id="cfg-mode">--</b> · sizing mode is <b id="cfg-sizing-mode">--</b>. Only sizing mode itself needs a manual file edit; the numbers below can be changed here.</p>
+      <div id="cfg-fields">
+        <div class="field"><label for="cfg-account_usd">Account size ($)</label><input id="cfg-account_usd"></div>
+        <div class="field"><label for="cfg-risk_pct_per_trade">Risk per trade (% of account)</label><input id="cfg-risk_pct_per_trade"></div>
+        <div class="field"><label for="cfg-contracts_per_trade">Fixed contracts (non-percent modes)</label><input id="cfg-contracts_per_trade"></div>
+        <div class="field"><label for="cfg-max_open_exposure_pct">Max at risk at once (%)</label><input id="cfg-max_open_exposure_pct"></div>
+        <div class="field"><label for="cfg-daily_loss_limit_pct">Daily loss stop (%)</label><input id="cfg-daily_loss_limit_pct"></div>
+        <div class="field"><label for="cfg-max_contracts_per_trade">Absolute max contracts per order</label><input id="cfg-max_contracts_per_trade"></div>
+        <div class="field"><label for="cfg-min_edge">Min edge</label><input id="cfg-min_edge"></div>
+        <div class="field"><label for="cfg-min_price">Min entry price ($)</label><input id="cfg-min_price"></div>
+        <div class="field"><label for="cfg-max_price">Max entry price ($)</label><input id="cfg-max_price"></div>
+      </div>
+      <div class="row"><button class="action" id="save-config">Save trading config</button></div>
+      <div id="config-status"></div>
     </div>
   </section>
 
@@ -436,7 +451,7 @@ function drawSeries(canvas, points, opts) {
 
 let market = null, side = "yes";
 
-const KIND_LABELS = { paper: "Paper trading", recorder: "Data recording", stream: "BRTI + book stream", demo: "Demo orders (fake money)", unknown: "Data file" };
+const KIND_LABELS = { paper: "Paper trading", recorder: "Data recording", stream: "BRTI + book stream", demo: "Demo orders (fake money)", polymarket: "Polymarket (separate venue, read-only)", unknown: "Data file" };
 function dbLabel(db) {
   const m = /^[a-z]+-[A-Z0-9]+-(demo|prod)-/.exec(db.name);
   const env = m ? m[1].toUpperCase() : "";
@@ -632,7 +647,7 @@ function drawPortfolio() {
   const s=portfolio, m=s.metrics || s;
   $("portfolio-source").textContent=sourceLabel(s.source);
   $("account-note").textContent=m.starting_balance_usd==null?'Starting account: not recorded for this run':`Starting account ${money(m.starting_balance_usd)} · ${m.starting_balance_source||'recorded'}`;
-  $("summary-tiles").innerHTML=tiles([['Account value',money(m.equity_usd),'Starting account + settled PnL'],['Net PnL',fmtUsd(m.total_pnl_usd),'After recorded fees'],['Growth',m.growth_pct==null?'--':num(m.growth_pct)+'%','Against the starting account'],['Max drawdown',fmtUsd(-Number(m.max_drawdown_usd)),'From the settled equity peak'],['Win rate',fmtPct(m.win_rate),`${m.wins||0} wins / ${m.losses||0} losses`],['Fees paid',money(m.total_fees_usd),'All recorded filled activity'],['Profit factor',m.profit_factor==null?'--':num(m.profit_factor),m.profit_factor_note||'Gross gains / gross losses'],['Open exposure',money(m.open_exposure_usd),'Recorded cost at risk']]);
+  $("summary-tiles").innerHTML=tiles([['Account value',money(m.equity_usd),'Starting account + settled PnL'],['Net PnL',fmtUsd(m.total_pnl_usd),'After recorded fees'],['Growth',m.growth_pct==null?'--':num(m.growth_pct)+'%','Against the starting account'],['Max drawdown',fmtUsd(-Number(m.max_drawdown_usd)),'From the settled equity peak'],['Win rate',fmtPct(m.win_rate),`${m.wins||0} wins / ${m.losses||0} losses`],['Fees paid',money(m.total_fees_usd),'All recorded filled activity'],['Profit factor',m.profit_factor==null?'--':num(m.profit_factor),m.profit_factor_note||'Gross gains / gross losses'],['Open exposure',money(m.open_exposure_usd),'Recorded cost at risk'],['Windows traded',m.windows_traded==null?'--':`${m.windows_traded}${m.windows_seen==null?'':' of '+m.windows_seen+' seen'}`,'Distinct 15-min markets with a recorded fill, of those recorded at all']]);
   let curve=[...(s.equity_curve||[])];
   if(curve.length&&s.first_entry_ts&&s.starting_balance_usd!=null)curve.unshift({ts:s.first_entry_ts,equity_usd:s.starting_balance_usd,drawdown_usd:0});
   const range=$("portfolio-range").value;
@@ -719,6 +734,26 @@ async function loadSettings() {
   $("settings-status").innerHTML = `<div class="note">Settings file: ${esc(s.env_file)}${s.env_file_exists ? "" : " (does not exist yet -- Save will create it)"}</div>`;
 }
 
+const CONFIG_FIELDS = ["account_usd", "risk_pct_per_trade", "contracts_per_trade", "max_open_exposure_pct",
+  "daily_loss_limit_pct", "max_contracts_per_trade", "min_edge", "min_price", "max_price"];
+
+async function loadConfig() {
+  const c = await getJson("/api/config");
+  $("cfg-mode").textContent = c.mode; $("cfg-sizing-mode").textContent = c.sizing_mode;
+  CONFIG_FIELDS.forEach((k) => { $("cfg-" + k).value = c[k] == null ? "" : c[k]; });
+}
+
+async function saveConfig() {
+  const payload = {};
+  CONFIG_FIELDS.forEach((k) => { payload[k] = $("cfg-" + k).value; });
+  const status = $("config-status");
+  try {
+    const data = await postJson("/api/config", payload);
+    CONFIG_FIELDS.forEach((k) => { $("cfg-" + k).value = data[k] == null ? "" : data[k]; });
+    status.innerHTML = '<div class="ok">Saved to config.yaml.</div>';
+  } catch (err) { status.innerHTML = `<div class="error">Error: ${esc(err.message)}</div>`; }
+}
+
 async function saveSettings() {
   const payload = { kalshi_env: $q('input[name="kalshi-env"]:checked').value };
   if ($("key-id-input").value) payload.key_id = $("key-id-input").value;
@@ -788,7 +823,9 @@ function buildLabForm(databases, accountDefaults) {
 
 function renderLabDbs(databases) {
   const previous = new Map([...document.querySelectorAll('#lab-dbs input')].map(i=>[i.value,i.checked]));
-  const usable = databases.filter((d) => d.kind !== "unknown");
+  // Polymarket recordings use a completely separate pm_-prefixed schema (no orderbook_snapshots/trades
+  // tables at all), so they are just as unusable here as an "unknown" file -- offering them would error.
+  const usable = databases.filter((d) => d.kind !== "unknown" && d.kind !== "polymarket");
   $("lab-dbs").innerHTML = usable.length ? usable.map((d) => {
     const demo = /-demo-/.test(d.name);
     return `<label><input type="checkbox" value="${esc(d.name)}" ${demo ? "disabled" : (previous.has(d.name)?previous.get(d.name):true)?"checked":""}> ${esc(dbLabel(d))}${demo ? ' <span class="orange">(demo, synthetic)</span>' : ""}</label>`;
@@ -967,6 +1004,7 @@ $("run-backtest").addEventListener("click", runBacktest);
 $("lab-run").addEventListener("click", labRun);
 $("lab-cancel").addEventListener("click", labCancel);
 $("save-settings").addEventListener("click", saveSettings);
+$("save-config").addEventListener("click", saveConfig);
 document.querySelectorAll('input[name="kalshi-env"]').forEach((r) => r.addEventListener("change", () => {
   $("prod-warn").style.display = $q('input[name="kalshi-env"]:checked').value === "prod" ? "block" : "none";
 }));
@@ -1013,6 +1051,7 @@ $("export-trades").addEventListener('click',()=>{
   buildLabForm(dbList, labDefaults && labDefaults.account);
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
+  try { await loadConfig(); } catch (e) { $("config-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
   setInterval(() => { if (!document.hidden && (tab === "market" || tab === "monitor" || tab === "demo" || tab === "orders")) refreshTab(); }, 3000);
   setInterval(() => { if (!document.hidden) refreshDatabases().catch(() => {}); }, 10000);
   setInterval(refreshQuote, 150);
