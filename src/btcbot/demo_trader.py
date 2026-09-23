@@ -28,13 +28,13 @@ import logging
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from btcbot.config import KalshiEnv
 from btcbot.execution import DemoExecutionBackend
-from btcbot.kalshi_client import KalshiError, KalshiWriteNotAllowedError
+from btcbot.kalshi_client import KalshiAPIError, KalshiConnectionError, KalshiError, KalshiWriteNotAllowedError
 from btcbot.live_paper import LivePaperTrader
 from btcbot.models import Market, OrderBook, ParseError
 from btcbot.paper_broker import Fill, QueueAssumption, settle
@@ -73,10 +73,19 @@ CREATE TABLE IF NOT EXISTS demo_events (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
     ticker TEXT,
-    event TEXT NOT NULL,     -- 'order_rejected' | 'cancel_failed' | 'fills_unavailable'
+    event TEXT NOT NULL,     -- 'order_rejected' | 'cancel_failed' | 'fills_unavailable' | 'order_backoff'
     detail TEXT NOT NULL
 );
 """
+
+
+def _is_server_trouble(exc: Exception) -> bool:
+    """A connection failure or a 5xx: the exchange itself is having trouble, as opposed to an ordinary
+    rejection (a post-only bid that would have crossed because the book moved, insufficient balance, a bad
+    price) that happens routinely and says nothing about Kalshi's health."""
+    if isinstance(exc, KalshiConnectionError):
+        return True
+    return isinstance(exc, KalshiAPIError) and exc.status_code >= 500
 
 
 def _iso(ts: datetime) -> str:
@@ -114,6 +123,16 @@ class DemoStats:
 class DemoTrader(LivePaperTrader):
     _supports_exits = False  # real exit orders are not built yet; a paper-only exit would diverge from the exchange
 
+    # Application-level backoff for repeated order-PLACEMENT failures specifically: create_order's POST is
+    # deliberately excluded from kalshi_client's own transport-retry (a blind retry of a non-idempotent write
+    # risks double-placing an order on an ambiguous failure -- see create_order's docstring), so without this
+    # the per-second poll loop would otherwise hammer an already-503ing endpoint once a second for however
+    # long the outage lasts. Only server-side trouble counts toward it (see _is_server_trouble); an ordinary
+    # rejection (book moved, insufficient balance) never triggers a cooldown, however often it recurs.
+    _ORDER_BACKOFF_TRIGGER = 2  # consecutive server-trouble failures before the first cooldown
+    _ORDER_BACKOFF_BASE_SEC = 2.0
+    _ORDER_BACKOFF_CAP_SEC = 30.0
+
     def __init__(
         self,
         conn: sqlite3.Connection,
@@ -141,6 +160,8 @@ class DemoTrader(LivePaperTrader):
         self._shadow_order_id: str | None = None
         self._records: dict[str, list[_OrderRecord]] = {}
         self.stats = DemoStats()
+        self._order_consecutive_server_failures = 0
+        self._order_backoff_until: datetime | None = None
 
     # ---- bookkeeping
 
@@ -172,6 +193,24 @@ class DemoTrader(LivePaperTrader):
         log.warning("%s %s: %s", ticker, event, detail)
         self._conn.execute("INSERT INTO demo_events (ts, ticker, event, detail) VALUES (?,?,?,?)", (_iso(ts), ticker, event, detail))
         self._conn.commit()
+
+    def _register_order_failure(self, exc: Exception, ticker: str | None, poll_ts: datetime) -> None:
+        if not _is_server_trouble(exc):
+            self._order_consecutive_server_failures = 0  # an ordinary rejection says nothing about Kalshi's health
+            return
+        self._order_consecutive_server_failures += 1
+        if self._order_consecutive_server_failures < self._ORDER_BACKOFF_TRIGGER:
+            return
+        delay = min(
+            self._ORDER_BACKOFF_CAP_SEC,
+            self._ORDER_BACKOFF_BASE_SEC * 2 ** (self._order_consecutive_server_failures - self._ORDER_BACKOFF_TRIGGER),
+        )
+        self._order_backoff_until = poll_ts + timedelta(seconds=delay)
+        self._event(
+            ticker, "order_backoff",
+            f"{self._order_consecutive_server_failures} consecutive server errors placing orders "
+            f"({exc}); pausing new order attempts for {delay:.0f}s",
+        )
 
     def _save(self, rec: _OrderRecord, *, closed_ts: datetime | None = None) -> None:
         self._conn.execute(
@@ -228,6 +267,10 @@ class DemoTrader(LivePaperTrader):
         return rec is not None and rec.demo_filled >= rec.size
 
     async def _place_resting(self, decision: Decision, poll_ts: datetime) -> str | None:
+        if self._order_backoff_until is not None:
+            if poll_ts < self._order_backoff_until:
+                return None  # cooling down after repeated server trouble; skip this tick's attempt entirely
+            self._order_backoff_until = None  # cooldown elapsed: this tick gets a normal attempt
         ticker = self._current_ticker
         shadow_id = await super()._place_resting(decision, poll_ts)  # the same order, simulated, on the same book
         try:
@@ -249,7 +292,9 @@ class DemoTrader(LivePaperTrader):
             self.stats.orders_rejected += 1
             await self._backend.cancel_order(shadow_id)
             self._event(ticker, "order_rejected", f"{decision.side} {decision.size}@{decision.price}: {exc}")
+            self._register_order_failure(exc, ticker, poll_ts)
             return None
+        self._order_consecutive_server_failures = 0
         self.stats.orders_placed += 1
         self._shadow_order_id = shadow_id
         cursor = self._conn.execute(
