@@ -93,6 +93,19 @@ truth for scope and phases; the README has the phase status and a dated table of
   `trade_tape` table, one row per market/second/price/taker side (~13x smaller than raw prints). `btcbot fillcheck` uses it to ask
   whether a taker really printed at or through the price of each recorded fill; the paper broker itself is unchanged for now. A tape
   failure never stops a recording. Recordings made before this have no tape.
+- Polymarket (`polymarket_client.py`, `polymarket_recorder.py`, `btcbot record-polymarket`): READ-ONLY research into a
+  SEPARATE venue, owner-driven exploration, not a numbered phase and not integrated with anything Kalshi. Public,
+  unauthenticated GETs only (Gamma API for market discovery, CLOB API for order books) against Polymarket's own rolling
+  "Bitcoin Up or Down" series (`btc-updown-5m-<epoch>` / `btc-updown-15m-<epoch>`, confirmed live 2026-09-22, closely
+  analogous to Kalshi's `KXBTC15M`). There is no wallet, no private key, and **no order-placing method exists in
+  `polymarket_client.py` at all** -- unlike Kalshi, Polymarket has no free demo/sandbox environment to gate real orders
+  behind (it settles on-chain in real USDC from the first order), so the only safe design is for the capability to
+  simply not exist yet, the same way `stream_recorder.py` has no order/cancel command. `PolymarketRecorder` writes its
+  own `pm_`-prefixed SQLite tables (`pm_orderbook_snapshots`, `pm_market_state`, `pm_settlements`, plus `run_log`) so a
+  Polymarket database can never be mistaken for -- or accidentally read as -- a Kalshi one; `btcbot.features.build_rows`
+  looks specifically for the Kalshi `orderbook_snapshots` table and correctly skips anything else. Not wired into
+  `strategy.py`, `btcbot lab`, `btcbot features`/`validate`/`retrain-check`, or any trading decision. Building real
+  Polymarket order placement is a separate, larger decision than this recorder and needs the owner's explicit go-ahead.
 - `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
   and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
@@ -168,6 +181,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Tests (offline): `.venv/Scripts/python.exe -m pytest`
 - Read-only live check, no credentials needed: `.venv/Scripts/btcbot.exe discover --env prod`
 - Record public data (no credentials needed): `.venv/Scripts/btcbot.exe record --env prod --hours 9`
+- Record Polymarket's public "Bitcoin Up or Down" order books, READ-ONLY, no wallet/key needed (separate venue from Kalshi): `.venv/Scripts/btcbot.exe record-polymarket --horizon 15m --hours 9`
 - Live paper trading, no credentials, no real orders (Phase 5): `.venv/Scripts/btcbot.exe paper --env prod --hours 9`
 - Calibration report from a recorder database: `.venv/Scripts/btcbot.exe calibrate --db data/recorder-....sqlite`
 - Backtest a recorder database: `.venv/Scripts/btcbot.exe backtest --db data/recorder-....sqlite`
