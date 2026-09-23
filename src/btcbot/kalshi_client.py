@@ -40,9 +40,11 @@ from btcbot.config import KalshiEnv
 from btcbot.models import (
     Balance,
     CancelAck,
+    HistoricalCutoff,
     KalshiFill,
     KalshiOrder,
     Market,
+    MarketCandle,
     OrderAck,
     OrderBook,
     ParseError,
@@ -310,6 +312,91 @@ class KalshiClient:
             params["cursor"] = cursor
         trades.sort(key=lambda t: (t.created_time, t.trade_id))
         return trades
+
+    # ---- historical backfill (Part A of docs/research/kalshi-history-backfill-handoff.md; all public GETs,
+    # ---- none of these ever sign a request -- see test_no_historical_method_ever_signs below)
+
+    async def get_historical_cutoff(self) -> HistoricalCutoff:
+        """Where the live endpoints' coverage ends and ``/historical/*``'s begins, per field. Confirmed live
+        2026-09-23: `{"market_settled_ts": ..., "trades_created_ts": ..., ...}`."""
+        data = await self._request("GET", "/historical/cutoff")
+        return HistoricalCutoff.from_api(data)
+
+    async def list_historical_markets(self, *, series_ticker: str) -> list[Market]:
+        """Settled markets older than ``market_settled_ts``, same shape as :meth:`list_markets` but from the
+        ``/historical/*`` mirror that keeps them after the live endpoint stops serving them."""
+        params = {"series_ticker": series_ticker, "limit": "1000"}
+        markets: list[Market] = []
+        seen_cursors: set[str] = set()
+        while True:
+            data = await self._request("GET", "/historical/markets", params=params)
+            page = require(data, "markets", "historical markets response")
+            if not isinstance(page, list):
+                raise ParseError("historical markets response: markets must be an array")
+            markets.extend(Market.from_api(market) for market in page)
+            cursor = data.get("cursor")
+            if cursor is None or cursor == "":
+                return markets
+            if not isinstance(cursor, str):
+                raise ParseError("historical markets response: cursor must be a string")
+            if cursor in seen_cursors:
+                raise KalshiError("historical markets response repeated a pagination cursor; refusing incomplete results")
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
+
+    async def get_historical_trades(
+        self, ticker: str, *, min_ts: datetime | None = None, max_ts: datetime | None = None, max_pages: int = 200
+    ) -> list[Trade]:
+        """Trade prints for a market older than ``trades_created_ts``, same :class:`Trade` shape as
+        :meth:`get_trades`. A higher default page cap than the live method: one settled market's whole
+        15-minute lifetime can hold far more than 20 pages of prints (a busy window has printed >800k in this
+        project's own testing)."""
+        params = {"ticker": ticker, "limit": "1000"}
+        if min_ts is not None:
+            params["min_ts"] = str(int(min_ts.timestamp()))
+        if max_ts is not None:
+            params["max_ts"] = str(int(max_ts.timestamp()))
+        trades: list[Trade] = []
+        seen_cursors: set[str] = set()
+        for _ in range(max_pages):
+            data = await self._request("GET", "/historical/trades", params=params)
+            page = require(data, "trades", "historical trades response")
+            if not isinstance(page, list):
+                raise ParseError("historical trades response: trades must be an array")
+            trades.extend(Trade.from_api(t) for t in page)
+            cursor = data.get("cursor")
+            if not cursor or not isinstance(cursor, str) or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
+        trades.sort(key=lambda t: (t.created_time, t.trade_id))
+        return trades
+
+    async def get_market_candlesticks(
+        self, series_ticker: str, ticker: str, *, start: datetime, end: datetime
+    ) -> list[MarketCandle]:
+        """1-minute price/quote bars for a market newer than ``market_settled_ts`` (the live endpoint; it
+        lives under the series, unlike the historical one)."""
+        data = await self._request(
+            "GET", f"/series/{quote(series_ticker, safe='')}/markets/{quote(ticker, safe='')}/candlesticks",
+            params={"start_ts": str(int(start.timestamp())), "end_ts": str(int(end.timestamp())), "period_interval": "1"},
+        )
+        page = require(data, "candlesticks", "candlesticks response")
+        if not isinstance(page, list):
+            raise ParseError("candlesticks response: candlesticks must be an array")
+        return [MarketCandle.from_api(ticker, c) for c in page]
+
+    async def get_historical_candlesticks(self, ticker: str, *, start: datetime, end: datetime) -> list[MarketCandle]:
+        """1-minute price/quote bars for a market older than ``market_settled_ts`` (no series in the path,
+        unlike the live endpoint)."""
+        data = await self._request(
+            "GET", f"/historical/markets/{quote(ticker, safe='')}/candlesticks",
+            params={"start_ts": str(int(start.timestamp())), "end_ts": str(int(end.timestamp())), "period_interval": "1"},
+        )
+        page = require(data, "candlesticks", "historical candlesticks response")
+        if not isinstance(page, list):
+            raise ParseError("historical candlesticks response: candlesticks must be an array")
+        return [MarketCandle.from_api(ticker, c) for c in page]
 
     async def get_orderbook(self, ticker: str, *, depth: int = 0) -> OrderBook:
         """Resting bids for both sides. ``depth`` 0 returns every level; 1-100 limits it."""

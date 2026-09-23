@@ -19,6 +19,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | 5 | Live paper run, several days | **built and tested; no real live run yet (needs real network access)** |
 | 6 | Demo-environment order/cancel/fill validation (`demo-check`) and demo trading (`demo`) | **built and tested offline; no real demo-check or demo run yet (needs a demo key on the owner's machine)** |
 | 7 | Live, optional, only if phases 4-6 show positive edge after fees | not started |
+| -- | Historical trade tape + market candlestick backfill (`download-market-history`), owner-driven, not a numbered phase | **built and tested offline; no real backfill run yet (needs network on the owner's machine)** |
 
 Phase 1 shipped a read-only client with no order-placing methods at all; Phase 6 added
 `create_order`/`cancel_order`, hard-gated to Kalshi's demo environment only (see the Phase 6 write-up below
@@ -180,6 +181,29 @@ that same local file) and is never pasted into a conversation. This applies with
 `btcbot demo-check` (Phase 6): unlike `auth-check`'s single read-only balance call, it places and cancels
 real orders with whatever key it's given, so that key has to be the owner's own, entered locally, and run
 by the owner -- never a Claude Code session, on this or any future phase.
+
+### Historical backfill
+
+`btcbot download-market-history` (see `docs/research/kalshi-history-backfill-handoff.md`) backfills a real
+trade tape and 1-minute market candlesticks for settled `KXBTC15M` markets, using Kalshi's public,
+unauthenticated `/historical/*` endpoints (no key, ever). It gives two things the recorder alone cannot:
+
+1. A `trade_tape` for thousands of PAST windows, in the exact schema `btcbot record`/`paper`/`demo` already
+  write, so `btcbot fillcheck` and any future tape-aware paper broker work on history, not just on live
+  recordings made since the tape was added.
+2. The market's own 1-minute yes-bid/yes-ask/price bars, so `market_level_pipeline`/`btcbot disagree
+  --history` can compare the model against the **market's own price** on old windows, not only against the
+  settled outcome.
+
+It does **not** backfill historical order books -- Kalshi does not serve them at all; depth still only comes
+from `btcbot record`/`btcbot stream`. It is resumable (Ctrl-C safe; a re-run skips markets it already
+finished) and rate-limited by default. Like every command that touches the real network, this session's own
+environment cannot reach Kalshi, so it is the owner's to run:
+
+```powershell
+.venv\Scripts\btcbot.exe download-market-history --env prod --limit-markets 20   # smoke test first
+.venv\Scripts\btcbot.exe download-market-history --env prod --since 2026-01-01T00:00:00Z
+```
 
 ## Setup
 
@@ -375,3 +399,5 @@ Checked on 2026-09-18/19 against docs.kalshi.com and the live API. Re-verify bef
 | CF Benchmarks | Kalshi offers BRTI itself through the authenticated WebSocket channel `cfbenchmarks_value` (about 1 Hz, with trailing 60 s and final-minute averages) and a 5 Hz variant. The REST passthrough needs an account entitlement. |
 | Lifecycle | `initialized` -> `active` at `open_time` -> `closed` at `close_time` -> `determined` -> `finalized`. Orders, including cancels, are rejected after `close_time`. |
 | Demo | Lists `KXBTC15M` with the same tickers and strikes as prod, but thin: in one sampled window demo had 854 contracts traded against 1.6M on prod, and a top of book of bid 0.01 x 1 / ask 0.10 x 17. Good for order-handling tests, not for fill realism. |
+| Historical cutoff | `GET /historical/cutoff` (no auth) -> `{market_settled_ts, trades_created_ts, orders_updated_ts, market_positions_last_updated_ts}`. Records older than the matching timestamp are served ONLY by `/historical/*`; newer ones only by the live endpoints. Confirmed live 2026-09-23 (see `docs/research/kalshi-history-backfill-handoff.md`), not just read from docs. |
+| Historical markets/trades/candlesticks | `GET /historical/markets` (same shape/pagination as live `/markets`), `GET /historical/trades` (same `Trade` shape as live `/markets/trades`, extra `is_block_trade`), `GET /historical/markets/{ticker}/candlesticks` and the live `GET /series/{series}/markets/{ticker}/candlesticks` (1-minute bars only, `period_interval=1`). All confirmed live 2026-09-23, no auth. **The live candlesticks endpoint doesn't just rename `volume`/`open_interest` to `volume_fp`/`open_interest_fp`** as the docs alone suggest -- every nested `price`/`yes_bid`/`yes_ask` sub-field is ALSO suffixed `_dollars` there (`close` -> `close_dollars` etc.), which the docs don't mention; `MarketCandle.from_api` accepts either spelling. `taker_side` is deprecated in favor of `taker_outcome_side` on trades; both are sent today and agree in every response checked. Kalshi does **not** serve historical order books -- depth only ever comes from `record`/`stream`. The live `/markets`+`/historical/markets` listings disagree on how far back they cover: the historical listing alone returned 20,000+ more `KXBTC15M` markets than the live one on 2026-09-23. |

@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Protocol
 from btcbot.kalshi_client import KalshiError
 from btcbot.market_discovery import find_current_market
 from btcbot.models import Market, OrderBook, ParseError
+from btcbot.trade_tape import init_trade_tape_schema, upsert_trades
 
 if TYPE_CHECKING:
     from btcbot.spot_feed import SpotTick
@@ -104,16 +105,8 @@ CREATE TABLE IF NOT EXISTS settlements (
     resolved INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE TABLE IF NOT EXISTS trade_tape (
-    ticker TEXT NOT NULL,
-    second_ts TEXT NOT NULL,       -- the trade second, UTC (a busy window prints thousands of trades; one row per
-    yes_price TEXT NOT NULL,       -- second/price/taker keeps the tape ~13x smaller than raw prints, plenty for fills)
-    no_price TEXT NOT NULL,
-    taker_side TEXT NOT NULL,
-    contracts REAL NOT NULL,
-    prints INTEGER NOT NULL,
-    PRIMARY KEY (ticker, second_ts, yes_price, taker_side)
-);
+-- trade_tape lives in btcbot.trade_tape now (shared with the historical backfill); its schema is applied
+-- separately below via init_trade_tape_schema, not duplicated in this string.
 
 CREATE TABLE IF NOT EXISTS run_log (
     id INTEGER PRIMARY KEY,
@@ -238,6 +231,7 @@ class Recorder:
         self._db = sqlite3.connect(str(self._db_path))
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(_SCHEMA)
+        init_trade_tape_schema(self._db)
         self._db.commit()
 
     def close(self) -> None:
@@ -278,22 +272,17 @@ class Recorder:
                 self._log("warning", "tape_error", f"trades {ticker}: {exc}")
             return
         seen = self._tape_seen.setdefault(ticker, set())
+        fresh = []
         for t in trades:
             if t.trade_id in seen:
                 continue  # the overlap between polls re-returns recent prints; count each once
             seen.add(t.trade_id)
-            second = _iso(t.created_time.replace(microsecond=0))
-            self._db.execute(
-                "INSERT INTO trade_tape (ticker, second_ts, yes_price, no_price, taker_side, contracts, prints)"
-                " VALUES (?, ?, ?, ?, ?, ?, 1) ON CONFLICT (ticker, second_ts, yes_price, taker_side) DO UPDATE SET"
-                " contracts = contracts + excluded.contracts, prints = prints + 1",
-                (t.ticker, second, str(t.yes_price), str(t.no_price), t.taker_side, float(t.count)),
-            )
+            fresh.append(t)
             if since is None or t.created_time > since:
                 since = t.created_time
-        if trades:
+        if fresh:
+            upsert_trades(self._db, fresh)  # each trade passed in exactly once here, so additive is safe
             self._tape_last[ticker] = since
-        self._db.commit()
         if force:  # a forced poll is the final sweep of a market that just closed: free its dedupe set
             self._tape_seen.pop(ticker, None)
             self._tape_last.pop(ticker, None)

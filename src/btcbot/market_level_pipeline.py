@@ -26,6 +26,7 @@ from btcbot.coinbase_history import Candle
 from btcbot.history_pipeline import MarketOutcome
 from btcbot.ml_model import LogisticModel, brier_score, fit
 from btcbot.model import ModelState, predict_p_yes
+from btcbot.models import MarketCandle
 from btcbot.paper_broker import taker_fee
 
 MIN_MARKETS = 6
@@ -56,14 +57,23 @@ def realized_vol_from_candles(candles: Sequence[Candle], *, window: int = 15) ->
 
 def market_level_examples(
     outcomes: Sequence[MarketOutcome], candles: Sequence[Candle], *, vol_window: int = 15,
+    market_candles: dict[str, Sequence[MarketCandle]] | None = None,
 ) -> list[tuple[dict[str, float], bool]]:
     """One example per settled market with enough candle history: features are the v1 model's own
     ``p_yes`` (priced at the last candle close before the market's close, with a candle-derived sigma) and
     that sigma itself, label is whether YES won. A market with no candle covering it, or no strike, is
     skipped -- there is nothing to price it with. Training an :mod:`btcbot.ml_model.LogisticModel` on this
     corrects the v1 formula's own miscalibration (the same thing ``btcbot calibrate`` measures with a
-    reliability table); it has no price or edge feature, because no recorded book price exists this far back
-    to compute an edge against."""
+    reliability table); it has no price or edge feature by default, because no recorded book price exists
+    this far back to compute an edge against.
+
+    ``market_candles``, if given (a ``ticker -> that market's own MarketCandle bars`` mapping, e.g. from
+    :func:`btcbot.history_pipeline.load_market_candles` grouped by ticker), adds an OPTIONAL
+    ``market_mid_at_decision`` feature: ``(yes_bid_close + yes_ask_close) / 2`` from the latest bar ending at
+    or before the market's close, or omitted for that example if there is no such bar. This is off by
+    default (``market_candles=None``) specifically so existing results reproduce unchanged; it is not in
+    :data:`MARKET_LEVEL_FEATURES`, so a model trained without passing this stays on the original two-feature
+    schema, and a caller who does pass it opts in per call, not by a global default changing under them."""
     ordered = sorted(candles, key=lambda c: c.start)
     starts = [c.start for c in ordered]
     examples: list[tuple[dict[str, float], bool]] = []
@@ -80,8 +90,60 @@ def market_level_examples(
         sigma = realized_vol_from_candles(history, window=vol_window)
         state = ModelState(spot=history[-1].close, strike=outcome.strike, tau_sec=1.0, sigma=sigma)
         p_yes = predict_p_yes(state)
-        examples.append(({"p_model": p_yes, "sigma": sigma}, outcome.result == "yes"))
+        features = {"p_model": p_yes, "sigma": sigma}
+        if market_candles is not None:
+            bars = market_candles.get(outcome.ticker)
+            if bars:
+                at_or_before = [b for b in bars if b.end_ts <= outcome.close_time]
+                if at_or_before:
+                    latest = max(at_or_before, key=lambda b: b.end_ts)
+                    if latest.yes_bid_close is not None and latest.yes_ask_close is not None:
+                        features["market_mid_at_decision"] = float((latest.yes_bid_close + latest.yes_ask_close) / 2)
+        examples.append((features, outcome.result == "yes"))
     return examples
+
+
+def rows_for_calibration(
+    outcomes: Sequence[MarketOutcome], candles: Sequence[Candle], market_candles: dict[str, Sequence[MarketCandle]],
+    *, vol_window: int = 15,
+) -> list[dict]:
+    """Rows shaped exactly like :mod:`btcbot.features`' (``ticker``, ``tau_sec``, ``p_model``, ``yes_mid``,
+    ``outcome_yes``) so :func:`btcbot.calibration_report.build_report` -- unchanged -- can run its existing
+    reliability/disagreement tables on HISTORICAL markets, comparing the v1 model against the market's own
+    price the same way it already does for live-recorded windows (``btcbot disagree``). Requires
+    ``market_candles`` (unlike :func:`market_level_examples`, where it is optional): a row with no market
+    price to compare against is not useful here and is skipped, not included with a null mid. ``tau_sec`` is
+    fixed at 0 for every row (matching the fixed ``tau_sec=1.0`` this whole module prices markets at, near
+    close) so :func:`btcbot.calibration_report.one_row_per_window`'s tau-gap filter is a no-op here; pass
+    ``at_tau_sec=0`` when calling ``build_report`` on this data."""
+    ordered = sorted(candles, key=lambda c: c.start)
+    starts = [c.start for c in ordered]
+    rows: list[dict] = []
+    for outcome in outcomes:
+        if outcome.strike is None:
+            continue
+        cut = bisect_right(starts, outcome.close_time)
+        if cut < 2:
+            continue
+        history = ordered[max(0, cut - vol_window - 1):cut]
+        sigma = realized_vol_from_candles(history, window=vol_window)
+        state = ModelState(spot=history[-1].close, strike=outcome.strike, tau_sec=1.0, sigma=sigma)
+        p_yes = predict_p_yes(state)
+        bars = market_candles.get(outcome.ticker)
+        if not bars:
+            continue
+        at_or_before = [b for b in bars if b.end_ts <= outcome.close_time]
+        if not at_or_before:
+            continue
+        latest = max(at_or_before, key=lambda b: b.end_ts)
+        if latest.yes_bid_close is None or latest.yes_ask_close is None:
+            continue
+        rows.append({
+            "ticker": outcome.ticker, "tau_sec": 0.0, "p_model": p_yes,
+            "yes_mid": float((latest.yes_bid_close + latest.yes_ask_close) / 2),
+            "outcome_yes": 1 if outcome.result == "yes" else 0,
+        })
+    return rows
 
 
 def split_markets_by_time(

@@ -326,9 +326,17 @@ class Trade:
 
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> Self:
-        taker = require(payload, "taker_side", "trade")
+        # taker_side is marked deprecated in Kalshi's docs (read 2026-09-23) in favor of taker_outcome_side;
+        # both are still sent today and agree in every live response checked. Prefer the new field, fall back
+        # to the old one, and treat the two disagreeing as a real parse error rather than silently picking one.
+        new, old = payload.get("taker_outcome_side"), payload.get("taker_side")
+        if new is not None and old is not None and new != old:
+            raise ParseError(f"trade: taker_outcome_side ({new!r}) and taker_side ({old!r}) disagree")
+        taker = new if new is not None else old
+        if taker is None:
+            raise ParseError("trade payload has neither taker_outcome_side nor taker_side")
         if taker not in ("yes", "no"):
-            raise ParseError(f"trade: taker_side must be yes or no, got {taker!r}")
+            raise ParseError(f"trade: taker_outcome_side/taker_side must be yes or no, got {taker!r}")
         return cls(
             ticker=require(payload, "ticker", "trade"),
             trade_id=require(payload, "trade_id", "trade"),
@@ -337,6 +345,119 @@ class Trade:
             no_price=_require_decimal(payload.get("no_price_dollars"), "trade no_price_dollars"),
             taker_side=taker,
             created_time=parse_time(require(payload, "created_time", "trade"), "trade created_time"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalCutoff:
+    """``GET /historical/cutoff``: records with a relevant timestamp OLDER than the matching field here are
+    served ONLY by the ``/historical/*`` endpoints; newer ones are served by the live endpoints (unauthenticated,
+    both). Confirmed live 2026-09-23 (read the full response, not just the fields this project currently uses --
+    a future field is ignored, not an error, since this is a "read what we need" view of a wider payload)."""
+
+    market_settled_ts: datetime
+    trades_created_ts: datetime
+    orders_updated_ts: datetime | None  # not used by this project; kept for completeness
+    market_positions_last_updated_ts: datetime | None  # optional per docs; some responses omit it
+
+    @classmethod
+    def from_api(cls, payload: Mapping[str, Any]) -> Self:
+        return cls(
+            market_settled_ts=parse_time(require(payload, "market_settled_ts", "historical cutoff"), "market_settled_ts"),
+            trades_created_ts=parse_time(require(payload, "trades_created_ts", "historical cutoff"), "trades_created_ts"),
+            orders_updated_ts=None if payload.get("orders_updated_ts") is None
+            else parse_time(payload["orders_updated_ts"], "orders_updated_ts"),
+            market_positions_last_updated_ts=None if payload.get("market_positions_last_updated_ts") is None
+            else parse_time(payload["market_positions_last_updated_ts"], "market_positions_last_updated_ts"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MarketCandle:
+    """One 1-minute price/quote bar for a single market, from either candlesticks endpoint.
+
+    The two endpoints name the SAME data differently -- confirmed by reading live responses from both
+    2026-09-23, not just the docs, which only mention the top-level volume/open_interest rename:
+
+    * ``/historical/markets/{ticker}/candlesticks``: bare field names throughout --
+      ``volume``, ``open_interest``, and ``price``/``yes_bid``/``yes_ask`` sub-objects with bare
+      ``open``/``high``/``low``/``close``/``mean``/``previous`` keys.
+    * ``/series/{series}/markets/{ticker}/candlesticks`` (live): ``volume_fp``, ``open_interest_fp``, and
+      the SAME sub-objects but with every key suffixed ``_dollars`` (``close_dollars``, etc.) -- the docs'
+      "differs by endpoint" warning covers only the outer two fields; it does not mention the nested rename,
+      which would silently zero out every price field if only the outer one were handled.
+
+    ``from_api`` accepts either shape by trying the bare key first, then the ``_dollars``/``_fp`` one; an
+    endpoint that started sending BOTH spellings for the same field would prefer the bare one, matching
+    historical (the endpoint this project reads more of). Price fields are nullable (no trades that minute);
+    ``volume``/``open_interest`` are required -- a genuinely missing one is a real gap, not silently 0."""
+
+    ticker: str
+    end_ts: datetime
+    yes_bid_open: Decimal | None
+    yes_bid_high: Decimal | None
+    yes_bid_low: Decimal | None
+    yes_bid_close: Decimal | None
+    yes_ask_open: Decimal | None
+    yes_ask_high: Decimal | None
+    yes_ask_low: Decimal | None
+    yes_ask_close: Decimal | None
+    price_open: Decimal | None
+    price_high: Decimal | None
+    price_low: Decimal | None
+    price_close: Decimal | None
+    price_mean: Decimal | None
+    price_previous: Decimal | None
+    volume: Decimal
+    open_interest: Decimal
+
+    @classmethod
+    def from_api(cls, ticker: str, payload: Mapping[str, Any]) -> Self:
+        def field(group: Mapping[str, Any] | None, bare: str) -> Decimal | None:
+            if group is None:
+                return None
+            if bare in group:
+                return to_decimal(group[bare], bare)
+            dollars = f"{bare}_dollars"
+            if dollars in group:
+                return to_decimal(group[dollars], dollars)
+            return None
+
+        price = payload.get("price")
+        yes_bid = payload.get("yes_bid")
+        yes_ask = payload.get("yes_ask")
+        for name, group in (("price", price), ("yes_bid", yes_bid), ("yes_ask", yes_ask)):
+            if group is not None and not isinstance(group, Mapping):
+                raise ParseError(f"candlestick: {name} must be an object")
+        end_ts_raw = require(payload, "end_period_ts", "candlestick")
+        try:
+            end_ts = datetime.fromtimestamp(int(end_ts_raw), tz=timezone.utc)
+        except (TypeError, ValueError) as exc:
+            raise ParseError(f"candlestick: end_period_ts must be a unix timestamp, got {end_ts_raw!r}: {exc}") from exc
+        def top_level(bare: str) -> Any:
+            value = payload.get(bare)
+            if value is not None:
+                return value
+            return payload.get(f"{bare}_fp")
+
+        volume = top_level("volume")
+        open_interest = top_level("open_interest")
+        if volume is None:
+            raise ParseError("candlestick: missing volume (checked both 'volume' and 'volume_fp')")
+        if open_interest is None:
+            raise ParseError("candlestick: missing open_interest (checked both 'open_interest' and 'open_interest_fp')")
+        return cls(
+            ticker=ticker,
+            end_ts=end_ts,
+            yes_bid_open=field(yes_bid, "open"), yes_bid_high=field(yes_bid, "high"),
+            yes_bid_low=field(yes_bid, "low"), yes_bid_close=field(yes_bid, "close"),
+            yes_ask_open=field(yes_ask, "open"), yes_ask_high=field(yes_ask, "high"),
+            yes_ask_low=field(yes_ask, "low"), yes_ask_close=field(yes_ask, "close"),
+            price_open=field(price, "open"), price_high=field(price, "high"),
+            price_low=field(price, "low"), price_close=field(price, "close"),
+            price_mean=field(price, "mean"), price_previous=field(price, "previous"),
+            volume=_require_decimal(volume, "volume"),
+            open_interest=_require_decimal(open_interest, "open_interest"),
         )
 
 
