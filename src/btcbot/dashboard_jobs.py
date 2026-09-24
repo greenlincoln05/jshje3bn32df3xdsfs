@@ -34,7 +34,10 @@ def _signature(path: Path, *, optional: bool = False) -> tuple[Any, ...]:
         if optional:
             return (str(path), None)
         raise
-    return (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    # ctime is deliberately excluded: opening a WAL-mode database read-only can touch a
+    # sidecar file's ctime alone (e.g. creating/locking "-shm") without changing its
+    # content, which would falsely invalidate an unchanged completed job.
+    return (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
 def _inputs(db_path: Path, config_path: Path) -> tuple[Any, ...]:
