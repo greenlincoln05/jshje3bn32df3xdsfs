@@ -717,9 +717,12 @@ function drawPortfolioHistory() {
     const totalPnl=h.segments.reduce((sum,s)=>sum+Number(s.pnl_usd||0),0);
     $("history-note").innerHTML=`${h.trades.length} settled trade(s) across ${h.run_files} run(s), ${h.segments.length} PR segment(s), total ${fmtUsd(totalPnl)}.`;
   }
-  $("history-scroll").innerHTML=h.segments.map(seg=>{
+  // Newest first: the backend returns segments/trades oldest-first (a sensible canonical order for the
+  // data itself), reversed here purely for display so the most recent PR and its most recent trades read
+  // top-to-bottom like a normal activity feed, with the oldest, pre-tracking stretch at the very bottom.
+  $("history-scroll").innerHTML=[...h.segments].reverse().map(seg=>{
     const label=seg.version?esc(seg.version.label):'Before PR tracking started';
-    const rows=seg.trades.map(t=>`<tr><td>${esc(t.ticker)}</td><td>${esc(t.side)}</td><td class="num">${num(t.size)}</td><td class="num">${cents(t.price)}</td><td>${esc(t.ts)}</td><td>${esc(t.result||'--')}</td><td>${fmtUsd(t.pnl_usd)}</td></tr>`).join('');
+    const rows=[...seg.trades].reverse().map(t=>`<tr><td>${esc(t.ticker)}</td><td>${esc(t.side)}</td><td class="num">${num(t.size)}</td><td class="num">${cents(t.price)}</td><td>${esc(t.ts)}</td><td>${esc(t.result||'--')}</td><td>${fmtUsd(t.pnl_usd)}</td></tr>`).join('');
     return `<div class="history-segment">
       <div class="history-divider"><div class="history-divider-label">${label}</div><div class="history-divider-stats">${segmentStatsLine(seg)}</div></div>
       ${seg.trades.length?`<table><thead><tr><th>Ticker</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th>Time (UTC)</th><th>Result</th><th>PnL</th></tr></thead><tbody>${rows}</tbody></table>`:'<div class="empty">No settled trades in this stretch.</div>'}
