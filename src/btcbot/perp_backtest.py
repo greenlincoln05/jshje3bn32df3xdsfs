@@ -63,6 +63,18 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
+def describe_source(conn: sqlite3.Connection) -> str | None:
+    """Cheap check for whether ``conn`` holds bars :func:`load_bars` could use, without loading any of
+    them -- for listing candidate databases (the dashboard's Perps tab). Returns the same source
+    description ``load_bars`` would use, or ``None`` if neither table has a row."""
+    tables = _tables(conn)
+    if "spot_candles" in tables and conn.execute("SELECT 1 FROM spot_candles LIMIT 1").fetchone():
+        return "Coinbase BTC-USD 1m candles (spot_candles)"
+    if "btc_klines_1s" in tables and conn.execute("SELECT 1 FROM btc_klines_1s LIMIT 1").fetchone():
+        return "Binance BTCUSDT 1s klines aggregated to 1m (btc_klines_1s)"
+    return None
+
+
 def load_bars(conn: sqlite3.Connection) -> tuple[list[Bar], str]:
     """1-minute BTC bars from whichever local database this is: a ``download-history`` database's Coinbase
     BTC-USD 1-minute ``spot_candles`` (preferred: USD, and Coinbase is a BRTI constituent), else a

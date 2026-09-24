@@ -184,6 +184,7 @@
     <button data-tab="orders">Active orders</button>
     <button data-tab="backtest">Backtest</button>
     <button data-tab="lab">Strategy Lab</button>
+    <button data-tab="perps">Perps (paper)</button>
     <button data-tab="demo">Demo orders</button>
     <button data-tab="settings">Settings</button>
   </nav>
@@ -328,6 +329,58 @@
       </div>
       <div class="results" id="lab-results">
         <div class="empty">Pick data, choose what to vary, and press <b>Run lab</b>. Results appear here: every combination is ranked on the training windows and then shown on windows it never saw.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-perps">
+    <div class="pad">
+      <div class="section-title"><h2>BTC perpetual -- PAPER backtest</h2><span class="badge">Offline research</span></div>
+      <p class="note">Idle cash parked in Kalshi's <code>BTCPERP</code> instead of sitting flat, simulated against Kalshi's own rules (fees, 8h funding, isolated margin, liquidation) -- see <code>docs/research/perps-paper.md</code>. Paper only: there is no perps order code anywhere in this repo, and nothing on this page can place, cancel, or modify an order.</p>
+
+      <h3>Run a new backtest</h3>
+      <p class="note">Needs a local database with BTC bars: a <code>btcbot download-history</code> file (Coinbase 1-minute candles) or a <code>btcbot download-polymarket-history</code> file (Binance 1-second klines). Runs in the background; this can take a while over months of data.</p>
+      <div class="row">
+        <label for="perp-db-select">Data file</label>
+        <select id="perp-db-select" style="min-width:260px"></select>
+        <button class="action" id="perp-refresh-dbs" title="Look for new files">Refresh</button>
+      </div>
+      <div style="max-width:520px">
+        <div class="field"><label for="perp-account">Idle cash to put to work ($)</label><input id="perp-account" value="500"></div>
+        <div class="field"><label for="perp-leverages">Leverage (comma list, max 3)</label><input id="perp-leverages" value="1, 2"></div>
+        <div class="field"><label for="perp-fundings">Assumed funding / 8h (comma list)</label><input id="perp-fundings" value="0, 0.0001"></div>
+        <div class="field"><label for="perp-split">Train share of bars</label><input id="perp-split" value="0.7"><small>Ranked/run on this earlier slice; the rest is the held-out test.</small></div>
+        <div class="field"><label for="perp-fee-bps">Taker fee (bps of notional)</label><input id="perp-fee-bps" value="12"></div>
+        <div class="field"><label for="perp-slippage-bps">Assumed slippage (bps)</label><input id="perp-slippage-bps" value="1"></div>
+        <div class="field"><label for="perp-maintenance-frac">Maintenance margin (fraction of initial)</label><input id="perp-maintenance-frac" value="0.9"></div>
+      </div>
+      <div class="checks" id="perp-strategies">
+        <label><input type="checkbox" value="flat" checked> flat -- stay in cash</label>
+        <label><input type="checkbox" value="hold" checked> hold -- go long once and sit</label>
+        <label><input type="checkbox" value="trend_24h" checked> trend_24h -- hourly vs 24h average</label>
+        <label><input type="checkbox" value="window_15m" checked> window_15m -- the 15-minute bot's idea, copied</label>
+      </div>
+      <div class="row"><button class="action primary" id="perp-run">Run backtest</button><span class="note" id="perp-run-note"></span></div>
+
+      <h3 style="margin-top:22px">Saved reports</h3>
+      <div class="row">
+        <label for="perp-report-select">Report</label>
+        <select id="perp-report-select" style="min-width:340px"></select>
+        <button class="action" id="perp-load-report">Load</button>
+        <button class="action" id="perp-refresh-reports" title="Look for new reports">Refresh</button>
+      </div>
+      <div class="note" id="perp-reports-note"></div>
+
+      <div id="perp-results" hidden style="margin-top:18px">
+        <div class="note" id="perp-spec-summary"></div>
+        <h3>Simulated returns</h3>
+        <div class="table-scroll"><table id="perp-table">
+          <thead><tr><th>Seg</th><th>Strategy</th><th>Lev</th><th>Fund/8h</th><th class="num">Return%</th><th class="num">Max DD%</th><th class="num">Trades</th><th class="num">Fees$</th><th class="num">Funding$</th><th class="num">Liq</th><th class="num">In-mkt%</th></tr></thead>
+          <tbody></tbody></table>
+        </div>
+        <h3>Held-out test verdicts <span class="sub">(daily returns, paired by day)</span></h3>
+        <div id="perp-verdicts"></div>
+        <div class="note" id="perp-disclaimer" hidden>Paper simulation on a spot proxy with an assumed funding rate -- not a profitability claim and not a recorded out-of-sample result. Nothing here places an order.</div>
       </div>
     </div>
   </section>
@@ -785,6 +838,95 @@ async function runBacktest() {
   } catch(err){backtestRunning=false;$("run-backtest").disabled=false;$("backtest-note").textContent='Error: '+err.message;}
 }
 
+// ---------------------------------------------------------------- perps (paper)
+let perpJob = null, perpTimer = null, perpRunning = false;
+
+async function refreshPerpDatabases() {
+  try {
+    const dbs = await getJson("/api/perp/databases");
+    const sel = $("perp-db-select"), current = sel.value;
+    sel.innerHTML = dbs.length ? dbs.map((d) => `<option value="${esc(d.name)}">${esc(d.name)} -- ${esc(d.source)}</option>`).join("")
+      : '<option value="">No eligible database found -- run btcbot download-history or download-polymarket-history first</option>';
+    if (dbs.some((d) => d.name === current)) sel.value = current;
+  } catch (err) { $("perp-run-note").textContent = "Error listing databases: " + err.message; }
+}
+
+async function refreshPerpReports() {
+  try {
+    const reports = await getJson("/api/perp/reports");
+    const sel = $("perp-report-select");
+    sel.innerHTML = reports.length ? reports.map((r) =>
+      `<option value="${esc(r.name)}">${esc(r.name)} -- ${esc(r.source)}, ${r.bars} bars, test after ${esc(String(r.train_end).slice(0, 16))}</option>`).join("")
+      : '<option value="">No saved reports yet</option>';
+    return reports;
+  } catch (err) { $("perp-reports-note").textContent = "Error: " + err.message; return []; }
+}
+
+function renderPerpReport(report) {
+  const s = report.spec;
+  $("perp-spec-summary").innerHTML = `<b>${esc(report.source)}</b> -- ${report.bars} one-minute bars, test = bars after ${esc(report.train_end)}<br>
+    Kalshi BTCPERP rules assumed: taker fee ${esc(s.taker_fee_bps)} bps on notional, maintenance margin ${esc(s.maintenance_frac)}x initial, funding cap ${esc(s.funding_cap)} / dead band ${esc(s.funding_deadband)} per 8h.
+    Assumed ${esc(s.half_spread_bps)} bps slippage per fill, ${esc(s.liq_slippage_bps)} bps extra on a liquidation, perp price = the spot proxy.`;
+  $q("#perp-table tbody").innerHTML = report.rows.length ? report.rows.map((r) => `<tr><td>${esc(r.segment)}</td><td>${esc(r.strategy)}</td><td>${esc(r.leverage)}</td><td>${esc(r.funding_8h)}</td>
+    <td class="num">${Number(r.return_pct).toFixed(2)}%</td><td class="num">${Number(r.max_drawdown_pct).toFixed(2)}%</td><td class="num">${r.trades}</td>
+    <td class="num">$${Number(r.fees_paid).toFixed(2)}</td><td class="num">$${Number(r.funding_paid).toFixed(2)}</td><td class="num">${r.liquidations}</td>
+    <td class="num">${Number(r.exposure_pct).toFixed(1)}%</td></tr>`).join("") : '<tr><td colspan="11" class="empty">No rows.</td></tr>';
+  $("perp-verdicts").innerHTML = report.verdicts.length ? report.verdicts.map((v) =>
+    `<div class="sub"><b>${esc(v.strategy)}</b> lev ${esc(v.leverage)} funding ${esc(v.funding_8h)}: ${esc(v.verdict)}</div>`).join("")
+    : '<div class="sub">No verdicts (nothing here to compare against staying in cash or buy-and-hold).</div>';
+  $("perp-results").hidden = false;
+  $("perp-disclaimer").hidden = false;
+}
+
+async function loadPerpReport() {
+  const name = $("perp-report-select").value;
+  if (!name) { $("perp-reports-note").textContent = "No saved report to load yet -- run a backtest above."; return; }
+  try {
+    renderPerpReport(await getJson("/api/perp/report?name=" + encodeURIComponent(name)));
+    $("perp-reports-note").textContent = "Loaded " + name + ".";
+  } catch (err) { $("perp-reports-note").textContent = "Error: " + err.message; }
+}
+
+function perpPayload() {
+  return {
+    db: $("perp-db-select").value, account: $("perp-account").value,
+    leverages: $("perp-leverages").value.split(",").map((s) => s.trim()).filter(Boolean),
+    fundings: $("perp-fundings").value.split(",").map((s) => s.trim()).filter(Boolean),
+    strategies: [...document.querySelectorAll("#perp-strategies input:checked")].map((i) => i.value),
+    split: $("perp-split").value, fee_bps: $("perp-fee-bps").value, slippage_bps: $("perp-slippage-bps").value,
+    maintenance_frac: $("perp-maintenance-frac").value,
+  };
+}
+
+async function pollPerp() {
+  if (!perpJob) return;
+  try {
+    const st = await getJson("/api/perp/status?id=" + encodeURIComponent(perpJob));
+    $("perp-run-note").className = "note";
+    $("perp-run-note").textContent = `${st.db} -- ${st.state} -- ${st.label} -- ${Math.round(st.elapsed_sec)}s`;
+    if (st.state === "completed" || st.state === "error") {
+      perpJob = null; perpRunning = false; $("perp-run").disabled = false;
+      if (st.state === "error") throw new Error(st.error);
+      renderPerpReport(st.report);
+      await refreshPerpReports();
+      return;
+    }
+    perpTimer = setTimeout(pollPerp, 750);
+  } catch (err) { perpRunning = false; perpJob = null; $("perp-run").disabled = false; $("perp-run-note").className = "error"; $("perp-run-note").textContent = err.message; }
+}
+
+async function runPerpBacktest() {
+  if (perpRunning) return;
+  const payload = perpPayload();
+  if (!payload.db) { $("perp-run-note").className = "note"; $("perp-run-note").textContent = "Choose a data file first."; return; }
+  if (!payload.strategies.length) { $("perp-run-note").className = "note"; $("perp-run-note").textContent = "Choose at least one strategy."; return; }
+  perpRunning = true; $("perp-run").disabled = true; $("perp-run-note").className = "note"; $("perp-run-note").textContent = "Starting…";
+  try {
+    const st = await postJson("/api/perp/start", payload);
+    perpJob = st.id; clearTimeout(perpTimer); await pollPerp();
+  } catch (err) { perpRunning = false; $("perp-run").disabled = false; $("perp-run-note").className = "error"; $("perp-run-note").textContent = "Error: " + err.message; }
+}
+
 async function loadSettings() {
   const s = await getJson("/api/settings");
   const radio = document.querySelector(`input[name="kalshi-env"][value="${s.kalshi_env}"]`) || document.querySelector('input[name="kalshi-env"][value="demo"]');
@@ -1044,7 +1186,7 @@ document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("c
   tab = btn.dataset.tab;
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
   document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === `tab-${tab}`));
-  const noPicker = tab === "settings" || tab === "lab" || (tab === "monitor" && historyMode);
+  const noPicker = tab === "settings" || tab === "lab" || tab === "perps" || (tab === "monitor" && historyMode);
   $("db-row").style.display = noPicker ? "none" : "";
   $("pickhelp").style.display = noPicker ? "none" : "";
   $q("#ticker-select").parentElement.style.display = tab === "market" ? "" : "none";
@@ -1080,6 +1222,10 @@ $("refresh-databases").addEventListener("click", async () => { const dbs = await
 $("db-select").addEventListener("change", () => { runSelections[runGroup()] = $("db-select").value; clearMarket(); clearPortfolio(); $("ticker-select").innerHTML = ""; if(tab!=='market'){$('hdr-title').textContent=document.querySelector('nav button.active').textContent;$('hdr-sub').textContent=$('db-select').value;} refreshTab(); });
 $("ticker-select").addEventListener("change", () => { clearMarket(); refreshTab(); });
 $("run-backtest").addEventListener("click", runBacktest);
+$("perp-run").addEventListener("click", runPerpBacktest);
+$("perp-load-report").addEventListener("click", loadPerpReport);
+$("perp-refresh-dbs").addEventListener("click", refreshPerpDatabases);
+$("perp-refresh-reports").addEventListener("click", refreshPerpReports);
 $("lab-run").addEventListener("click", labRun);
 $("lab-cancel").addEventListener("click", labCancel);
 $("save-settings").addEventListener("click", saveSettings);
@@ -1128,6 +1274,7 @@ $("export-trades").addEventListener('click',()=>{
   let labDefaults = null;
   try { labDefaults = await getJson("/api/lab/defaults"); } catch (e) { /* falls back to the static HTML defaults */ }
   buildLabForm(dbList, labDefaults && labDefaults.account);
+  try { await refreshPerpDatabases(); await refreshPerpReports(); } catch (e) { /* Perps tab is optional at startup */ }
   await refreshMarket();
   try { await loadSettings(); } catch (e) { $("settings-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }
   try { await loadConfig(); } catch (e) { $("config-status").innerHTML = '<div class="error">Error: ' + esc(e.message) + "</div>"; }

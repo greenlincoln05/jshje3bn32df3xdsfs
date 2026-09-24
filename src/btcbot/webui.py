@@ -15,6 +15,11 @@ ever reads local SQLite databases and rewrites three lines of a local text file.
 demo-only order-placing code elsewhere in this repo -- `kalshi_client.py`/`execution.py`/`demo_check.py` --
 but nothing here calls any of it; entering a key just lets the owner run `auth-check`/`demo-check`
 themselves, exactly as if they'd edited `.env` directly.)
+
+The "Perps (paper)" tab is the same read-only-plus-offline-compute pattern as Backtest/Strategy Lab, for
+:mod:`btcbot.perp_backtest` (docs/research/perps-paper.md): it lists saved `btcbot perp-backtest` JSON
+reports and can also run a fresh one, in the background, over a local database already on disk. Same
+guarantees as the CLI: no network, no key, and no perps order code exists anywhere in this repo.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from btcbot.dashboard_analytics import portfolio_view
 from btcbot.dashboard_history import portfolio_history
 from btcbot.dashboard_jobs import BacktestJobs, BacktestQueueFull
 from btcbot.dashboard_market import market_quote, market_view
+from btcbot.dashboard_perps import PerpJobs, PerpQueueFull, list_perp_databases, list_perp_reports, read_perp_report
 from btcbot.lab import (
     DEFAULT_GRID, TUNABLE, AccountSettings, LabError, LabParams, expand_grid, load_lab_data, parse_values, run_lab,
 )
@@ -595,6 +601,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if job is None:
                     raise _ApiError(404, "no such backtest (the dashboard may have been restarted)")
                 self._send_json(200, job)
+            elif parsed.path == "/api/perp/databases":
+                self._send_json(200, list_perp_databases(self.server.data_dir))
+            elif parsed.path == "/api/perp/reports":
+                self._send_json(200, list_perp_reports(self.server.data_dir))
+            elif parsed.path == "/api/perp/report":
+                try:
+                    self._send_json(200, read_perp_report(self.server.data_dir, query.get("name", "")))
+                except (FileNotFoundError, ValueError) as exc:
+                    raise _ApiError(404, f"no such report: {exc}") from exc
+            elif parsed.path == "/api/perp/status":
+                job = self.server.perp_jobs.get(query.get("id", ""))
+                if job is None:
+                    raise _ApiError(404, "no such perp backtest run (the dashboard may have been restarted)")
+                self._send_json(200, job)
             elif parsed.path == "/api/settings":
                 self._send_json(200, settings_status(self.server.env_path))
             elif parsed.path == "/api/config":
@@ -641,6 +661,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         maker_fee_multiplier=str(payload.get("maker_fee_multiplier", "both")),
                     )
                 except BacktestQueueFull as exc:
+                    raise _ApiError(409, str(exc)) from exc
+                except (ValueError, OSError) as exc:
+                    raise _ApiError(400, str(exc)) from exc
+                self._send_json(202, job)
+            elif parsed.path == "/api/perp/start":
+                payload = self._read_json_body()
+                path = self._require_db({"db": str(payload.get("db", ""))})
+                try:
+                    job = self.server.perp_jobs.submit(path, self.server.data_dir, payload)
+                except PerpQueueFull as exc:
                     raise _ApiError(409, str(exc)) from exc
                 except (ValueError, OSError) as exc:
                     raise _ApiError(400, str(exc)) from exc
@@ -745,6 +775,8 @@ class DashboardServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         if hasattr(self, "backtest_jobs"):
             self.backtest_jobs.close(wait=False)
+        if hasattr(self, "perp_jobs"):
+            self.perp_jobs.close(wait=False)
         super().server_close()
 
 
@@ -758,6 +790,7 @@ def create_dashboard_server(*, data_dir: Path, env_path: Path, config_path: Path
     server.config_path = config_path  # type: ignore[attr-defined]
     server.lab_jobs = {}  # type: ignore[attr-defined]
     server.backtest_jobs = BacktestJobs()
+    server.perp_jobs = PerpJobs()
     server.daemon_threads = True
     return server
 
