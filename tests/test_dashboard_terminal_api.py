@@ -1,8 +1,12 @@
 import time
 import sqlite3
+from decimal import Decimal
 
 import pytest
 
+from btcbot.coinbase_history import Candle
+from btcbot.history_pipeline import init_history_schema, save_candles
+from test_perp import random_walk_bars
 from test_webui import dashboard, _get, _post, make_db, seed_fillable_window, TICKER, T0
 
 
@@ -64,3 +68,48 @@ def test_backtest_http_rejects_path_escape_and_nonfinite_fee(dashboard):
     db = make_db(dashboard.data_dir)
     assert _post(dashboard.base_url, "/api/backtest/start", {"db": "../escape.sqlite"})[0] == 404
     assert _post(dashboard.base_url, "/api/backtest/start", {"db": db.name, "maker_fee_multiplier": "NaN"})[0] == 400
+
+
+def _make_history_db(data_dir, name="history-KXBTC15M-prod-20260101T000000Z.sqlite", days=3):
+    db_path = data_dir / name
+    conn = sqlite3.connect(str(db_path))
+    init_history_schema(conn)
+    save_candles(conn, [Candle(b.ts, b.low, b.high, b.open, b.close, Decimal(1)) for b in random_walk_bars(days)])
+    conn.close()
+    return db_path
+
+
+def test_perp_backtest_http_runs_a_job_and_the_saved_report_matches_a_reload(dashboard):
+    db = _make_history_db(dashboard.data_dir)
+    status, dbs = _get(dashboard.base_url, "/api/perp/databases")
+    assert status == 200 and dbs[0]["name"] == db.name and "Coinbase" in dbs[0]["source"]
+
+    status, reports = _get(dashboard.base_url, "/api/perp/reports")
+    assert status == 200 and reports == []
+
+    payload = {"db": db.name, "strategies": ["flat"], "leverages": ["1"], "fundings": ["0"]}
+    status, job = _post(dashboard.base_url, "/api/perp/start", payload)
+    assert status == 202
+    for _ in range(200):
+        status, job = _get(dashboard.base_url, f"/api/perp/status?id={job['id']}")
+        if job["state"] in ("completed", "error"):
+            break
+        time.sleep(.01)
+    assert status == 200 and job["state"] == "completed", job
+    assert job["report"]["rows"]
+
+    status, reports = _get(dashboard.base_url, "/api/perp/reports")
+    assert status == 200 and len(reports) == 1
+    status, full = _get(dashboard.base_url, f"/api/perp/report?name={reports[0]['name']}")
+    assert status == 200 and full == job["report"]
+
+    assert _get(dashboard.base_url, "/api/perp/report?name=../escape.json")[0] == 404
+    assert _get(dashboard.base_url, "/api/perp/status?id=missing")[0] == 404
+
+
+def test_perp_backtest_http_rejects_path_escape_bad_strategy_and_high_leverage(dashboard):
+    db = dashboard.data_dir / "recorder.sqlite"
+    sqlite3.connect(str(db)).close()
+    assert _post(dashboard.base_url, "/api/perp/start", {"db": "../escape.sqlite"})[0] == 404
+    assert _post(dashboard.base_url, "/api/perp/start", {"db": db.name, "strategies": ["bogus"]})[0] == 400
+    assert _post(dashboard.base_url, "/api/perp/start", {"db": db.name, "leverages": ["10"]})[0] == 400

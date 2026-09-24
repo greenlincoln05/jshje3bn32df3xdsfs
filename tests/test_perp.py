@@ -19,6 +19,7 @@ from btcbot.history_pipeline import init_history_schema, save_candles
 from btcbot.perp_backtest import (
     Bar,
     PerpBacktestError,
+    describe_source,
     excess_t,
     load_bars,
     render_report,
@@ -250,6 +251,28 @@ class TestLoadBars:
     def test_an_unrelated_database_is_an_error(self):
         with pytest.raises(PerpBacktestError):
             load_bars(sqlite3.connect(":memory:"))
+
+    def test_describe_source_matches_load_bars_and_none_for_unrelated_or_empty(self):
+        history_conn = sqlite3.connect(":memory:")
+        init_history_schema(history_conn)
+        save_candles(history_conn, [Candle(T0, d(99), d(102), d(100), d(101), d(1))])
+        assert describe_source(history_conn) == load_bars(history_conn)[1]
+
+        pm_conn = sqlite3.connect(":memory:")
+        init_pm_history_schema(pm_conn)
+        base = int(T0.timestamp())
+        pm_conn.execute(
+            "INSERT INTO btc_klines_1s VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (base, "100", "100.5", "99.5", "100.25", "1", 1, "0.5")
+        )
+        assert describe_source(pm_conn) == load_bars(pm_conn)[1]
+
+        assert describe_source(sqlite3.connect(":memory:")) is None
+        empty_history = sqlite3.connect(":memory:")
+        init_history_schema(empty_history)
+        assert describe_source(empty_history) is None  # spot_candles exists but has no rows
+        empty_pm = sqlite3.connect(":memory:")
+        init_pm_history_schema(empty_pm)
+        assert describe_source(empty_pm) is None  # btc_klines_1s exists but has no rows
 
 
 class TestCli:

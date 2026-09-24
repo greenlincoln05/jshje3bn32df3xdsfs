@@ -166,7 +166,14 @@ truth for scope and phases; the README has the phase status and a dated table of
   to this project's first recorded run, not just runs started after this feature landed. Deliberately not a
   re-derived multi-file equity curve -- paper resets its simulated bankroll on every restart, and demo's real
   balance carries over on the exchange but isn't reconstructed here -- just a chronological ledger of settled
-  trades with a per-PR-segment win-rate/PnL summary.
+  trades with a per-PR-segment win-rate/PnL summary. A "Perps (paper)" tab (`dashboard_perps.py`) gives
+  `btcbot perp-backtest` (above) the same treatment: `list_perp_databases()` lists local databases with usable
+  BTC bars (cheap -- checks table names and one row, never loads the bars), `PerpJobs` runs a fresh backtest
+  in the background over one and writes it to `data/research/perp-backtest-<timestamp>.json` -- the exact
+  file the CLI itself would write, so the CLI and the dashboard read and write one shared report format -- and
+  `list_perp_reports()`/`read_perp_report()` reload any saved report (by this tab or the CLI) without rerunning
+  it. Same guarantees as the CLI and everything else in this file: no network, no key, and it cannot reach
+  perps order code because none exists anywhere in this repo.
 
 - `stream_recorder.py` (`btcbot stream`) is a READ-ONLY authenticated WebSocket capture of BRTI
   (`cfbenchmarks_value`, `cfbenchmarks_value_5hz`) and order-book deltas. It sends only `subscribe` /
