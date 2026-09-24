@@ -53,6 +53,7 @@ from btcbot.backtest import BacktestError, BacktestReport, load_replay_data, run
 from btcbot.candidate_suite import load_candidate_suite, render_candidate_suite, run_candidate_suite
 from btcbot.coinbase_history import CoinbaseHistoryError, fetch_candle_history
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
+from btcbot.singleton import AlreadyRunningError, acquire_lock, release_lock
 from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.history_pipeline import (
     HistoryError,
@@ -1185,76 +1186,85 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
     env = KalshiEnv.DEMO
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    db_path = data_dir / f"demo-{series_ticker}-{env.value}-{timestamp}.sqlite"
-    maker_fee_multiplier = Decimal(args.maker_fee_multiplier)
-
-    async with KalshiClient(env, auth=auth, write_log=order_audit_log()) as client:  # signs only the calls that need it; market data stays public
-        balance = await client.get_balance()  # proves the demo key works before anything is placed
-        market_now = await find_current_market(client, series_ticker)
-        if market_now is not None:
-            collateral = collateral_preflight(balance, market_now)
-            if collateral.passed is False:
-                print(f"error: {collateral.detail}", file=sys.stderr)
-                return 1
-        reconcile = await DemoExecutionBackend(client, "").reconcile()
-        print(
-            f"Demo account: available ${balance.available:,.2f}. Cancelled {len(reconcile.cancelled_order_ids)} "
-            f"leftover resting order(s); {len(reconcile.open_positions)} open position(s) left alone.",
-            flush=True,
-        )
-        recorder = Recorder(
-            client, series_ticker=series_ticker, db_path=db_path, kill_file=args.kill_file,
-            poll_interval_sec=args.poll_interval, settle_on_determined=True,
-        )
-        # The dashboard reads the run's starting account from here, so nobody types a capital number in.
-        recorder.log_event("account_start", json.dumps({
-            "kind": "demo", "available_usd": str(balance.available), "portfolio_value_usd": str(balance.portfolio_value),
-            "source": "kalshi demo balance at start",
-        }))
-        trader_conn = sqlite3.connect(str(db_path))
-        spot_buffer = SpotBuffer()
-        trader = DemoTrader(
-            trader_conn, config, spot_buffer, client, maker_fee_multiplier=maker_fee_multiplier,
-            kill_file=args.kill_file, resume_file=args.resume_file,
-            log_event=lambda level, event, detail: recorder.log_event(event, detail, level=level),
-        )
-        recorder.on_orderbook = trader.on_orderbook_snapshot
-        recorder.on_settlement = trader.on_settlement
-
-        def on_tick(tick):
-            recorder.record_spot_tick(tick)
-            trader.on_spot_tick(tick.price, tick.receive_ts)
-
-        spot_feed = CoinbaseSpotFeed(spot_buffer, on_tick=on_tick)
-        spot_task = asyncio.ensure_future(spot_feed.run_forever())
-        print(
-            f"DEMO trading {series_ticker}: REAL orders, FAKE money, environment={env.value} -> {db_path}\n"
-            f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early (open orders are cancelled).",
-            flush=True,
-        )
-        summary = None
-        try:
-            summary = await recorder.run(duration_sec=args.hours * 3600)
-        finally:
-            spot_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await spot_task
-            await spot_feed.aclose()
-            await trader.shutdown(summary.stopped_at if summary is not None else datetime.now(timezone.utc))
-            trader.close()
-            recorder.close()
-    print(render_recorder_summary(summary))
-    print()
-    print("Trading report (real demo fills; PnL only for windows that have settled):")
-    print(render_backtest_reports([trader.report()]))
-    print()
-    report_conn = sqlite3.connect(str(db_path))
+    # A second live `btcbot demo` against the same data dir would place its OWN real orders on the SAME
+    # Kalshi account without either process ever learning about the other's -- see singleton.py's docstring
+    # for the production incident this closes off. Acquired before anything else (no network call yet), so
+    # a second instance fails fast instead of touching the exchange at all.
+    lock_path = data_dir / ".demo.lock"
+    acquire_lock(lock_path, label="btcbot demo")
     try:
-        print(render_demo_report(report_conn, trader.stats))
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        db_path = data_dir / f"demo-{series_ticker}-{env.value}-{timestamp}.sqlite"
+        maker_fee_multiplier = Decimal(args.maker_fee_multiplier)
+
+        async with KalshiClient(env, auth=auth, write_log=order_audit_log()) as client:  # signs only the calls that need it; market data stays public
+            balance = await client.get_balance()  # proves the demo key works before anything is placed
+            market_now = await find_current_market(client, series_ticker)
+            if market_now is not None:
+                collateral = collateral_preflight(balance, market_now)
+                if collateral.passed is False:
+                    print(f"error: {collateral.detail}", file=sys.stderr)
+                    return 1
+            reconcile = await DemoExecutionBackend(client, "").reconcile()
+            print(
+                f"Demo account: available ${balance.available:,.2f}. Cancelled {len(reconcile.cancelled_order_ids)} "
+                f"leftover resting order(s); {len(reconcile.open_positions)} open position(s) left alone.",
+                flush=True,
+            )
+            recorder = Recorder(
+                client, series_ticker=series_ticker, db_path=db_path, kill_file=args.kill_file,
+                poll_interval_sec=args.poll_interval, settle_on_determined=True,
+            )
+            # The dashboard reads the run's starting account from here, so nobody types a capital number in.
+            recorder.log_event("account_start", json.dumps({
+                "kind": "demo", "available_usd": str(balance.available), "portfolio_value_usd": str(balance.portfolio_value),
+                "source": "kalshi demo balance at start",
+            }))
+            trader_conn = sqlite3.connect(str(db_path))
+            spot_buffer = SpotBuffer()
+            trader = DemoTrader(
+                trader_conn, config, spot_buffer, client, maker_fee_multiplier=maker_fee_multiplier,
+                kill_file=args.kill_file, resume_file=args.resume_file,
+                log_event=lambda level, event, detail: recorder.log_event(event, detail, level=level),
+            )
+            recorder.on_orderbook = trader.on_orderbook_snapshot
+            recorder.on_settlement = trader.on_settlement
+
+            def on_tick(tick):
+                recorder.record_spot_tick(tick)
+                trader.on_spot_tick(tick.price, tick.receive_ts)
+
+            spot_feed = CoinbaseSpotFeed(spot_buffer, on_tick=on_tick)
+            spot_task = asyncio.ensure_future(spot_feed.run_forever())
+            print(
+                f"DEMO trading {series_ticker}: REAL orders, FAKE money, environment={env.value} -> {db_path}\n"
+                f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early (open orders are cancelled).",
+                flush=True,
+            )
+            summary = None
+            try:
+                summary = await recorder.run(duration_sec=args.hours * 3600)
+            finally:
+                spot_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await spot_task
+                await spot_feed.aclose()
+                await trader.shutdown(summary.stopped_at if summary is not None else datetime.now(timezone.utc))
+                trader.close()
+                recorder.close()
+        print(render_recorder_summary(summary))
+        print()
+        print("Trading report (real demo fills; PnL only for windows that have settled):")
+        print(render_backtest_reports([trader.report()]))
+        print()
+        report_conn = sqlite3.connect(str(db_path))
+        try:
+            print(render_demo_report(report_conn, trader.stats))
+        finally:
+            report_conn.close()
+        return 0
     finally:
-        report_conn.close()
-    return 0
+        release_lock(lock_path)
 
 
 async def _cmd_calibrate(args: argparse.Namespace) -> int:
@@ -1313,66 +1323,74 @@ async def _cmd_paper(args: argparse.Namespace) -> int:
     env = KalshiEnv(args.env) if args.env else KalshiSettings().env
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    db_path = data_dir / f"paper-{series_ticker}-{env.value}-{timestamp}.sqlite"
-    queue_assumption = QueueAssumption(args.queue)
-    maker_fee_multiplier = Decimal(args.maker_fee_multiplier)
+    # A second live `btcbot paper` against the same data dir runs an entirely independent simulated ledger
+    # alongside the first -- no shared external account like demo, but the two interleave in the same data
+    # directory and produce exactly the "PnL looks weird" confusion this closes off. See singleton.py.
+    lock_path = data_dir / ".paper.lock"
+    acquire_lock(lock_path, label="btcbot paper")
+    try:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        db_path = data_dir / f"paper-{series_ticker}-{env.value}-{timestamp}.sqlite"
+        queue_assumption = QueueAssumption(args.queue)
+        maker_fee_multiplier = Decimal(args.maker_fee_multiplier)
 
-    async with KalshiClient(env) as client:  # public data only: no auth; paper never places a real order
-        recorder = Recorder(
-            client,
-            series_ticker=series_ticker,
-            db_path=db_path,
-            kill_file=args.kill_file,
-            poll_interval_sec=args.poll_interval,
-        )
-        recorder.log_event("account_start", json.dumps({
-            "kind": "paper", "account_usd": str(config.sizing.account_usd),
-            "source": "config sizing.account_usd (paper has no exchange balance)",
-        }))
-        # a second connection to the same file: recorder.py owns the base tables, this owns predictions
-        trader_conn = sqlite3.connect(str(db_path))
-        spot_buffer = SpotBuffer()
-        trader = LivePaperTrader(
-            trader_conn,
-            config,
-            spot_buffer,
-            queue_assumption=queue_assumption,
-            maker_fee_multiplier=maker_fee_multiplier,
-            kill_file=args.kill_file,
-            resume_file=args.resume_file,
-            log_event=lambda level, event, detail: recorder.log_event(event, detail, level=level),
-        )
-        recorder.on_orderbook = trader.on_orderbook_snapshot
-        recorder.on_settlement = trader.on_settlement
+        async with KalshiClient(env) as client:  # public data only: no auth; paper never places a real order
+            recorder = Recorder(
+                client,
+                series_ticker=series_ticker,
+                db_path=db_path,
+                kill_file=args.kill_file,
+                poll_interval_sec=args.poll_interval,
+            )
+            recorder.log_event("account_start", json.dumps({
+                "kind": "paper", "account_usd": str(config.sizing.account_usd),
+                "source": "config sizing.account_usd (paper has no exchange balance)",
+            }))
+            # a second connection to the same file: recorder.py owns the base tables, this owns predictions
+            trader_conn = sqlite3.connect(str(db_path))
+            spot_buffer = SpotBuffer()
+            trader = LivePaperTrader(
+                trader_conn,
+                config,
+                spot_buffer,
+                queue_assumption=queue_assumption,
+                maker_fee_multiplier=maker_fee_multiplier,
+                kill_file=args.kill_file,
+                resume_file=args.resume_file,
+                log_event=lambda level, event, detail: recorder.log_event(event, detail, level=level),
+            )
+            recorder.on_orderbook = trader.on_orderbook_snapshot
+            recorder.on_settlement = trader.on_settlement
 
-        def on_tick(tick):
-            recorder.record_spot_tick(tick)
-            trader.on_spot_tick(tick.price, tick.receive_ts)
+            def on_tick(tick):
+                recorder.record_spot_tick(tick)
+                trader.on_spot_tick(tick.price, tick.receive_ts)
 
-        spot_feed = CoinbaseSpotFeed(spot_buffer, on_tick=on_tick)
-        spot_task = asyncio.ensure_future(spot_feed.run_forever())
-        print(
-            f"Paper trading {series_ticker} ({env.value}, simulated fills only -- no real orders) to {db_path}\n"
-            f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early and cancel any open order.",
-            flush=True,
-        )
-        summary = None
-        try:
-            summary = await recorder.run(duration_sec=args.hours * 3600)
-        finally:
-            spot_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await spot_task
-            await spot_feed.aclose()
-            await trader.shutdown(summary.stopped_at if summary is not None else datetime.now(timezone.utc))
-            trader.close()
-            recorder.close()
-    print(render_recorder_summary(summary))
-    print()
-    print("Trading report (feed this database to `btcbot backtest` to compare against a replay of it):")
-    print(render_backtest_reports([trader.report()]))
-    return 0
+            spot_feed = CoinbaseSpotFeed(spot_buffer, on_tick=on_tick)
+            spot_task = asyncio.ensure_future(spot_feed.run_forever())
+            print(
+                f"Paper trading {series_ticker} ({env.value}, simulated fills only -- no real orders) to {db_path}\n"
+                f"for up to {args.hours:.2f}h. Create {args.kill_file} to stop early and cancel any open order.",
+                flush=True,
+            )
+            summary = None
+            try:
+                summary = await recorder.run(duration_sec=args.hours * 3600)
+            finally:
+                spot_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await spot_task
+                await spot_feed.aclose()
+                await trader.shutdown(summary.stopped_at if summary is not None else datetime.now(timezone.utc))
+                trader.close()
+                recorder.close()
+        print(render_recorder_summary(summary))
+        print()
+        print("Trading report (feed this database to `btcbot backtest` to compare against a replay of it):")
+        print(render_backtest_reports([trader.report()]))
+        return 0
+    finally:
+        release_lock(lock_path)
 
 
 async def _cmd_dashboard(args: argparse.Namespace) -> int:
@@ -1831,6 +1849,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    except (ConfigError, KalshiError, ValueError, OSError) as exc:  # ValueError covers ParseError and bad settings
+    except (ConfigError, KalshiError, ValueError, OSError, AlreadyRunningError) as exc:  # ValueError covers ParseError and bad settings
         print(f"error: {exc}", file=sys.stderr)
         return 1
