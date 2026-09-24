@@ -56,7 +56,11 @@ guard test was updated to add the one new read, `get_market_trades`). Nothing is
   detection (Binance switched spot archives to microseconds on 2025-01-01), REST fallback for days not yet
   archived.
 - `pm_history.py` + `btcbot download-polymarket-history`: a resumable backfill into one `pm_`/`btc_`-prefixed
-  SQLite file. Windows come from the slug epoch, which is the window **start**: `btc-updown-15m-1765548000` is
+  SQLite file. The trade tape is stored as **per-second aggregates** (print count, total size and total notional
+  per second, token and taker side), which is everything the analysis reads. It measured 8.7x smaller than raw
+  prints: about 0.21 MB instead of 1.84 MB per busy window, so ~3 GB instead of ~26 GB since May 1. The run also
+  **stops cleanly below `--min-free-gb`** (default 2) instead of filling the disk. Both were added after the
+  raw-print version helped fill the owner's disk on 2026-09-24. Windows come from the slug epoch, which is the window **start**: `btc-updown-15m-1765548000` is
   "December 12, 9:00AM-9:15AM ET". Gamma's `endDate` must equal start + 900, or the window is recorded as
   `window_mismatch` and left out.
 - `pm_reaction.py` + `btcbot pm-reaction`: the validity report, lead-lag, event study and both models, plus a

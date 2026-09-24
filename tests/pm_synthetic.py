@@ -80,7 +80,11 @@ def make_db(
             " window_end, result_up, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'x')",
             (slug, horizon_sec, f"0xc{w}", f"up{w}", f"down{w}", start, end, 1 if result_up else 0),
         )
-        conn.executemany("INSERT INTO pm_hist_trades (slug, ts, outcome, side, price, size, tx_hash) VALUES (?, ?, ?, ?, ?, ?, ?)", trades)
+        # At most one print per second here, so each becomes its own per-second tape row (n = 1).
+        conn.executemany(
+            "INSERT INTO pm_hist_tape (slug, ts, outcome, side, n, size, notional) VALUES (?, ?, ?, ?, 1, ?, ?)",
+            [(sl, ts, o, sd, size, str(Decimal(price) * Decimal(size))) for sl, ts, o, sd, price, size, _tx in trades],
+        )
         conn.execute(
             "INSERT INTO pm_hist_progress (slug, status, trade_count, truncated, fetched_at) VALUES (?, 'done', ?, 0, 'x')",
             (slug, len(trades)),

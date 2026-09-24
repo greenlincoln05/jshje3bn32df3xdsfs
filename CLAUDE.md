@@ -114,7 +114,11 @@ truth for scope and phases; the README has the phase status and a dated table of
   `get_market_trades`, is another public GET, and `tests/test_polymarket.py` pins the exact method list). Reaction research
   (`docs/research/polymarket-reaction-data.md`): `btcbot download-polymarket-history` (`pm_history.py`,
   `binance_history.py`) backfills settled windows' public taker trade tape (no wallet/profile fields stored) plus
-  checksum-verified Binance BTCUSDT 1 s klines into `pm_`/`btc_`-prefixed tables; `btcbot pm-reaction` (`pm_reaction.py`)
+  checksum-verified Binance BTCUSDT 1 s klines into `pm_`/`btc_`-prefixed tables. The tape is stored as per-second
+  aggregates (`pm_hist_tape`: prints, total size, total notional per window/second/token/taker side; measured 8.7x smaller
+  than raw prints on busy windows) and both backfills stop cleanly below `--min-free-gb` (default 2) -- the raw-print
+  version helped fill the owner's disk on 2026-09-24 until `paper`/`demo` could not create their databases, so do not
+  go back to storing raw prints or drop that floor. Old raw-print databases (`pm_hist_trades`) are still read; `btcbot pm-reaction` (`pm_reaction.py`)
   reports data validity, lead-lag, a BTC-shock/strike-cross event study, and trains two `LogisticModel`s judged on later
   windows with a window-paired t <= -2: an outcome model vs Polymarket's OWN price, and a reaction model vs a CONTROL
   (Polymarket history + last print's side + BTC's move since that print). Do not drop that control: without it a

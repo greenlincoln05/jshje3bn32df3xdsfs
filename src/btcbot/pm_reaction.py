@@ -227,7 +227,7 @@ def build_series(
             cur_idx = i
             pm_flow[i] = sum(t.up_flow for t in group)
             pm_absflow[i] = weight
-            pm_count[i] = float(len(group))
+            pm_count[i] = float(sum(t.count for t in group))
             ups = [t.up_price for t in group if t.outcome == "up"]
             downs = [t.up_price for t in group if t.outcome == "down"]
             if ups and downs:
@@ -271,7 +271,7 @@ def build_series(
     return WindowSeries(
         slug=window.slug, start=window.start, end=window.end, result_up=window.result_up, truncated=window.truncated,
         t0=t0, btc=btc, btc_missing=missing, pm=pm, last_trade_idx=last_trade_idx, sigma=sigma, p_fair=p_fair,
-        complement_gaps=complement_gaps, trade_count=len(trades),
+        complement_gaps=complement_gaps, trade_count=sum(t.count for t in trades),
         _pm_flow=_prefix(pm_flow), _pm_absflow=_prefix(pm_absflow), _pm_count=_prefix(pm_count),
         _btc_flow=_prefix(btc_flow), _btc_vol=_prefix(btc_vol),
     )
