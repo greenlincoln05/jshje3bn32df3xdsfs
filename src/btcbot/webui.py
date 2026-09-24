@@ -39,6 +39,7 @@ from pydantic import ValidationError
 from btcbot.backtest import BacktestError, load_trades, run_backtest
 from btcbot.config import BotConfig, ConfigError, load_config
 from btcbot.dashboard_analytics import portfolio_view
+from btcbot.dashboard_history import portfolio_history
 from btcbot.dashboard_jobs import BacktestJobs, BacktestQueueFull
 from btcbot.dashboard_market import market_quote, market_view
 from btcbot.lab import (
@@ -558,6 +559,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                             self._configured_account())
                 except (ValueError, ArithmeticError, sqlite3.Error) as exc:
                     raise _ApiError(400, f"portfolio error: {exc}") from exc
+                self._send_json(200, result)
+            elif parsed.path == "/api/portfolio_history":
+                kind = query.get("kind", "")
+                try:
+                    result = portfolio_history(self.server.data_dir, kind)
+                except (ValueError, sqlite3.Error) as exc:
+                    raise _ApiError(400, f"portfolio history error: {exc}") from exc
                 self._send_json(200, result)
             elif parsed.path == "/api/quote":
                 self._send_json(200, market_quote(self._require_db(query), query.get("ticker", "")))

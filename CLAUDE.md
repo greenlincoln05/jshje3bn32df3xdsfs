@@ -134,7 +134,18 @@ truth for scope and phases; the README has the phase status and a dated table of
   `paper_summary()` metric, dropped by the Terminal redesign (PR #52) and restored in `dashboard_analytics.py`).
   `list_databases()` now labels a `polymarket-*.sqlite` recording as its own kind rather than "unknown", and
   the Strategy Lab's own recording checklist excludes it explicitly (its `pm_`-prefixed schema has none of
-  the Kalshi tables a lab replay reads).
+  the Kalshi tables a lab replay reads). The Portfolio tab also has a "Full history" mode
+  (`dashboard_history.py`, `GET /api/portfolio_history?kind=paper|demo`): one continuous, scrollable trade
+  ledger merged across every `paper-*`/`demo-*.sqlite` file of that kind instead of picking one file at a
+  time, with divider rows marking which PR/commit was live for each stretch of trades
+  (`btcbot.code_version`: `btcbot paper`/`btcbot demo` record their own `git log HEAD` -- commit hash, PR
+  number and title parsed straight from this repo's own merge-commit convention, no GitHub API call -- into
+  a `code_version` table at startup). Every pre-existing `paper-*`/`demo-*.sqlite` file was backfilled once
+  by hand (correlating each file's own start timestamp against `git log --merges`), so the history goes back
+  to this project's first recorded run, not just runs started after this feature landed. Deliberately not a
+  re-derived multi-file equity curve -- paper resets its simulated bankroll on every restart, and demo's real
+  balance carries over on the exchange but isn't reconstructed here -- just a chronological ledger of settled
+  trades with a per-PR-segment win-rate/PnL summary.
 
 - `stream_recorder.py` (`btcbot stream`) is a READ-ONLY authenticated WebSocket capture of BRTI
   (`cfbenchmarks_value`, `cfbenchmarks_value_5hz`) and order-book deltas. It sends only `subscribe` /

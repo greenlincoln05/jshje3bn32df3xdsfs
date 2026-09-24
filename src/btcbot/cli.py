@@ -54,6 +54,7 @@ from btcbot.candidate_suite import load_candidate_suite, render_candidate_suite,
 from btcbot.coinbase_history import CoinbaseHistoryError, fetch_candle_history
 from btcbot.config import ConfigError, KalshiEnv, KalshiSettings, load_config
 from btcbot.singleton import AlreadyRunningError, acquire_lock, release_lock
+from btcbot.code_version import current_code_version, init_code_version_schema, record_code_version
 from btcbot.demo_check import DemoCheckReport, run_demo_check
 from btcbot.history_pipeline import (
     HistoryError,
@@ -1164,6 +1165,16 @@ async def _cmd_demo_probe(args: argparse.Namespace) -> int:
         return await run_probe(client, args.series or config.series_ticker)
 
 
+def _record_startup_code_version(conn: sqlite3.Connection) -> None:
+    """Best-effort: the dashboard's Portfolio tab uses this to mark, across every run's own database file,
+    which PR was live when its trades happened. A git failure (not a repo, git missing) must never stop a
+    live run from starting -- current_code_version() already returns None rather than raising for that."""
+    init_code_version_schema(conn)
+    version = current_code_version(cwd=Path(__file__).resolve().parent)
+    if version is not None:
+        record_code_version(conn, version, source="auto")
+
+
 async def _cmd_demo(args: argparse.Namespace) -> int:
     """The paper trader's strategy placing REAL orders in Kalshi's DEMO environment (fake money). Needs the
     owner's own demo key in .env. Always the demo environment: the client itself also refuses to sign an order
@@ -1221,6 +1232,7 @@ async def _cmd_demo(args: argparse.Namespace) -> int:
                 "source": "kalshi demo balance at start",
             }))
             trader_conn = sqlite3.connect(str(db_path))
+            _record_startup_code_version(trader_conn)
             spot_buffer = SpotBuffer()
             trader = DemoTrader(
                 trader_conn, config, spot_buffer, client, maker_fee_multiplier=maker_fee_multiplier,
@@ -1348,6 +1360,7 @@ async def _cmd_paper(args: argparse.Namespace) -> int:
             }))
             # a second connection to the same file: recorder.py owns the base tables, this owns predictions
             trader_conn = sqlite3.connect(str(db_path))
+            _record_startup_code_version(trader_conn)
             spot_buffer = SpotBuffer()
             trader = LivePaperTrader(
                 trader_conn,
