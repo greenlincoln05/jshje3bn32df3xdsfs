@@ -141,7 +141,7 @@ class TestClient:
         # There is no demo/paper environment on Polymarket to gate a write behind, so the only safe design is
         # for the capability to simply not exist -- confirm that by construction, not by convention.
         public_methods = {name for name in dir(PolymarketClient) if not name.startswith("_")}
-        assert public_methods == {"list_recent_updown_events", "get_event", "get_order_book"}
+        assert public_methods == {"list_recent_updown_events", "get_event", "get_order_book", "get_market_trades"}
 
 
 class FakeClock:

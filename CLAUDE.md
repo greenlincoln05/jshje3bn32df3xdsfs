@@ -110,7 +110,17 @@ truth for scope and phases; the README has the phase status and a dated table of
   analogous to Kalshi's `KXBTC15M`). There is no wallet, no private key, and **no order-placing method exists in
   `polymarket_client.py` at all** -- unlike Kalshi, Polymarket has no free demo/sandbox environment to gate real orders
   behind (it settles on-chain in real USDC from the first order), so the only safe design is for the capability to
-  simply not exist yet, the same way `stream_recorder.py` has no order/cancel command. `PolymarketRecorder` writes its
+  simply not exist yet, the same way `stream_recorder.py` has no order/cancel command (its one addition since,
+  `get_market_trades`, is another public GET, and `tests/test_polymarket.py` pins the exact method list). Reaction research
+  (`docs/research/polymarket-reaction-data.md`): `btcbot download-polymarket-history` (`pm_history.py`,
+  `binance_history.py`) backfills settled windows' public taker trade tape (no wallet/profile fields stored) plus
+  checksum-verified Binance BTCUSDT 1 s klines into `pm_`/`btc_`-prefixed tables; `btcbot pm-reaction` (`pm_reaction.py`)
+  reports data validity, lead-lag, a BTC-shock/strike-cross event study, and trains two `LogisticModel`s judged on later
+  windows with a window-paired t <= -2: an outcome model vs Polymarket's OWN price, and a reaction model vs a CONTROL
+  (Polymarket history + last print's side + BTC's move since that print). Do not drop that control: without it a
+  zero-lag synthetic market "lost" to BTC information at t < -6 from bid-ask bounce and 1 s timing alone. No real data
+  has been run through any of this from a session (this environment's network policy blocks the data hosts); models
+  save to `models/polymarket/` and are not loadable by `ml-ablation`/`validate --model`. `PolymarketRecorder` writes its
   own `pm_`-prefixed SQLite tables (`pm_orderbook_snapshots`, `pm_market_state`, `pm_settlements`, plus `run_log`) so a
   Polymarket database can never be mistaken for -- or accidentally read as -- a Kalshi one; `btcbot.features.build_rows`
   looks specifically for the Kalshi `orderbook_snapshots` table and correctly skips anything else. Not wired into
@@ -216,6 +226,8 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Read-only live check, no credentials needed: `.venv/Scripts/btcbot.exe discover --env prod`
 - Record public data (no credentials needed): `.venv/Scripts/btcbot.exe record --env prod --hours 9`
 - Record Polymarket's public "Bitcoin Up or Down" order books, READ-ONLY, no wallet/key needed (separate venue from Kalshi): `.venv/Scripts/btcbot.exe record-polymarket --horizon 15m --hours 9`
+- RESUMABLE, READ-ONLY backfill of settled Polymarket btc-updown windows' trade tape + Binance 1 s klines, needs network: `.venv/Scripts/btcbot.exe download-polymarket-history --since 2026-05-01T00:00:00Z` (add `--limit-markets 20` for a smoke test)
+- Polymarket reaction study + outcome/reaction models on a backfill (offline): `.venv/Scripts/btcbot.exe pm-reaction --db data/pm-history-15m-....sqlite`
 - Live paper trading, no credentials, no real orders (Phase 5): `.venv/Scripts/btcbot.exe paper --env prod --hours 9`
 - Calibration report from a recorder database: `.venv/Scripts/btcbot.exe calibrate --db data/recorder-....sqlite`
 - Backtest a recorder database: `.venv/Scripts/btcbot.exe backtest --db data/recorder-....sqlite`
