@@ -21,6 +21,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | 7 | Live, optional, only if phases 4-6 show positive edge after fees | not started |
 | -- | Historical trade tape + market candlestick backfill (`download-market-history`), owner-driven, not a numbered phase | **built and tested offline; no real backfill run yet (needs network on the owner's machine)** |
 | -- | Polymarket 15m reaction research (`download-polymarket-history`, `pm-reaction`), READ-ONLY, separate venue, not a numbered phase | **built and tested offline on synthetic data; no real data run yet (needs network)** |
+| -- | BTC perpetuals PAPER backtest under Kalshi `BTCPERP` rules (`perp-backtest`, [docs/research/perps-paper.md](docs/research/perps-paper.md)), no perps order code | **built and tested offline on synthetic data; no real backtest yet (needs BTC bars from `download-history`)** |
 
 Phase 1 shipped a read-only client with no order-placing methods at all; Phase 6 added
 `create_order`/`cancel_order`, hard-gated to Kalshi's demo environment only (see the Phase 6 write-up below

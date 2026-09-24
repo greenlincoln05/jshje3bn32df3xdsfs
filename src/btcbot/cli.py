@@ -35,6 +35,10 @@ Polymarket reaction research (docs/research/polymarket-reaction-data.md), READ-O
                                and Binance BTCUSDT 1s klines (public data, no key, no wallet)
   pm-reaction                  validity report, lead-lag, event study, and outcome/reaction models judged
                                on later windows against the market's own price (offline)
+
+BTC perpetual paper trading (docs/research/perps-paper.md), PAPER ONLY, no perps order code exists:
+  perp-backtest  replay idle cash through Kalshi BTCPERP rules (fees, 8h funding, margin, liquidation) at
+                 no or low leverage, against staying in cash and buy-and-hold (offline)
 """
 
 from __future__ import annotations
@@ -1213,6 +1217,44 @@ async def _cmd_pm_reaction(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_perp_backtest(args: argparse.Namespace) -> int:
+    """PAPER ONLY: replay BTC bars from a local database through Kalshi's BTCPERP rules. Offline -- no network,
+    no key, and there is no perps order code anywhere in this repo (docs/research/perps-paper.md)."""
+    from btcbot.perp_backtest import PerpBacktestError, load_bars, render_report, run_backtest
+    from btcbot.perp_paper import PerpPaperError, PerpSpec
+
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        print(f"error: no such database: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(str(db_path))
+    try:
+        bars, source = load_bars(conn)
+        spec = PerpSpec(taker_fee_bps=Decimal(args.fee_bps), half_spread_bps=Decimal(args.slippage_bps),
+                        maintenance_frac=Decimal(args.maintenance_frac))
+        report = run_backtest(
+            bars, source=source, account_usd=Decimal(args.account),
+            leverages=[Decimal(x) for x in (args.leverage or ["1", "2"])],
+            fundings=[Decimal(x) for x in (args.funding_8h or ["0", "0.0001"])],
+            strategies=args.strategy or ["flat", "hold", "trend_24h", "window_15m"],
+            train_fraction=args.split, spec=spec,
+        )
+    except (PerpBacktestError, PerpPaperError, sqlite3.Error, InvalidOperation) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(render_report(report))
+    out = Path(args.report) if args.report else Path(args.data_dir) / "research" / (
+        f"perp-backtest-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"source": report.source, "bars": report.bars, "train_end": report.train_end,
+                               "spec": report.spec, "rows": report.rows, "verdicts": report.verdicts}, indent=2),
+                   encoding="ascii")
+    print(f"\nFull report: {out}")
+    return 0
+
+
 async def _cmd_ml_ablation(args: argparse.Namespace) -> int:
     """Compare current-entry/ML-entry x settlement-hold/ML-exit as four independent layers on the same
     train/test split (docs/research/ml-layers-handoff.md). Offline: no network, no credentials."""
@@ -1822,6 +1864,24 @@ def build_parser() -> argparse.ArgumentParser:
     pm_reaction.add_argument("--k-sigma", type=float, default=3.0, help="BTC shock threshold in sigmas over 5 s (default: 3)")
     pm_reaction.set_defaults(handler=_cmd_pm_reaction)
 
+    perp = commands.add_parser(
+        "perp-backtest",
+        help="PAPER ONLY: replay idle cash through Kalshi BTCPERP rules (fees, funding, margin, liquidation) vs cash "
+        "and buy-and-hold, on BTC bars from a local database (offline; no perps order code exists)",
+    )
+    perp.add_argument("--db", required=True, help="a `download-history` database (Coinbase 1m spot_candles) or a `download-polymarket-history` one (Binance 1s klines)")
+    perp.add_argument("--account", default="500", help="idle cash to put to work, USD (default: 500)")
+    perp.add_argument("--leverage", action="append", help="leverage to test, repeatable, max 3 (default: 1 and 2)")
+    perp.add_argument("--funding-8h", action="append", help="assumed funding rate per 8h period, repeatable (default: 0 and 0.0001)")
+    perp.add_argument("--strategy", action="append", choices=["flat", "hold", "trend_24h", "window_15m"], help="repeatable (default: all four)")
+    perp.add_argument("--fee-bps", default="12", help="taker fee on notional, bps (default: 12, Kalshi's lowest-volume tier)")
+    perp.add_argument("--slippage-bps", default="1", help="assumed slippage per fill vs the spot proxy, bps (default: 1)")
+    perp.add_argument("--maintenance-frac", default="0.9", help="maintenance margin as a fraction of initial (default: 0.9)")
+    perp.add_argument("--split", type=float, default=0.7, help="fraction of bars before the held-out test (default: 0.7)")
+    perp.add_argument("--data-dir", default="data", help="report JSON goes to <data-dir>/research/ unless --report (default: ./data)")
+    perp.add_argument("--report", help="explicit path for the JSON report")
+    perp.set_defaults(handler=_cmd_perp_backtest)
+
     ablation = commands.add_parser(
         "ml-ablation",
         help="compare current-entry/ML-entry x settlement-hold/ML-exit as four independent layers on the same train/test split (offline)",
@@ -2008,6 +2068,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.max_staleness < 0 or args.embargo < 0 or not (args.min_move >= 0) or not (args.k_sigma > 0):
             print("error: --max-staleness/--embargo/--min-move must be non-negative and --k-sigma positive", file=sys.stderr)
             return 2
+    if args.command == "perp-backtest":
+        if not (0.2 <= args.split <= 0.9):
+            print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
+            return 2
+        for lev in args.leverage or []:
+            if not _is_non_negative_decimal(lev) or not (Decimal(0) < Decimal(lev) <= 3):
+                print("error: --leverage must be greater than 0 and at most 3 for paper trading", file=sys.stderr)
+                return 2
+        for name, value in (("--account", args.account), ("--fee-bps", args.fee_bps), ("--slippage-bps", args.slippage_bps)):
+            if not _is_non_negative_decimal(value) or (name == "--account" and Decimal(value) == 0):
+                print(f"error: {name} must be a non-negative number (--account positive)", file=sys.stderr)
+                return 2
+        for value in args.funding_8h or []:
+            try:
+                Decimal(value)
+            except InvalidOperation:
+                print("error: --funding-8h must be a number, e.g. 0.0001 for 0.01% per 8 hours", file=sys.stderr)
+                return 2
     if args.command == "ml-ablation":
         if args.entry_model is None and args.exit_model is None:
             print("error: give at least one of --entry-model / --exit-model", file=sys.stderr)
