@@ -1107,6 +1107,8 @@ async def _cmd_download_polymarket_history(args: argparse.Namespace) -> int:
     init_pm_history_schema(conn)
     print(f"{'Creating new' if is_new else 'Resuming'} database {db_path} (public data only, no key, no wallet)", flush=True)
     failed = False
+    min_free = int(args.min_free_gb * 1024**3)
+    db_dir = str(db_path.parent) if str(db_path.parent) else "."
     try:
         if not args.btc_only:
             print(f"Polymarket btc-updown-{args.horizon} windows {since.isoformat()} -> {until.isoformat()} ...", flush=True)
@@ -1114,7 +1116,7 @@ async def _cmd_download_polymarket_history(args: argparse.Namespace) -> int:
                 pm = await backfill_polymarket(
                     client, conn, horizon=args.horizon, since=since, until=until, concurrency=args.concurrency,
                     sleep_sec=args.sleep_ms / 1000, retry_missing=args.retry_missing, limit_markets=args.limit_markets,
-                    progress=lambda msg: print(msg, flush=True),
+                    progress=lambda msg: print(msg, flush=True), db_dir=db_dir, min_free_bytes=min_free,
                 )
             print(
                 f"  windows: {pm.windows} in range, {pm.done} fetched, {pm.skipped} already done, {pm.missing} with no "
@@ -1124,14 +1126,16 @@ async def _cmd_download_polymarket_history(args: argparse.Namespace) -> int:
             )
             for line in pm.failures[:10]:
                 print(f"  FAILED {line}", file=sys.stderr)
-            failed = failed or pm.failed > 0
+            if pm.stopped:
+                print(f"  STOPPED: {pm.stopped}", file=sys.stderr)
+            failed = failed or pm.failed > 0 or pm.stopped is not None
         if not args.no_btc:
             btc_start = since - timedelta(seconds=PRE_SEC + 60)
             print(f"Binance BTCUSDT 1s klines {btc_start.isoformat()} -> {until.isoformat()} ...", flush=True)
             async with httpx.AsyncClient(timeout=60.0) as http:
                 btc = await backfill_btc(
                     http, conn, start=btc_start, end=until, rest_fallback=not args.no_rest_fallback,
-                    progress=lambda msg: print(msg, flush=True),
+                    progress=lambda msg: print(msg, flush=True), db_dir=db_dir, min_free_bytes=min_free,
                 )
             print(
                 f"  days: {btc.days} in range, {btc.skipped} already done, {btc.archive_days} from the archive, "
@@ -1139,7 +1143,9 @@ async def _cmd_download_polymarket_history(args: argparse.Namespace) -> int:
             )
             for line in btc.failed[:10]:
                 print(f"  FAILED {line}", file=sys.stderr)
-            failed = failed or bool(btc.failed)
+            if btc.stopped:
+                print(f"  STOPPED: {btc.stopped}", file=sys.stderr)
+            failed = failed or bool(btc.failed) or btc.stopped is not None
     finally:
         conn.close()
     print(
@@ -1841,6 +1847,7 @@ def build_parser() -> argparse.ArgumentParser:
     download_pm.add_argument("--no-btc", action="store_true", help="skip the Binance klines")
     download_pm.add_argument("--btc-only", action="store_true", help="only the Binance klines (e.g. to pair with record-polymarket databases)")
     download_pm.add_argument("--no-rest-fallback", action="store_true", help="archive only; skip days it has not published yet")
+    download_pm.add_argument("--min-free-gb", type=float, default=2.0, help="stop cleanly when free disk space drops below this, GiB (default: 2, leaving room for paper/demo/record)")
     download_pm.set_defaults(handler=_cmd_download_polymarket_history)
 
     pm_reaction = commands.add_parser(
@@ -2053,6 +2060,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.btc_only and args.no_btc:
             print("error: --btc-only and --no-btc cannot both be given", file=sys.stderr)
             return 2
+        if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+            print("error: --min-free-gb must be a non-negative number", file=sys.stderr)
+            return 2
         if args.concurrency < 1 or args.sleep_ms < 0 or (args.limit_markets is not None and args.limit_markets < 1):
             print("error: --concurrency and --limit-markets must be at least 1, --sleep-ms non-negative", file=sys.stderr)
             return 2
@@ -2152,4 +2162,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except (ConfigError, KalshiError, ValueError, OSError, AlreadyRunningError) as exc:  # ValueError covers ParseError and bad settings
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.OperationalError as exc:
+        if "disk is full" not in str(exc) and "disk I/O" not in str(exc):
+            raise
+        print(
+            f"error: {exc}.\nThe disk holding the database is full, so nothing could be written. Free space first "
+            "(largest files: data\\ -- a pm-history-*.sqlite backfill is public data and safe to delete; paper-*/"
+            "demo-*/recorder-* databases are your own recordings and are not), then rerun.",
+            file=sys.stderr,
+        )
         return 1

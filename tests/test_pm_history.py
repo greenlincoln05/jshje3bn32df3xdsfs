@@ -262,8 +262,8 @@ class TestBackfillPolymarket:
         trades = load_trades(conn, w.slug)
         assert [t.ts for t in trades] == [W0 + 1, W0 + 5]
         assert trades[0].up_price == pytest.approx(0.6)  # the Down print, in Up terms
-        columns = {r[1] for r in conn.execute("PRAGMA table_info(pm_hist_trades)")}
-        assert columns == {"slug", "ts", "outcome", "side", "price", "size", "tx_hash"}  # no wallet/profile data
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(pm_hist_tape)")}
+        assert columns == {"slug", "ts", "outcome", "side", "n", "size", "notional"}  # no wallet/profile data
 
     async def test_a_rerun_skips_done_and_missing_but_retries_unresolved(self):
         script = {W0: "resolved", W0 + 900: "missing", W0 + 1800: "unresolved"}
@@ -279,6 +279,77 @@ class TestBackfillPolymarket:
             retried = await backfill_polymarket(client, conn, horizon="15m", since=since, until=until, sleep_sec=0, retry_missing=True)
             assert retried.missing == 1 and retried.skipped == 2
         assert calls == [f"0xcond{W0}", f"0xcond{W0 + 1800}"]  # each resolved window's tape fetched exactly once
+
+
+class TestDiskUse:
+    """The owner's disk filled up (2026-09-24) from a raw-print backfill, so paper/demo could not even create
+    their databases. The tape is now stored per second, and both backfills stop above a free-space floor."""
+
+    def test_prints_in_one_second_collapse_to_one_row_with_the_same_vwap(self):
+        from btcbot.pm_history import aggregate_tape
+
+        trades = [PmTrade.from_api(trade_payload(ts=100, price=p, size=q)) for p, q in (("0.50", "10"), ("0.60", "30"))]
+        trades.append(PmTrade.from_api(trade_payload(ts=100, side="SELL", price="0.40", size="5")))
+        rows = aggregate_tape(trades)
+        assert len(rows) == 2  # (100, up, BUY) and (100, up, SELL)
+        ts, outcome, side, n, size, notional = rows[0]
+        assert (ts, outcome, side, n, size) == (100, "up", "BUY", 2, Decimal("40"))
+        assert notional / size == Decimal("0.575")
+
+    def test_aggregated_tape_reads_back_as_the_same_per_second_series(self):
+        from btcbot.pm_history import save_window
+
+        conn = sqlite3.connect(":memory:")
+        init_pm_history_schema(conn)
+        trades = [PmTrade.from_api(trade_payload(ts=W0 + 3, price=p, size=q)) for p, q in (("0.50", "10"), ("0.60", "30"))]
+        trades.append(PmTrade.from_api(trade_payload(ts=W0 + 3, outcome="Down", side="BUY", price="0.30", size="20")))
+        save_window(conn, slug="s", horizon_sec=900, condition_id="c", up_token_id="u", down_token_id="d",
+                    window_start=W0, window_end=W0 + 900, result_up=True, trades=trades, truncated=False)
+        got = sorted(load_trades(conn, "s"), key=lambda t: t.outcome)
+        assert [(t.outcome, t.count) for t in got] == [("down", 1), ("up", 2)]
+        assert got[1].up_price == pytest.approx(0.575) and got[1].up_flow == pytest.approx(40.0)
+        assert got[0].up_price == pytest.approx(0.70) and got[0].up_flow == pytest.approx(-20.0)
+        assert conn.execute("SELECT trade_count FROM pm_hist_progress WHERE slug='s'").fetchone()[0] == 3
+
+    def test_a_database_written_before_aggregation_is_still_read(self):
+        conn = sqlite3.connect(":memory:")
+        init_pm_history_schema(conn)
+        conn.execute("CREATE TABLE pm_hist_trades (slug TEXT, ts INTEGER, outcome TEXT, side TEXT, price TEXT, size TEXT, tx_hash TEXT)")
+        conn.execute("INSERT INTO pm_hist_trades VALUES ('old', 5, 'down', 'SELL', '0.25', '4', 'x')")
+        (t,) = load_trades(conn, "old")
+        assert (t.ts, t.up_price, t.up_flow, t.count) == (5, 0.75, 4.0, 1)
+
+    def test_decimals_are_stored_without_trailing_zeros_or_exponents(self):
+        from btcbot.pm_history import _compact
+
+        assert [_compact(Decimal(x)) for x in ("93000.10000000", "93000.00000000", "0.00000000", "0.0005")] == [
+            "93000.1", "93000", "0", "0.0005"]
+
+    async def test_polymarket_backfill_stops_cleanly_below_the_disk_floor(self):
+        script = {W0: "resolved", W0 + 900: "resolved"}
+        conn = sqlite3.connect(":memory:")
+        init_pm_history_schema(conn)
+        since, until = datetime.fromtimestamp(W0, tz=UTC), datetime.fromtimestamp(W0 + 1800, tz=UTC)
+        calls: list[str] = []
+        async with PolymarketClient(transport=httpx.MockTransport(pm_handler(script, calls))) as client:
+            s = await backfill_polymarket(client, conn, horizon="15m", since=since, until=until, sleep_sec=0,
+                                          min_free_bytes=10**9, disk_free=lambda _: 10**6)
+        assert s.done == 0 and s.stopped is not None and "free" in s.stopped and calls == []
+
+    async def test_btc_backfill_stops_cleanly_below_the_disk_floor(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request.url)
+            return httpx.Response(404)
+
+        conn = sqlite3.connect(":memory:")
+        init_pm_history_schema(conn)
+        day1 = datetime(2026, 1, 1, tzinfo=UTC)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            s = await backfill_btc(http, conn, start=day1, end=day1 + timedelta(days=3),
+                                   min_free_bytes=10**9, disk_free=lambda _: 10**6)
+        assert s.stopped is not None and requests == [] and s.rows == 0
 
 
 class TestBackfillBtc:
@@ -307,6 +378,29 @@ class TestBackfillBtc:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             again = await backfill_btc(http, conn, start=day1, end=now, now=lambda: now)
         assert (again.skipped, again.rest_days) == (1, 1)  # the finished day is skipped, the partial one refreshed
+
+
+class TestDiskFullMessage:
+    def test_a_full_disk_is_a_plain_message_not_a_traceback(self, monkeypatch, capsys):
+        import btcbot.cli as cli
+
+        async def boom(args):
+            raise sqlite3.OperationalError("database or disk is full")
+
+        monkeypatch.setattr(cli, "_cmd_perp_backtest", boom)
+        assert main(["perp-backtest", "--db", "x"]) == 1
+        err = capsys.readouterr().err
+        assert "disk holding the database is full" in err and "pm-history" in err
+
+    def test_other_sqlite_errors_still_raise(self, monkeypatch):
+        import btcbot.cli as cli
+
+        async def boom(args):
+            raise sqlite3.OperationalError("no such table: foo")
+
+        monkeypatch.setattr(cli, "_cmd_perp_backtest", boom)
+        with pytest.raises(sqlite3.OperationalError):
+            main(["perp-backtest", "--db", "x"])
 
 
 class TestDownloadCli:
