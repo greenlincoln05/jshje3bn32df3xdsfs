@@ -23,6 +23,23 @@ def test_portfolio_rejects_invalid_capital(dashboard, value):
     assert status == 400
 
 
+def test_portfolio_history_http_merges_across_files_of_one_kind(dashboard):
+    make_db(dashboard.data_dir, "paper-KXBTC15M-prod-20260919T000000Z.sqlite")
+    make_db(dashboard.data_dir, "paper-KXBTC15M-prod-20260920T000000Z.sqlite")
+    status, body = _get(dashboard.base_url, "/api/portfolio_history?kind=paper")
+    assert status == 200
+    assert body["kind"] == "paper"
+    assert body["run_files"] == 2
+    assert body["trades"] == [] and body["versions"] == [] and body["segments"] == []
+
+
+def test_portfolio_history_http_rejects_prod_and_missing_kind(dashboard):
+    status, body = _get(dashboard.base_url, "/api/portfolio_history?kind=prod")
+    assert status == 400 and "kind must be" in body["error"]
+    status, body = _get(dashboard.base_url, "/api/portfolio_history")
+    assert status == 400 and "kind must be" in body["error"]
+
+
 def test_backtest_http_job_completes_all_scenarios_and_has_stable_cached_result(dashboard):
     db = make_db(dashboard.data_dir)
     with sqlite3.connect(db) as conn:

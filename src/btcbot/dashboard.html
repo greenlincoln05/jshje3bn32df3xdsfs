@@ -728,12 +728,14 @@ function drawPortfolioHistory() {
 }
 async function refreshPortfolioHistory() {
   if(historyBusy)return;
+  const requestedKind=historyKind;
   historyBusy=true;
   try {
-    const response=await getJson(`/api/portfolio_history?kind=${encodeURIComponent(historyKind)}`);
+    const response=await getJson(`/api/portfolio_history?kind=${encodeURIComponent(requestedKind)}`);
+    if(requestedKind!==historyKind)return;  // the toggle changed while this was in flight: this response is stale
     portfolioHistory=response;
     if(tab==='monitor' && historyMode) drawPortfolioHistory();
-  } catch(err){$("history-note").textContent='Error: '+err.message;}
+  } catch(err){if(requestedKind===historyKind)$("history-note").textContent='Error: '+err.message;}
   finally{historyBusy=false;}
 }
 async function refreshPortfolio() {
