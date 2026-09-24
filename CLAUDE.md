@@ -126,6 +126,17 @@ truth for scope and phases; the README has the phase status and a dated table of
   looks specifically for the Kalshi `orderbook_snapshots` table and correctly skips anything else. Not wired into
   `strategy.py`, `btcbot lab`, `btcbot features`/`validate`/`retrain-check`, or any trading decision. Building real
   Polymarket order placement is a separate, larger decision than this recorder and needs the owner's explicit go-ahead.
+- BTC perpetuals, PAPER ONLY (`perp_paper.py`, `perp_backtest.py`, `btcbot perp-backtest`,
+  `docs/research/perps-paper.md`), owner-driven, not a numbered phase: replays 1-minute BTC bars from a local
+  `download-history`/`download-polymarket-history` database through Kalshi `BTCPERP` rules (0.0001 BTC contracts,
+  taker fee on notional, 8 h funding at 12 AM/8 AM/4 PM ET with a +/-2% cap and 0.01% dead band, maintenance margin 90%
+  of initial, so even 1x is liquidated after about a 10% adverse move) for pre-registered `flat`/`hold`/`trend_24h`/
+  `window_15m` strategies, judged on a held-out time split against cash and buy-and-hold (no verdict under 30 test
+  days, never "profitable"). Rules were read from Kalshi's help center via search snippets 2026-09-24 and are
+  unverified. Perp price = a spot proxy and funding = an assumed constant, both stated in every report. Paper leverage
+  is capped at 3x. There is NO perps order code: Kalshi perps trade via a separate `/margin` API that `kalshi_client.py`
+  does not implement, a test pins that the perp modules import no network/Kalshi client and define no order function,
+  and adding a `/margin` client (even demo-gated) needs the owner's explicit go-ahead.
 - `webui.py` (`btcbot dashboard`) is a monitoring tool, not a phase -- it only reads local SQLite databases
   and rewrites three lines of a local `.env`. It binds to `127.0.0.1` only (never `0.0.0.0`) and must stay
   that way. Its Settings tab may write a key the owner enters into their own local `.env`, same as editing
@@ -228,6 +239,7 @@ truth for scope and phases; the README has the phase status and a dated table of
 - Record Polymarket's public "Bitcoin Up or Down" order books, READ-ONLY, no wallet/key needed (separate venue from Kalshi): `.venv/Scripts/btcbot.exe record-polymarket --horizon 15m --hours 9`
 - RESUMABLE, READ-ONLY backfill of settled Polymarket btc-updown windows' trade tape + Binance 1 s klines, needs network: `.venv/Scripts/btcbot.exe download-polymarket-history --since 2026-05-01T00:00:00Z` (add `--limit-markets 20` for a smoke test)
 - Polymarket reaction study + outcome/reaction models on a backfill (offline): `.venv/Scripts/btcbot.exe pm-reaction --db data/pm-history-15m-....sqlite`
+- BTC perpetual PAPER backtest vs cash and buy-and-hold under Kalshi BTCPERP rules (offline, no order code): `.venv/Scripts/btcbot.exe perp-backtest --db data/history-....sqlite`
 - Live paper trading, no credentials, no real orders (Phase 5): `.venv/Scripts/btcbot.exe paper --env prod --hours 9`
 - Calibration report from a recorder database: `.venv/Scripts/btcbot.exe calibrate --db data/recorder-....sqlite`
 - Backtest a recorder database: `.venv/Scripts/btcbot.exe backtest --db data/recorder-....sqlite`
