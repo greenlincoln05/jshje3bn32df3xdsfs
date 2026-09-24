@@ -20,6 +20,7 @@ A Python bot for Kalshi's rolling 15-minute Bitcoin up/down contracts (series `K
 | 6 | Demo-environment order/cancel/fill validation (`demo-check`) and demo trading (`demo`) | **built and tested offline; no real demo-check or demo run yet (needs a demo key on the owner's machine)** |
 | 7 | Live, optional, only if phases 4-6 show positive edge after fees | not started |
 | -- | Historical trade tape + market candlestick backfill (`download-market-history`), owner-driven, not a numbered phase | **built and tested offline; no real backfill run yet (needs network on the owner's machine)** |
+| -- | Polymarket 15m reaction research (`download-polymarket-history`, `pm-reaction`), READ-ONLY, separate venue, not a numbered phase | **built and tested offline on synthetic data; no real data run yet (needs network)** |
 
 Phase 1 shipped a read-only client with no order-placing methods at all; Phase 6 added
 `create_order`/`cancel_order`, hard-gated to Kalshi's demo environment only (see the Phase 6 write-up below
@@ -203,6 +204,23 @@ environment cannot reach Kalshi, so it is the owner's to run:
 ```powershell
 .venv\Scripts\btcbot.exe download-market-history --env prod --limit-markets 20   # smoke test first
 .venv\Scripts\btcbot.exe download-market-history --env prod --since 2026-01-01T00:00:00Z
+```
+
+### Polymarket reaction research
+
+`btcbot download-polymarket-history` backfills settled Polymarket "Bitcoin Up or Down" windows (their public
+taker trade tape and resolution) plus Binance BTCUSDT 1-second klines, and `btcbot pm-reaction` measures how
+that market reacts to BTC moves. It reports data validity, lead-lag and an event study, then trains an
+outcome model (judged against Polymarket's own price) and a reaction model (judged against a
+bounce/timing control) on later windows. Read-only, public data, no wallet or key, and not wired into any
+trading. [docs/research/polymarket-reaction-data.md](docs/research/polymarket-reaction-data.md) ranks every
+data source considered (including sub-second Hugging Face datasets this does not import yet) and explains
+the validity traps.
+
+```powershell
+.venv\Scripts\btcbot.exe download-polymarket-history --since 2026-09-20T00:00:00Z --limit-markets 20   # smoke test
+.venv\Scripts\btcbot.exe download-polymarket-history --since 2026-05-01T00:00:00Z                        # resumable
+.venv\Scripts\btcbot.exe pm-reaction --db data\pm-history-15m-....sqlite
 ```
 
 ## Setup

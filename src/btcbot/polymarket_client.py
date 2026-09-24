@@ -12,7 +12,18 @@ nothing here should be read as a step toward it.
 Confirmed against the live public API 2026-09-22: Polymarket runs a rolling "Bitcoin Up or Down" series at
 multiple horizons (event slugs ``btc-updown-5m-<epoch>``, ``btc-updown-15m-<epoch>``, ...), each a two-outcome
 (``Up``/``Down``) market with its own CLOB order book, closely analogous in shape to Kalshi's ``KXBTC15M``. A
-resolved event's Gamma record has ``closed: true`` and ``outcomePrices: ["1","0"]`` or ``["0","1"]``.
+resolved event's Gamma record has ``closed: true`` and ``outcomePrices: ["1","0"]`` or ``["0","1"]``. The slug's
+epoch is the window's START (``btc-updown-15m-1765548000`` is titled "December 12, 9:00AM-9:15AM ET", and
+1765548000 is 14:00 UTC that day).
+
+The public trade tape (:meth:`PolymarketClient.get_market_trades`, ``data-api.polymarket.com/trades``) is the
+only fine-grained HISTORY Polymarket serves for a closed short-window market: ``clob.polymarket.com/prices-history``
+returns nothing below 12-hour granularity once a market resolves (py-clob-client issue #216), and the Goldsky
+order-fill subgraph stopped indexing completely at the 2026-04-28 CTF Exchange V2 migration. The Data API caps
+``offset`` at 10,000 (a request past it is a 400), so a very busy market's OLDEST trades can be out of reach;
+``get_market_trades`` reports that as ``truncated`` rather than returning a silently partial tape. Only the
+fields a price/flow series needs are parsed -- wallet addresses, names and profile fields in the same payload
+are deliberately dropped, never stored.
 """
 
 from __future__ import annotations
@@ -29,6 +40,8 @@ from btcbot.models import ParseError, parse_time, require, to_decimal
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
+DATA_API_BASE = "https://data-api.polymarket.com"
+TRADES_MAX_OFFSET = 10_000  # Data API docs: offset 0..10000, past it the request is rejected with HTTP 400
 
 
 class PolymarketError(Exception):
@@ -154,12 +167,62 @@ class OrderBook:
         return self.asks[0] if self.asks else None
 
 
+@dataclass(frozen=True, slots=True)
+class PmTrade:
+    """One public trade print on an Up/Down market, as the TAKER saw it (``takerOnly=true``, so each fill
+    appears once and ``side`` is the aggressor's side)."""
+
+    timestamp: datetime
+    outcome: str  # "up" | "down": which token traded
+    side: str  # "BUY" | "SELL": the taker's side
+    price: Decimal  # of the traded token, in (0, 1)
+    size: Decimal  # shares of the traded token
+    tx_hash: str
+
+    @classmethod
+    def from_api(cls, payload: Mapping[str, Any]) -> "PmTrade":
+        outcome_raw = payload.get("outcome")
+        if isinstance(outcome_raw, str) and outcome_raw.lower() in ("up", "down"):
+            outcome = outcome_raw.lower()
+        elif payload.get("outcomeIndex") in (0, 1):
+            outcome = "up" if payload["outcomeIndex"] == 0 else "down"
+        else:
+            raise ParseError(f"trade: unrecognised outcome {outcome_raw!r}")
+        side = str(require(payload, "side", "trade")).upper()
+        if side not in ("BUY", "SELL"):
+            raise ParseError(f"trade: unrecognised side {side!r}")
+        price = to_decimal(require(payload, "price", "trade"), "trade.price")
+        size = to_decimal(require(payload, "size", "trade"), "trade.size")
+        if price is None or size is None or not (0 <= price <= 1) or size < 0:
+            raise ParseError(f"trade: price {price!r} / size {size!r} out of range")
+        ts_raw = require(payload, "timestamp", "trade")
+        try:
+            ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ParseError(f"trade: timestamp must be unix seconds, got {ts_raw!r}: {exc}") from exc
+        return cls(
+            timestamp=ts, outcome=outcome, side=side, price=price, size=size,
+            tx_hash=str(payload.get("transactionHash") or ""),
+        )
+
+    def up_price(self) -> Decimal:
+        """The price in "Up" terms: an Up print as-is, a Down print as ``1 - price`` (the two tokens are
+        complementary claims on the same event, so a Down trade at 0.30 says Up is worth about 0.70)."""
+        return self.price if self.outcome == "up" else 1 - self.price
+
+    def up_flow(self) -> Decimal:
+        """Signed taker size in "Up" terms: buying Up or selling Down is bullish (+), the reverse bearish (-)."""
+        bullish = (self.outcome == "up") == (self.side == "BUY")
+        return self.size if bullish else -self.size
+
+
 class PolymarketClient:
     """Public, unauthenticated reads only. No credentials of any kind, no write method exists."""
 
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None, timeout: float = 10.0) -> None:
         self._gamma = httpx.AsyncClient(base_url=GAMMA_BASE, transport=transport, timeout=timeout)
         self._clob = httpx.AsyncClient(base_url=CLOB_BASE, transport=transport, timeout=timeout)
+        self._data = httpx.AsyncClient(base_url=DATA_API_BASE, transport=transport, timeout=timeout)
 
     async def __aenter__(self) -> "PolymarketClient":
         return self
@@ -167,6 +230,7 @@ class PolymarketClient:
     async def __aexit__(self, *exc: object) -> None:
         await self._gamma.aclose()
         await self._clob.aclose()
+        await self._data.aclose()
 
     async def _get(self, client: httpx.AsyncClient, path: str, *, params: Mapping[str, str] | None = None) -> Any:
         try:
@@ -210,3 +274,31 @@ class PolymarketClient:
         if not isinstance(data, dict):
             raise ParseError(f"book {token_id}: expected an object")
         return OrderBook.from_api(token_id, data)
+
+    async def get_market_trades(
+        self, condition_id: str, *, page_size: int = 1000, max_offset: int = TRADES_MAX_OFFSET,
+    ) -> tuple[list[PmTrade], bool]:
+        """Every public taker trade on one market, oldest first, plus ``truncated``: True when paging reached
+        the Data API's offset cap with pages still full, so the market's OLDEST trades may be missing (the API
+        serves newest first). A caller must treat a truncated tape as incomplete, not as the whole window."""
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        trades: list[PmTrade] = []
+        offset = 0
+        truncated = False
+        while True:
+            data = await self._get(
+                self._data, "/trades",
+                params={"market": condition_id, "limit": str(page_size), "offset": str(offset), "takerOnly": "true"},
+            )
+            if not isinstance(data, list):
+                raise ParseError(f"trades {condition_id}: expected an array")
+            trades.extend(PmTrade.from_api(p) for p in data)
+            if len(data) < page_size:
+                break
+            offset += page_size
+            if offset > max_offset:
+                truncated = True
+                break
+        trades.sort(key=lambda t: t.timestamp)
+        return trades, truncated

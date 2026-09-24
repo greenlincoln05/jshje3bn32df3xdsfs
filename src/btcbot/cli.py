@@ -29,6 +29,12 @@ ML entry/exit layers (docs/research/ml-layers-handoff.md), owner-driven, not a n
                      owner-run: this session's environment cannot reach Kalshi/Coinbase, see CLAUDE.md)
   ml-train          train an entry/exit model from recorded data, validated on markets it never trained on
   ml-ablation       compare current/ML entries x settlement-hold/ML-exit as four independent layers
+
+Polymarket reaction research (docs/research/polymarket-reaction-data.md), READ-ONLY, a separate venue:
+  download-polymarket-history  RESUMABLE backfill of settled btc-updown windows, their public trade tape,
+                               and Binance BTCUSDT 1s klines (public data, no key, no wallet)
+  pm-reaction                  validity report, lead-lag, event study, and outcome/reaction models judged
+                               on later windows against the market's own price (offline)
 """
 
 from __future__ import annotations
@@ -1062,6 +1068,151 @@ async def _cmd_ml_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _newest_pm_history_db(data_dir: Path, horizon: str) -> Path | None:
+    files = sorted(data_dir.glob(f"pm-history-{horizon}-*.sqlite"), key=lambda p: p.stat().st_mtime)
+    return files[-1] if files else None
+
+
+async def _cmd_download_polymarket_history(args: argparse.Namespace) -> int:
+    """RESUMABLE backfill for the Polymarket reaction dataset (docs/research/polymarket-reaction-data.md):
+    settled btc-updown windows + their public taker trade tape (Gamma + Data API) and Binance BTCUSDT 1s klines
+    (data.binance.vision, REST fallback). READ-ONLY public GETs: no key, no wallet, and the Polymarket client
+    has no order method at all."""
+    from btcbot.pm_history import backfill_btc, backfill_polymarket, init_pm_history_schema
+    from btcbot.pm_reaction import PRE_SEC
+    from btcbot.polymarket_client import PolymarketClient
+
+    try:
+        since = parse_time(args.since)
+        until = parse_time(args.until) if args.until else datetime.now(timezone.utc) - timedelta(hours=1)
+    except ParseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if until <= since:
+        print("error: --until must be after --since", file=sys.stderr)
+        return 2
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if args.db:
+        db_path = Path(args.db)
+    else:
+        db_path = _newest_pm_history_db(data_dir, args.horizon) or (
+            data_dir / f"pm-history-{args.horizon}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.sqlite")
+    is_new = not db_path.exists()
+    conn = sqlite3.connect(str(db_path))
+    init_pm_history_schema(conn)
+    print(f"{'Creating new' if is_new else 'Resuming'} database {db_path} (public data only, no key, no wallet)", flush=True)
+    failed = False
+    try:
+        if not args.btc_only:
+            print(f"Polymarket btc-updown-{args.horizon} windows {since.isoformat()} -> {until.isoformat()} ...", flush=True)
+            async with PolymarketClient() as client:
+                pm = await backfill_polymarket(
+                    client, conn, horizon=args.horizon, since=since, until=until, concurrency=args.concurrency,
+                    sleep_sec=args.sleep_ms / 1000, retry_missing=args.retry_missing, limit_markets=args.limit_markets,
+                    progress=lambda msg: print(msg, flush=True),
+                )
+            print(
+                f"  windows: {pm.windows} in range, {pm.done} fetched, {pm.skipped} already done, {pm.missing} with no "
+                f"event, {pm.unresolved} not resolved yet, {pm.window_mismatch} window mismatches, {pm.failed} failed.\n"
+                f"  trades: {pm.trades} taker prints; {pm.truncated} windows hit the Data API offset cap.",
+                flush=True,
+            )
+            for line in pm.failures[:10]:
+                print(f"  FAILED {line}", file=sys.stderr)
+            failed = failed or pm.failed > 0
+        if not args.no_btc:
+            btc_start = since - timedelta(seconds=PRE_SEC + 60)
+            print(f"Binance BTCUSDT 1s klines {btc_start.isoformat()} -> {until.isoformat()} ...", flush=True)
+            async with httpx.AsyncClient(timeout=60.0) as http:
+                btc = await backfill_btc(
+                    http, conn, start=btc_start, end=until, rest_fallback=not args.no_rest_fallback,
+                    progress=lambda msg: print(msg, flush=True),
+                )
+            print(
+                f"  days: {btc.days} in range, {btc.skipped} already done, {btc.archive_days} from the archive, "
+                f"{btc.rest_days} via REST, {len(btc.failed)} failed; {btc.rows} bars written.", flush=True,
+            )
+            for line in btc.failed[:10]:
+                print(f"  FAILED {line}", file=sys.stderr)
+            failed = failed or bool(btc.failed)
+    finally:
+        conn.close()
+    print(
+        f"Database: {db_path}\nRaw public data, not a profitability claim. Next: btcbot pm-reaction --db {db_path}"
+    )
+    return 1 if failed else 0
+
+
+async def _cmd_pm_reaction(args: argparse.Namespace) -> int:
+    """Offline: how Polymarket's btc-updown market reacts to BTC events, and whether a model beats the market's
+    own price on later windows (docs/research/polymarket-reaction-data.md). Research only -- nothing here is
+    wired into strategy.py, btcbot lab, or any Kalshi or Polymarket trading decision."""
+    from btcbot.ml_model import save_model
+    from btcbot.pm_history import PmHistoryError
+    from btcbot.pm_reaction import (
+        PmReactionError,
+        load_series_from_history,
+        load_series_from_recorder,
+        render_study,
+        run_study,
+    )
+
+    db_path = Path(args.db)
+    if not db_path.is_file():
+        print(f"error: no such database: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(str(db_path))
+    try:
+        if args.recorder_db:
+            windows_total, series = 0, []
+            for path in args.recorder_db:
+                if not Path(path).is_file():
+                    print(f"error: no such database: {path}", file=sys.stderr)
+                    return 1
+                rconn = sqlite3.connect(str(path))
+                try:
+                    n, s = load_series_from_recorder(rconn, conn)
+                finally:
+                    rconn.close()
+                windows_total += n
+                series.extend(s)
+        else:
+            windows_total, series = load_series_from_history(conn)
+        study = run_study(
+            windows_total, series, horizon_sec=args.horizon_sec, sample_every=args.sample_every,
+            max_staleness_sec=args.max_staleness, min_move=args.min_move, train_fraction=args.split,
+            embargo=args.embargo, epochs=args.epochs, max_train_rows=args.max_train_rows, k_sigma=args.k_sigma,
+        )
+    except (PmHistoryError, PmReactionError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(render_study(study))
+    out_dir = Path(args.out_dir)
+    saved = []
+    if study.outcome_model is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        save_model(study.outcome_model, out_dir / "pm_outcome.json")
+        saved.append(str(out_dir / "pm_outcome.json"))
+    if study.reaction_model is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        save_model(study.reaction_model, out_dir / "pm_reaction.json")
+        saved.append(str(out_dir / "pm_reaction.json"))
+    report_path = Path(args.report) if args.report else Path(args.data_dir) / "research" / (
+        f"pm-reaction-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(study.to_json(), indent=2), encoding="ascii")
+    print(f"\nFull report: {report_path}")
+    if saved:
+        print(
+            "Models: " + ", ".join(saved) + " -- Polymarket-schema research models, NOT loadable by `btcbot "
+            "ml-ablation` / `btcbot validate --model` (different feature schema) and not wired into any trading."
+        )
+    return 0
+
+
 async def _cmd_ml_ablation(args: argparse.Namespace) -> int:
     """Compare current-entry/ML-entry x settlement-hold/ML-exit as four independent layers on the same
     train/test split (docs/research/ml-layers-handoff.md). Offline: no network, no credentials."""
@@ -1631,6 +1782,46 @@ def build_parser() -> argparse.ArgumentParser:
     ml_train.add_argument("--embargo", type=int, default=1, help="windows dropped between train and test (--features/--history mode only, default: 1)")
     ml_train.set_defaults(handler=_cmd_ml_train)
 
+    download_pm = commands.add_parser(
+        "download-polymarket-history",
+        help="RESUMABLE, READ-ONLY backfill: settled Polymarket btc-updown windows + public trade tape + Binance "
+        "BTCUSDT 1s klines into SQLite (public data, no key, no wallet)",
+    )
+    download_pm.add_argument("--horizon", default="15m", choices=["5m", "15m"], help="window length (default: 15m)")
+    download_pm.add_argument("--since", required=True, help="ISO 8601: first window start to include")
+    download_pm.add_argument("--until", help="ISO 8601: last window END to include (default: one hour ago)")
+    download_pm.add_argument("--db", help="database to write/resume (default: the newest data/pm-history-<horizon>-*.sqlite, or a fresh one)")
+    download_pm.add_argument("--data-dir", default="data", help="directory for the database (default: ./data)")
+    download_pm.add_argument("--limit-markets", type=int, help="stop after this many windows (smoke test, e.g. 20)")
+    download_pm.add_argument("--concurrency", type=int, default=2, help="windows fetched at once (default: 2, be polite)")
+    download_pm.add_argument("--sleep-ms", type=int, default=250, help="pause before each window's requests, ms (default: 250)")
+    download_pm.add_argument("--retry-missing", action="store_true", help="re-ask windows previously found to have no event")
+    download_pm.add_argument("--no-btc", action="store_true", help="skip the Binance klines")
+    download_pm.add_argument("--btc-only", action="store_true", help="only the Binance klines (e.g. to pair with record-polymarket databases)")
+    download_pm.add_argument("--no-rest-fallback", action="store_true", help="archive only; skip days it has not published yet")
+    download_pm.set_defaults(handler=_cmd_download_polymarket_history)
+
+    pm_reaction = commands.add_parser(
+        "pm-reaction",
+        help="offline: Polymarket btc-updown reaction to BTC events (validity, lead-lag, event study) and "
+        "outcome/reaction models judged on later windows against the market's own price",
+    )
+    pm_reaction.add_argument("--db", required=True, help="database from `btcbot download-polymarket-history` (Binance klines, and the Polymarket tape unless --recorder-db)")
+    pm_reaction.add_argument("--recorder-db", action="append", default=[], help="use a `btcbot record-polymarket` database's book mids for the Polymarket side instead (repeatable)")
+    pm_reaction.add_argument("--out-dir", default="models/polymarket", help="where to save pm_outcome.json / pm_reaction.json (default: models/polymarket)")
+    pm_reaction.add_argument("--data-dir", default="data", help="report JSON goes to <data-dir>/research/ unless --report (default: ./data)")
+    pm_reaction.add_argument("--report", help="explicit path for the JSON report")
+    pm_reaction.add_argument("--horizon-sec", type=int, default=15, help="reaction model horizon in seconds (default: 15)")
+    pm_reaction.add_argument("--sample-every", type=int, default=15, help="seconds between sampled rows per window (default: 15)")
+    pm_reaction.add_argument("--max-staleness", type=int, default=5, help="drop rows whose last Polymarket print is older than this, s (default: 5)")
+    pm_reaction.add_argument("--min-move", type=float, default=0.01, help="reaction rows need a move at least this big (default: 0.01)")
+    pm_reaction.add_argument("--split", type=float, default=0.7, help="fraction of windows used to train (default: 0.7)")
+    pm_reaction.add_argument("--embargo", type=int, default=1, help="windows dropped between train and validate (default: 1)")
+    pm_reaction.add_argument("--epochs", type=int, default=200, help="gradient-descent epochs (default: 200)")
+    pm_reaction.add_argument("--max-train-rows", type=int, default=200_000, help="evenly subsample training rows above this (default: 200000)")
+    pm_reaction.add_argument("--k-sigma", type=float, default=3.0, help="BTC shock threshold in sigmas over 5 s (default: 3)")
+    pm_reaction.set_defaults(handler=_cmd_pm_reaction)
+
     ablation = commands.add_parser(
         "ml-ablation",
         help="compare current-entry/ML-entry x settlement-hold/ML-exit as four independent layers on the same train/test split (offline)",
@@ -1797,6 +1988,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         if args.db and args.which is None:
             print("error: --which is required with --db", file=sys.stderr)
+            return 2
+    if args.command == "download-polymarket-history":
+        if args.btc_only and args.no_btc:
+            print("error: --btc-only and --no-btc cannot both be given", file=sys.stderr)
+            return 2
+        if args.concurrency < 1 or args.sleep_ms < 0 or (args.limit_markets is not None and args.limit_markets < 1):
+            print("error: --concurrency and --limit-markets must be at least 1, --sleep-ms non-negative", file=sys.stderr)
+            return 2
+    if args.command == "pm-reaction":
+        if not (0.2 <= args.split <= 0.9):
+            print("error: --split must be between 0.2 and 0.9", file=sys.stderr)
+            return 2
+        for name, value in (("--horizon-sec", args.horizon_sec), ("--sample-every", args.sample_every),
+                            ("--epochs", args.epochs), ("--max-train-rows", args.max_train_rows)):
+            if value < 1:
+                print(f"error: {name} must be at least 1", file=sys.stderr)
+                return 2
+        if args.max_staleness < 0 or args.embargo < 0 or not (args.min_move >= 0) or not (args.k_sigma > 0):
+            print("error: --max-staleness/--embargo/--min-move must be non-negative and --k-sigma positive", file=sys.stderr)
             return 2
     if args.command == "ml-ablation":
         if args.entry_model is None and args.exit_model is None:
